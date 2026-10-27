@@ -126,6 +126,7 @@ func Load(ctx context.Context, r io.Reader, rootPtr any) (Stats, error) {
 // Sink is used for Type.StateSave.
 type Sink struct {
 	internal objectEncoder
+	graph    graphStructEncoder
 }
 
 // Save adds the given object to the map.
@@ -219,6 +220,7 @@ type SaverLoader interface {
 // Source is used for Type.StateLoad.
 type Source struct {
 	internal objectDecoder
+	graph    graphStructDecoder
 }
 
 // Load loads the given object passed as a pointer..
@@ -242,6 +244,20 @@ func (s Source) LoadWait(slot int, objPtr any) {
 func (s Source) LoadValue(slot int, objPtr any, fn func(any)) {
 	o := reflect.ValueOf(objPtr)
 	s.internal.load(slot, o, true, func() { fn(o.Elem().Interface()) })
+}
+
+// ValueLoader is implemented by the generated code of structs with fields
+// saved through values (see Source.LoadValueTo).
+type ValueLoader interface {
+	// StateLoadValue loads the value of the field in the given slot.
+	StateLoadValue(ctx context.Context, slot int, value any)
+}
+
+// AfterLoader is implemented by the generated code of structs with afterLoad
+// methods (see Source.AfterLoadTo).
+type AfterLoader interface {
+	// StateAfterLoad calls the afterLoad method.
+	StateAfterLoad(ctx context.Context)
 }
 
 // AfterLoad schedules a function execution when all objects have been
