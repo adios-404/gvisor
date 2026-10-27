@@ -320,12 +320,29 @@ func (fs *Filesystem) Release(ctx context.Context) {
 	}
 	fs.mu.Lock()
 	root.releaseKeptDentriesLocked(ctx)
-	for fs.cachedDentriesLen != 0 {
-		fs.evictCachedDentryLocked(ctx)
-	}
+	fs.evictAllCachedDentriesLocked(ctx)
 	fs.mu.Unlock()
 	// Drop ref acquired in Dentry.InitRoot().
 	root.DecRef(ctx)
+}
+
+// EvictCachedDentries evicts all dentries that are only kept alive by the
+// dentry cache. Dentries in use are not cached, and thus not affected.
+func (fs *Filesystem) EvictCachedDentries(ctx context.Context) {
+	fs.mu.Lock()
+	defer fs.processDeferredDecRefs(ctx)
+	defer fs.mu.Unlock()
+	fs.evictAllCachedDentriesLocked(ctx)
+}
+
+// Preconditions:
+//   - fs.mu must be locked for writing.
+func (fs *Filesystem) evictAllCachedDentriesLocked(ctx context.Context) {
+	// Evicting a dentry can add its parent to the cache, so loop until the
+	// cache is empty.
+	for fs.cachedDentriesLen != 0 {
+		fs.evictCachedDentryLocked(ctx)
+	}
 }
 
 // releaseKeptDentriesLocked recursively drops all dentry references created by
