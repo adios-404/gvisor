@@ -1,111 +1,48 @@
-_templates:
-  retry_settings: &retry_settings
-    automatic:
-      - exit_status: 80
-        limit: 0
-      - signal_reason: cancel
-        limit: 0
-      - exit_status: -1
-        limit: 3
-      - exit_status: "*"
-        limit: 2
-  common: &common
-    timeout_in_minutes: 55
-    retry:
-      <<: *retry_settings
-  source_test: &source_test
-    if: build.env("STAGED_BINARIES") == null
-  source_test_presubmit: &source_test_presubmit
-    if: build.env("STAGED_BINARIES") == null && build.branch != "master"
-  docker: &docker
-    env:
-      BUILDKITE_PIPELINE_INSTALL_RUNTIME: true
+# Test pipeline for first-pass (commit as .buildkite/first-pass.yaml on a test
+# branch). Two questions:
+#
+#   (1) Can a first-pass build trigger a build in `pipeline`? The trigger step
+#       below tries. If `pipeline` gets a new build titled "(DO NOT MERGE)
+#       first-pass -> pipeline trigger test", the answer is yes.
+#   (4) Can uploaded steps override the variables the coordinator uses to
+#       decide trust (BUILDKITE_PULL_REQUEST, BUILDKITE_SOURCE)? The two
+#       override steps try, at pipeline level and at step level, and print what
+#       the job actually got. Compare with the values Buildkite reports for each
+#       job (check-trigger-test.sh does this).
+#
+# Override values are deliberately distinctive, so any leak is obvious.
+
 env:
-  # Force a clean checkout every time to avoid reuse of files between runs.
-  BUILDKITE_CLEAN_CHECKOUT: true
-
-  # Optional filter for syscall tests.
-  SYSCALL_TEST_FILTERS: ''
-
-priority: ${PRIORITY:-0}
-
-agents:
-  queue: "default"
+  BUILDKITE_PULL_REQUEST: "424242"
+  BUILDKITE_SOURCE: "schedule"
+  BUILDKITE_BUILD_ID: "00000000-0000-0000-0000-000000000042"
 
 steps:
-  # Run smoke tests before the other tests.
-  - <<: *common
-    <<: *source_test
-    label: ":fire: Smoke tests (AMD64)"
-    command: make smoke-tests
-  - <<: *common
-    <<: *source_test
+  - label: ":mag: env override (pipeline-level env)"
+    key: "override-pipeline-env"
+    command: >-
+      echo "BUILDKITE_PULL_REQUEST=$$BUILDKITE_PULL_REQUEST
+      BUILDKITE_SOURCE=$$BUILDKITE_SOURCE BUILDKITE_BUILD_ID=$$BUILDKITE_BUILD_ID"
+    agents:
+      queue: "default"
+
+  - label: ":mag: env override (step env)"
+    key: "override-step-env"
     env:
-      GLIBC_TUNABLES: glibc.pthread.rseq=0
-    label: ":fire: Smoke race tests"
-    command: make smoke-race-tests
+      BUILDKITE_PULL_REQUEST: "false"
+      BUILDKITE_SOURCE: "ui"
+      BUILDKITE_BUILD_ID: "00000000-0000-0000-0000-000000000043"
+    command: >-
+      echo "BUILDKITE_PULL_REQUEST=$$BUILDKITE_PULL_REQUEST
+      BUILDKITE_SOURCE=$$BUILDKITE_SOURCE BUILDKITE_BUILD_ID=$$BUILDKITE_BUILD_ID"
+    agents:
+      queue: "default"
 
-  # Run the remaining tests only if the smoke tests pass, so that a change
-  # that does not build or start does not use the other agents (presubmits
-  # only).
-  - wait: ~
-    if: build.branch != "master"
-
-  # Build runsc and pkg (presubmits only).
-  - <<: *common
-    <<: *source_test_presubmit
-    label: ":world_map: Build runsc and pkg (AMD64)"
-    commands:
-      - "make build TARGETS=//pkg/..."
-      - "make build OPTIONS='--build_tag_filters=-network_plugins' TARGETS='//runsc/...'"
-
-  - <<: *common
-    <<: *source_test
-    label: ":broom: Lint"
-    command: make lint
-  - <<: *common
-    <<: *source_test
-    label: ":soap: Lint (C++)"
-    command: make lint-cc
-  - <<: *common
-    <<: *source_test
-    label: ":scroll: Governance file sync check"
-    command: make governance-check
-  - <<: *common
-    <<: *source_test
-    label: ":building_construction: Gazelle BUILD file check"
-    command: make gazelle-check
-  - <<: *common
-    <<: *source_test
-    label: ":scales: Dependency license check"
-    command: make license-check
-
-  # Basic unit tests.
-  - <<: *common
-    <<: *source_test
-    label: ":golang: Nogo tests"
-    command: make nogo-tests
-  - <<: *common
-    <<: *source_test
-    label: ":test_tube: Unit tests (cgroupv2)"
-    command: make unit-tests
-  - <<: *common
-    <<: *docker
-    # This variant is not really a source test, but we annotate it as such to
-    # avoid running binary-only tests for all variants of cgroups. It is
-    # sufficient to run cgroupv2 variants only for source changes.
-    <<: *source_test
-    label: ":test_tube: Container tests (cgroupv2)"
-    command: make container-tests
-
-  # System call tests.
-  - <<: *common
-    label: ":toolbox: System call tests (AMD64)"
-    command: make OPTIONS=--config=syscalls-amd64 syscall-tests
-    parallelism: 20
-
-  - <<: *common
-    <<: *docker
-    <<: *source_test
-    label: ":lock: Root tests"
-    command: make root-tests
+  - label: ":arrow_right: trigger pipeline"
+    key: "trigger-pipeline"
+    trigger: "pipeline"
+    async: true
+    build:
+      branch: "${BUILDKITE_BRANCH}"
+      commit: "${BUILDKITE_COMMIT}"
+      message: "(DO NOT MERGE) first-pass -> pipeline trigger test"
