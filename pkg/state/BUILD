@@ -71,6 +71,13 @@ go_library(
         "deferred_list.go",
         "encode.go",
         "encode_unsafe.go",
+        "graph_addrmap.go",
+        "graph_buf_unsafe.go",
+        "graph_encode_objects_unsafe.go",
+        "graph_encode_unsafe.go",
+        "graph_encode_values_unsafe.go",
+        "graph_typecache_unsafe.go",
+        "graph_typeinfo_unsafe.go",
         "ods_list.go",
         "state.go",
         "state_norace.go",
@@ -93,6 +100,10 @@ go_library(
 go_test(
     name = "state_test",
     size = "small",
-    srcs = ["types_test.go"],
+    srcs = [
+        "graph_addrmap_test.go",
+        "graph_buf_test.go",
+        "types_test.go",
+    ],
     embed = [":state"],
 )
