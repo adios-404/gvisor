@@ -79,7 +79,7 @@ func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns
 
 	contents := map[string]kernfs.Inode{
 		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newCPUInfoData(k)),
 		"devices":        fs.newInode(ctx, root, 0444, &devicesData{}),
 		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
 		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
@@ -273,29 +273,39 @@ func (i *tasksInode) DecRef(ctx context.Context) {
 	i.tasksInodeRefs.DecRef(func() { i.Destroy(ctx) })
 }
 
-// staticFileSetStat implements a special static file that allows inode
-// attributes to be set. This is to support /proc files that are readonly, but
-// allow attributes to be set.
+// cpuInfoData implements vfs.DynamicBytesSource for /proc/cpuinfo.
+//
+// The contents are about 1 KB per CPU, so they are generated on read instead
+// of being stored and saved in every checkpoint. All inputs are saved kernel
+// state, except the CPU frequency, which is recorded at mount: so the file
+// contents do not change after a restore on a different host.
 //
 // +stateify savable
-type staticFileSetStat struct {
+type cpuInfoData struct {
 	dynamicBytesFileSetAttr
-	vfs.StaticData
+
+	k *kernel.Kernel
+
+	// freqMHz is the CPU frequency to report. Immutable.
+	freqMHz float64
 }
 
-var _ dynamicInode = (*staticFileSetStat)(nil)
+var _ dynamicInode = (*cpuInfoData)(nil)
 
-func newStaticFileSetStat(data string) *staticFileSetStat {
-	return &staticFileSetStat{StaticData: vfs.StaticData{Data: data}}
-}
-
-func cpuInfoData(k *kernel.Kernel) string {
-	features := k.FeatureSet()
-	var buf bytes.Buffer
-	for i, max := uint(0), k.ApplicationCores(); i < max; i++ {
-		features.WriteCPUInfoTo(i, max, &buf)
+func newCPUInfoData(k *kernel.Kernel) *cpuInfoData {
+	return &cpuInfoData{
+		k:       k,
+		freqMHz: k.FeatureSet().CPUFreqMHz(),
 	}
-	return buf.String()
+}
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (d *cpuInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	features := d.k.FeatureSet()
+	for i, max := uint(0), d.k.ApplicationCores(); i < max; i++ {
+		features.WriteCPUInfoWithFreqTo(i, max, d.freqMHz, buf)
+	}
+	return nil
 }
 
 func ipcData(v uint64) dynamicInode {

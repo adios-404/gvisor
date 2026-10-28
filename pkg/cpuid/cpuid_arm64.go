@@ -96,11 +96,22 @@ func (fs FeatureSet) HasPointerAuth() bool {
 	return fs.hwCap.hwCap1&HWCAP_PACA != 0
 }
 
+// CPUFreqMHz returns the CPU frequency that WriteCPUInfoTo reports.
+func (fs FeatureSet) CPUFreqMHz() float64 {
+	return fs.cpuFreqMHz
+}
+
 // WriteCPUInfoTo is to generate a section of one cpu in /proc/cpuinfo. This is
 // a minimal /proc/cpuinfo, and the bogomips field is simply made up.
 func (fs FeatureSet) WriteCPUInfoTo(cpu, numCPU uint, w io.Writer) {
+	fs.WriteCPUInfoWithFreqTo(cpu, numCPU, fs.CPUFreqMHz(), w)
+}
+
+// WriteCPUInfoWithFreqTo is like WriteCPUInfoTo, but it reports freqMHz as
+// the CPU frequency.
+func (fs FeatureSet) WriteCPUInfoWithFreqTo(cpu, numCPU uint, freqMHz float64, w io.Writer) {
 	fmt.Fprintf(w, "processor\t: %d\n", cpu)
-	fmt.Fprintf(w, "BogoMIPS\t: %.02f\n", fs.cpuFreqMHz) // It's bogus anyway.
+	fmt.Fprintf(w, "BogoMIPS\t: %.02f\n", freqMHz) // It's bogus anyway.
 	fmt.Fprintf(w, "Features\t\t: %s\n", fs.FlagString())
 	fmt.Fprintf(w, "CPU implementer\t: 0x%x\n", fs.cpuImplHex)
 	fmt.Fprintf(w, "CPU architecture\t: %d\n", fs.cpuArchDec)
