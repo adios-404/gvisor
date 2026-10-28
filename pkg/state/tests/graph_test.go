@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/state"
+	"gvisor.dev/gvisor/pkg/state/pretty"
 )
 
 // saveBytes saves the graph rooted at root.
@@ -457,5 +459,144 @@ func TestRootZeroFields(t *testing.T) {
 	want.b, want.n = [1]byte{9}, 3
 	if got != want {
 		t.Errorf("Load of non-zero fields: got %+v, want %+v", got, want)
+	}
+}
+
+func TestSliceOfArraysRoundTrip(t *testing.T) {
+	prev := state.GraphEngineEnabled()
+	state.EnableGraphEngine(true)
+	defer state.EnableGraphEngine(prev)
+
+	s1 := [][2]int64{{1, 2}, {3, 4}, {5, 6}}
+	s2 := [][2]int64{{10, 20}, {30, 40}, {50, 60}}
+	saved := &gSliceOfArraysRoot{
+		sliceFirst: s1,
+		ptrSecond:  (*[2][2]int64)(s1[0:2]),
+		ptrFirst:   (*[2][2]int64)(s2[1:3]),
+		sliceNext:  s2,
+	}
+	var buf bytes.Buffer
+	if _, err := state.Save(t.Context(), &buf, saved); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data := buf.Bytes()
+	var out bytes.Buffer
+	if err := pretty.PrintText(&out, bytes.NewReader(data)); err != nil {
+		t.Fatalf("PrintText: %v", err)
+	}
+	var got gSliceOfArraysRoot
+	if _, err := state.Load(t.Context(), bytes.NewReader(data), &got); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got.ptrSecond[1][0] = 99
+	if got.sliceFirst[1][0] != 99 {
+		t.Errorf("ptrSecond does not alias sliceFirst[0:2]: sliceFirst=%v", got.sliceFirst)
+	}
+	got.ptrFirst[0][1] = 88
+	if got.sliceNext[1][1] != 88 {
+		t.Errorf("ptrFirst does not alias sliceNext[1:3]: sliceNext=%v", got.sliceNext)
+	}
+
+	// Slice of arrays of non-pod structs (inlineStruct) where a multi-element
+	// array pointer is encoded (reaching objDone) before the enclosing slice
+	// is discovered in a deeper object.
+	ks := [][2]gKey{
+		{{a: 1, b: "one"}, {a: 2, b: "two"}},
+		{{a: 3, b: "three"}, {a: 4, b: "four"}},
+		{{a: 5, b: "five"}, {a: 6, b: "six"}},
+	}
+	kRoot := &gRoot{
+		any: (*[2][2]gKey)(ks[1:3]),
+		all: []*gNode{{iface: ks}},
+	}
+	buf.Reset()
+	if _, err := state.Save(t.Context(), &buf, kRoot); err != nil {
+		t.Fatalf("Save struct slice-of-arrays: %v", err)
+	}
+	var gotKRoot gRoot
+	if _, err := state.Load(t.Context(), bytes.NewReader(buf.Bytes()), &gotKRoot); err != nil {
+		t.Fatalf("Load struct slice-of-arrays: %v", err)
+	}
+	gotPtr := gotKRoot.any.(*[2][2]gKey)
+	gotSlice := gotKRoot.all[0].iface.([][2]gKey)
+	gotPtr[0][1] = gKey{a: 42, b: "mutated"}
+	if gotSlice[1][1] != (gKey{a: 42, b: "mutated"}) {
+		t.Errorf("gotPtr does not alias gotSlice[1:3]: gotSlice=%v", gotSlice)
+	}
+
+	// Partially overlapping slices of non-power-of-2-sized [2]gKey elements
+	// where the lower-addressed slice is encoded first.
+	overlapRoot := &gRoot{
+		any: ks[0:2:2],
+		all: []*gNode{{iface: ks[1:3:3]}},
+	}
+	buf.Reset()
+	if _, err := state.Save(t.Context(), &buf, overlapRoot); err != nil {
+		t.Fatalf("Save overlapping slice-of-arrays: %v", err)
+	}
+	var gotOverlap gRoot
+	if _, err := state.Load(t.Context(), bytes.NewReader(buf.Bytes()), &gotOverlap); err != nil {
+		t.Fatalf("Load overlapping slice-of-arrays: %v", err)
+	}
+	gotLo := gotOverlap.any.([][2]gKey)
+	gotHi := gotOverlap.all[0].iface.([][2]gKey)
+	gotLo[1][0] = gKey{a: 77, b: "shared"}
+	if gotHi[0][0] != (gKey{a: 77, b: "shared"}) {
+		t.Errorf("gotLo[1][0] does not alias gotHi[0][0]: gotHi=%v", gotHi)
+	}
+
+	// Unaligned sub-slice of arrays spanning an outer element boundary,
+	// absorbed by an enclosing slice of the same array element type.
+	flat := [6]gKey{
+		{a: 10, b: "a"}, {a: 20, b: "b"},
+		{a: 30, b: "c"}, {a: 40, b: "d"},
+		{a: 50, b: "e"}, {a: 60, b: "f"},
+	}
+	sInner := unsafe.Slice((*[2]gKey)(unsafe.Pointer(&flat[1])), 1)
+	sOuter := unsafe.Slice((*[2]gKey)(unsafe.Pointer(&flat[0])), 3)
+	uRoot := &gRoot{
+		any: sInner,
+		all: []*gNode{{iface: sOuter}},
+	}
+	buf.Reset()
+	if _, err := state.Save(t.Context(), &buf, uRoot); err != nil {
+		t.Fatalf("Save unaligned slice-of-arrays: %v", err)
+	}
+	var gotURoot gRoot
+	if _, err := state.Load(t.Context(), bytes.NewReader(buf.Bytes()), &gotURoot); err != nil {
+		t.Fatalf("Load unaligned slice-of-arrays: %v", err)
+	}
+	gotInner := gotURoot.any.([][2]gKey)
+	gotOuter := gotURoot.all[0].iface.([][2]gKey)
+	gotInner[0][0] = gKey{a: 98, b: "aliased-lo"}
+	gotInner[0][1] = gKey{a: 99, b: "aliased-hi"}
+	if gotOuter[0][1] != (gKey{a: 98, b: "aliased-lo"}) || gotOuter[1][0] != (gKey{a: 99, b: "aliased-hi"}) {
+		t.Errorf("gotInner does not alias gotOuter across boundary: gotOuter=%v", gotOuter)
+	}
+}
+
+func TestMapAliasedThroughNamedType(t *testing.T) {
+	prev := state.GraphEngineEnabled()
+	state.EnableGraphEngine(true)
+	defer state.EnableGraphEngine(prev)
+
+	m := map[string]int64{"x": 1}
+	saved := &gAliasMapRoot{m: m, nm: m}
+	var buf bytes.Buffer
+	if _, err := state.Save(t.Context(), &buf, saved); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data := buf.Bytes()
+	var out bytes.Buffer
+	if err := pretty.PrintText(&out, bytes.NewReader(data)); err != nil {
+		t.Fatalf("PrintText: %v", err)
+	}
+	var got gAliasMapRoot
+	if _, err := state.Load(t.Context(), bytes.NewReader(data), &got); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	got.m["y"] = 2
+	if got.nm["x"] != 1 || got.nm["y"] != 2 {
+		t.Errorf("map not shared after load: m=%v nm=%v", got.m, got.nm)
 	}
 }

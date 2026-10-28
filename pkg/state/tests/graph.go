@@ -475,3 +475,21 @@ type gBytesRoot struct {
 	n   int64
 	s   string
 }
+
+// gAliasNamedMap is an unregistered named map type sharing its underlying type
+// with map[string]int64.
+type gAliasNamedMap map[string]int64
+
+// +stateify savable
+type gAliasMapRoot struct {
+	m  map[string]int64
+	nm gAliasNamedMap
+}
+
+// +stateify savable
+type gSliceOfArraysRoot struct {
+	sliceFirst [][2]int64
+	ptrSecond  *[2][2]int64
+	ptrFirst   *[2][2]int64
+	sliceNext  [][2]int64
+}
