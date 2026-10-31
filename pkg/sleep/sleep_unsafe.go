@@ -197,17 +197,18 @@ func (s *Sleeper) nextWaker(block, wakepOrSleep bool) *Waker {
 			// need to wakep once we get a value.
 			wakepOrSleep = false
 
-			// Try to commit the sleep and report it to the
-			// tracer as a select.
+			// Try to commit the sleep.
 			//
 			// gopark puts the caller to sleep and calls
 			// commitSleep to decide whether to immediately
 			// wake the caller up or to leave it sleeping.
-			const traceEvGoBlockSelect = 24
-			// See:runtime2.go in the go runtime package for
-			// the values to pass as the waitReason here.
-			const waitReasonSelect = 9
-			sync.Gopark(commitSleep, unsafe.Pointer(&s.waitingG), sync.WaitReasonSelect, sync.TraceBlockSelect, 0)
+			//
+			// WaitReasonSemacquire/TraceBlockSync are consistent
+			// with sync.Gate. Do not use WaitReasonSelect: the
+			// runtime expects a goroutine parked with it to have
+			// channel sudogs, and the goroutine leak detector
+			// marks it as leaked if it has none.
+			sync.Gopark(commitSleep, unsafe.Pointer(&s.waitingG), sync.WaitReasonSemacquire, sync.TraceBlockSync, 0)
 		}
 
 		// Pull the shared list out and reverse it in the local

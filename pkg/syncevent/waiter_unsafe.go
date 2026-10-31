@@ -93,7 +93,12 @@ func (w *Waiter) WaitFor(es Set) Set {
 		// If w.g is still preparingG (i.e. w.NotifyPending() has not been
 		// called or has not reached atomic.SwapUintptr()), go to sleep until
 		// w.NotifyPending() => goready().
-		sync.Gopark(waiterCommit, unsafe.Pointer(&w.g), sync.WaitReasonSelect, sync.TraceBlockSelect, 0)
+		//
+		// WaitReasonSemacquire/TraceBlockSync are consistent with sync.Gate.
+		// Do not use WaitReasonSelect: the runtime expects a goroutine parked
+		// with it to have channel sudogs, and the goroutine leak detector
+		// marks it as leaked if it has none.
+		sync.Gopark(waiterCommit, unsafe.Pointer(&w.g), sync.WaitReasonSemacquire, sync.TraceBlockSync, 0)
 	}
 }
 
@@ -138,8 +143,8 @@ func (w *Waiter) WaitAndAckAll() Set {
 
 		// If w.g is still preparingG (i.e. w.NotifyPending() has not been
 		// called or has not reached atomic.SwapUintptr()), go to sleep until
-		// w.NotifyPending() => goready().
-		sync.Gopark(waiterCommit, unsafe.Pointer(&w.g), sync.WaitReasonSelect, sync.TraceBlockSelect, 0)
+		// w.NotifyPending() => goready(). See WaitFor for the wait reason.
+		sync.Gopark(waiterCommit, unsafe.Pointer(&w.g), sync.WaitReasonSemacquire, sync.TraceBlockSync, 0)
 
 		// Check for pending events. We call PendingAndAckAll() directly now since
 		// we only expect to be woken after events become pending.
