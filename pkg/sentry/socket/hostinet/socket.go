@@ -583,9 +583,16 @@ func (s *Socket) Shutdown(_ *kernel.Task, how int) *syserr.Error {
 	}
 	switch how {
 	case unix.SHUT_RD, unix.SHUT_RDWR:
-		// Mark the socket as closed for reading.
+		err := unix.Shutdown(s.fd, how)
+		// Mark the socket as closed for reading only after the host socket
+		// is, so that a reader that sees recvClosed and reads again gets the
+		// data still queued or EOF. Like Linux, do this even if shutdown
+		// fails, e.g. with ENOTCONN on an unconnected socket.
 		s.recvClosed.Store(true)
-		fallthrough
+		// A reader may have seen the host's shutdown before recvClosed was
+		// set; the host will not notify it again.
+		s.queue.Notify(waiter.EventRdHUp)
+		return syserr.FromError(err)
 	case unix.SHUT_WR:
 		return syserr.FromError(unix.Shutdown(s.fd, how))
 	default:
@@ -683,8 +690,16 @@ func (s *Socket) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, have
 			if n != 0 {
 				panic(fmt.Sprintf("CopyOutFrom: got (%d, %v), wanted (0, %v)", n, err, err))
 			}
-			// Are we closed for reading? No sense in trying to read if so.
+			// Are we closed for reading? No sense in waiting if so. Shutdown
+			// shuts down the host socket before it sets recvClosed, so one more
+			// read returns any data still queued, or 0 for TCP. A datagram
+			// socket with nothing queued still returns EAGAIN; like Linux, a
+			// blocking recv then returns 0.
 			if s.recvClosed.Load() {
+				n, err = copyToDst()
+				if linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+					err = nil
+				}
 				break
 			}
 			if ch != nil {
