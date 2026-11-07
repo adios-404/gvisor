@@ -1251,8 +1251,8 @@ func (s *sender) isAssignedSequenceNumber(seg *segment) bool {
 // that the timeout was spurious, so skip writeNext past the data already
 // sent and count that data as outstanding again. SACKed segments stay out of
 // Outstanding, as in the ACK removal loop. A segment of that data that was
-// really lost is then repaired by fast retransmit, which detectLoss allows
-// from here on (RFC4015 Section 4).
+// really lost is then repaired by fast retransmit or RACK, which
+// resendingTimeoutFlight and detectLoss allow from here on (RFC4015 Section 4).
 //
 // See: https://datatracker.ietf.org/doc/html/rfc4015#section-3.3.
 //
@@ -1275,6 +1275,18 @@ func (s *sender) resumeAfterSpuriousTimeout() {
 	}
 	s.updateWriteNext(next)
 	s.spuriousTimeoutResumed = true
+}
+
+// resendingTimeoutFlight reports whether timeout recovery is still resending
+// the flight that was outstanding at the RTO go-back-N, so that loss recovery
+// must not start. Once the timeout has been shown spurious and the sender has
+// resumed with unsent data (RFC4015 step (8)), that flight is no longer
+// resent, so a segment of it that was really lost must be repaired by fast
+// retransmit or RACK instead of another timeout (RFC4015 Section 4).
+//
+// +checklocks:s.ep.mu
+func (s *sender) resendingTimeoutFlight() bool {
+	return s.state == tcpip.RTORecovery && !s.spuriousTimeoutResumed
 }
 
 // SetPipe implements the SetPipe() function described in RFC6675. Netstack
@@ -1356,8 +1368,9 @@ func (s *sender) detectLoss(seg *segment) (fastRetransmit bool) {
 	// ACK must not change the state to Disorder. A retransmission lost in this
 	// state waits for the next RTO. See RFC 6582, section 3.2, steps 2 and 4;
 	// RFC 8985, section 9.3; and, for an RTO during loss recovery, RFC 6675,
-	// section 5.1.
-	if s.state == tcpip.RTORecovery {
+	// section 5.1. This ends early if the timeout proves spurious and the
+	// sender resumes with unsent data; see resendingTimeoutFlight.
+	if s.resendingTimeoutFlight() {
 		return false
 	}
 
@@ -1885,7 +1898,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		// reorder window.
 		// Do not start fast recovery while timeout recovery is still draining
 		// the pre-RTO flight. See sender.detectLoss.
-		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active && s.state != tcpip.RTORecovery {
+		if numLost := s.rc.detectLoss(rcvdSeg.rcvdTime); numLost > 0 && !s.FastRecovery.Active && !s.resendingTimeoutFlight() {
 			// If any segment is marked as lost by
 			// RACK, enter recovery and retransmit
 			// the lost segments.

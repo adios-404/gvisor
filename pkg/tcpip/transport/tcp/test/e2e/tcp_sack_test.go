@@ -1193,10 +1193,23 @@ func TestSpuriousRTOPartialFirstACK(t *testing.T) {
 // flight that was really lost after a spurious timeout, without another
 // timeout. Segment 2 is lost. The first ACK covers segment 1 and reports
 // segments 3 to 5. It shows that the timeout was spurious, so the sender
-// resumes with unsent data, and RACK finds segment 2 lost.
+// resumes with unsent data, and RACK finds segment 2 lost while the sender is
+// still in timeout recovery.
 func TestSpuriousRTORACKRetransmit(t *testing.T) {
+	testSpuriousRTORACKRetransmit(t, 0)
+}
+
+// TestSpuriousRTORACKReorderTimer repeats TestSpuriousRTORACKRetransmit with a
+// coarse clock, so that RACK finds segment 2 lost when its reordering timer
+// fires rather than on the ACK.
+func TestSpuriousRTORACKReorderTimer(t *testing.T) {
+	testSpuriousRTORACKRetransmit(t, time.Millisecond)
+}
+
+func testSpuriousRTORACKRetransmit(t *testing.T, clockResolution time.Duration) {
+	t.Helper()
 	clock := faketime.NewManualClock()
-	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: mtu, Clock: clock})
+	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: mtu, Clock: clock, ClockResolution: clockResolution})
 	defer c.Cleanup()
 	const numPackets = 6
 	data := make([]byte, numPackets*maxPayload)
@@ -1206,10 +1219,29 @@ func TestSpuriousRTORACKRetransmit(t *testing.T) {
 	ack := sendSpuriousRTOFlight(t, c, clock, data, len(data), true /* rack */)
 
 	ack(maxPayload, header.SACKBlock{Start: c.IRS.Add(1 + 2*maxPayload), End: c.IRS.Add(1 + 5*maxPayload)})
+	stats := c.Stack().Stats().TCP
+	if clockResolution != 0 {
+		// Wait until the ACK is being processed; TCP_INFO then waits for
+		// it to finish, so the reordering timer is armed before the clock
+		// moves.
+		if err := testutil.Poll(func() error {
+			if got := stats.SpuriousRTORecovery.Value(); got != 1 {
+				return fmt.Errorf("got SpuriousRTORecovery = %d, want 1", got)
+			}
+			return nil
+		}, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		var info tcpip.TCPInfoOption
+		if err := c.EP.GetSockOpt(&info); err != nil {
+			t.Fatalf("TCP_INFO: %v", err)
+		}
+		c.CheckNoPacket("segment 2 was resent before the reordering timer fired")
+		clock.Advance(2 * clockResolution)
+	}
 	c.ReceiveAndCheckPacketWithOptions(data, maxPayload, maxPayload, tsOptionSize)
 	c.CheckNoPacket("segments 3 to 6 were sent again after a spurious timeout")
 
-	stats := c.Stack().Stats().TCP
 	if got := stats.SpuriousRTORecovery.Value(); got != 1 {
 		t.Errorf("got SpuriousRTORecovery = %d, want 1", got)
 	}

@@ -446,7 +446,7 @@ func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 	numLost := rc.detectLoss(rc.snd.reorderTimer.target)
 	// A reordering timer must not start fast recovery while timeout recovery
 	// is still draining the pre-RTO flight. See sender.detectLoss.
-	if numLost == 0 || rc.snd.state == tcpip.RTORecovery {
+	if numLost == 0 || rc.snd.resendingTimeoutFlight() {
 		return nil
 	}
 
