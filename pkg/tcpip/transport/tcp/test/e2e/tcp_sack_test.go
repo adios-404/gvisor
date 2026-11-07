@@ -1274,6 +1274,108 @@ func TestSpuriousRTORACKRetransmit(t *testing.T) {
 	}
 }
 
+// TestSpuriousRTOReorderAfterResume checks that the RFC 4015 response still
+// restores ssthresh when a duplicate ACK arrives after the sender resumed
+// with unsent data. Nothing is lost: segment 4 arrives before segment 3, so
+// the peer reports it in one duplicate ACK, then acknowledges the flight. The
+// in-order case acknowledges the flight without the duplicate ACK.
+func TestSpuriousRTOReorderAfterResume(t *testing.T) {
+	for _, rack := range []bool{false, true} {
+		for _, reorder := range []bool{false, true} {
+			t.Run(fmt.Sprintf("rack=%t/reorder=%t", rack, reorder), func(t *testing.T) {
+				testSpuriousRTOReorderAfterResume(t, rack, reorder)
+			})
+		}
+	}
+}
+
+func testSpuriousRTOReorderAfterResume(t *testing.T, rack, reorder bool) {
+	clock := faketime.NewManualClock()
+	observed := make(chan tcp.TCPSenderState, 64)
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true, MTU: mtu, Clock: clock,
+		Probe: func(s *tcp.TCPEndpointState) { observed <- s.Sender },
+	})
+	defer c.Cleanup()
+	const numPackets = 6
+	data := make([]byte, numPackets*maxPayload)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	ack := sendSpuriousRTOFlight(t, c, clock, data, len(data), rack)
+
+	ack(2 * maxPayload)
+	if reorder {
+		ack(2*maxPayload, header.SACKBlock{Start: c.IRS.Add(1 + 3*maxPayload), End: c.IRS.Add(1 + 4*maxPayload)})
+	}
+	ack(len(data))
+	want := c.IRS.Add(1 + seqnum.Size(len(data)))
+	var state tcp.TCPSenderState
+	for state.SndUna != want {
+		select {
+		case state = <-observed:
+		case <-time.After(time.Second):
+			t.Fatal("the last ACK was not processed")
+		}
+	}
+	c.CheckNoPacket("a segment was sent again after a spurious timeout")
+
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("TCP_INFO: %v", err)
+	}
+	if info.CcState != tcpip.Open {
+		t.Errorf("got CcState = %v, want %v", info.CcState, tcpip.Open)
+	}
+	if state.Ssthresh != tcp.InitialSsthresh {
+		t.Errorf("got Ssthresh = %d, want %d: the spurious timeout was not undone", state.Ssthresh, tcp.InitialSsthresh)
+	}
+}
+
+// TestSpuriousRTOLossAfterReorderedACK checks the other side of
+// TestSpuriousRTOReorderAfterResume: a genuine loss found after a duplicate
+// ACK has moved the resumed sender to Disorder starts a new recovery, so the
+// spurious timeout's pending response no longer applies to it.
+func TestSpuriousRTOLossAfterReorderedACK(t *testing.T) {
+	clock := faketime.NewManualClock()
+	observed := make(chan tcp.TCPSenderState, 64)
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true, MTU: mtu, Clock: clock,
+		Probe: func(s *tcp.TCPEndpointState) { observed <- s.Sender },
+	})
+	defer c.Cleanup()
+	const numPackets = 6
+	data := make([]byte, numPackets*maxPayload)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	ack := sendSpuriousRTOFlight(t, c, clock, data, len(data), false /* rack */)
+
+	// Segment 3 was lost. The first duplicate ACK moves the sender to
+	// Disorder; the third starts fast recovery.
+	ack(2 * maxPayload)
+	start := c.IRS.Add(1 + 3*maxPayload)
+	for end := 4; end <= numPackets; end++ {
+		ack(2*maxPayload, header.SACKBlock{Start: start, End: c.IRS.Add(1 + seqnum.Size(end*maxPayload))})
+	}
+	c.ReceiveAndCheckPacketWithOptions(data, 2*maxPayload, maxPayload, tsOptionSize)
+
+	var state tcp.TCPSenderState
+	for !state.FastRecovery.Active {
+		select {
+		case state = <-observed:
+		case <-time.After(time.Second):
+			t.Fatal("the sender did not enter fast recovery")
+		}
+	}
+	if state.SpuriousRecovery {
+		t.Error("got SpuriousRecovery = true in the new recovery, want false")
+	}
+	if state.Ssthresh >= tcp.InitialSsthresh {
+		t.Errorf("got Ssthresh = %d, want it reduced for the genuine loss", state.Ssthresh)
+	}
+}
+
 func testSpuriousRTOFastRetransmit(t *testing.T, firstACK int) {
 	t.Helper()
 	clock := faketime.NewManualClock()

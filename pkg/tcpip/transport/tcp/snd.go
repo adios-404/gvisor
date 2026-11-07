@@ -1936,10 +1936,14 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 				// The removal loop has run, so Outstanding is
 				// the true FlightSize: apply the RFC4015
 				// response here if the recovery was detected
-				// spurious (RFC3522).
-				if s.inRecovery() && s.spuriousRecovery {
+				// spurious (RFC3522). After a spurious timeout
+				// the sender may have resumed with unsent data
+				// and then left RTORecovery on a duplicate ACK;
+				// that recovery still ends here.
+				if (s.inRecovery() || s.spuriousTimeoutResumed) && s.spuriousRecovery {
 					s.undoSpuriousRecovery(originalOutstanding - s.Outstanding)
 				}
+				s.spuriousTimeoutResumed = false
 				s.state = tcpip.Open
 				// Update RACK when we are exiting fast or RTO
 				// recovery as described in the RFC
