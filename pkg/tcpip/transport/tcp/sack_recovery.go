@@ -50,6 +50,9 @@ func (sr *sackRecovery) handleSACKRecovery(limit int, end seqnum.Value) (dataSen
 		if nextSeg == nil {
 			return dataSent
 		}
+		if snd.pacer.Rate != 0 && !snd.pacingAllows(&limit) {
+			return dataSent
+		}
 		if !snd.isAssignedSequenceNumber(nextSeg) || snd.SndNxt.LessThanEq(nextSeg.sequenceNumber) {
 			// New data being sent.
 

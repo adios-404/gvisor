@@ -555,7 +555,11 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 			break
 		}
 
-		if sent := snd.maybeSendSegment(seg, int(snd.ep.scoreboard.SMSS()), snd.SndUna.Add(snd.SndWnd)); !sent {
+		limit := int(snd.ep.scoreboard.SMSS())
+		if snd.pacer.Rate != 0 && !snd.pacingAllows(&limit) {
+			break
+		}
+		if sent := snd.maybeSendSegment(seg, limit, snd.SndUna.Add(snd.SndWnd)); !sent {
 			break
 		}
 		dataSent = true

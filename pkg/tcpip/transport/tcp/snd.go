@@ -203,6 +203,12 @@ type sender struct {
 
 	// rate samples the rate at which the network delivers data.
 	rate rateSampler
+
+	// pacer spaces out transmissions when the sender is paced.
+	pacer pacer
+
+	// pacingTimer wakes a paced sender when it may send again.
+	pacingTimer timer `state:"nosave"`
 }
 
 // protectedWriteList wraps the write list, checking for invalid state when
@@ -318,6 +324,8 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 	ep.snd.reorderTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.rc.reorderTimerExpired))
 	ep.snd.probeTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.probeTimerExpired))
 	ep.snd.corkTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.corkTimerExpired))
+	ep.snd.pacingTimer.init(ep.snd.ep.stack.Clock(), timerHandler(ep.snd.ep, ep.snd.pacingTimerExpired))
+	ep.snd.pacer.init(ep.snd.ep.stack.ClockResolution())
 
 	ep.snd.updateMaxPayloadSize(int(ep.snd.ep.route.MTU()), 0)
 	// Initialize SACK Scoreboard after updating max payload size as we use
@@ -355,6 +363,8 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 		// tcpi_delivery_rate_app_limited is set from the start.
 		ep.snd.rate.RateAppLimited = true
 	}
+
+	ep.snd.updatePacingRate()
 }
 
 // initCongestionControl initializes the specified congestion control module and
@@ -718,7 +728,13 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 		return &tcpip.ErrTimeout{}
 	}
 
+	// The retransmission does not wait for pacing, as in Linux, whose
+	// retransmission timer sends it directly.
+	bypass := s.pacer.sendOneNow()
 	s.sendData()
+	if bypass {
+		s.pacer.cancelSendOneNow()
+	}
 
 	return nil
 }
@@ -1171,7 +1187,13 @@ func (s *sender) sendData() {
 			s.updateWriteNext(seg.Next())
 			continue
 		}
-		if sent := s.maybeSendSegment(seg, limit, end); !sent {
+		// What is left of a send quantum limits this segment only: the
+		// next one may start a new quantum.
+		segLimit := limit
+		if s.pacer.Rate != 0 && !s.pacingAllows(&segLimit) {
+			break
+		}
+		if sent := s.maybeSendSegment(seg, segLimit, end); !sent {
 			break
 		}
 		dataSent = true
@@ -1853,6 +1875,8 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		s.rate.endACK()
 	}
 
+	s.updatePacingRate()
+
 	if s.ep.SACKPermitted && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
 		// Update RACK reorder window.
 		// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
@@ -1911,11 +1935,19 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 		}
 	}
 	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
-	if size := seg.payloadSize(); s.rate.enabled && size != 0 {
-		// Without RACK no segment is marked lost, so a retransmission made
-		// during fast recovery is what tells the sampler about the loss. A
-		// tail loss probe is sent outside recovery and is not a loss.
-		s.rate.onSent(&seg.rate, size, seg.xmitTime, seg.xmitCount > 0 && s.FastRecovery.Active)
+	if size := seg.payloadSize(); size != 0 {
+		if s.rate.enabled {
+			// Without RACK no segment is marked lost, so a retransmission
+			// made during fast recovery is what tells the sampler about the
+			// loss. A tail loss probe is sent outside recovery and is not a
+			// loss.
+			s.rate.onSent(&seg.rate, size, seg.xmitTime, seg.xmitCount > 0 && s.FastRecovery.Active)
+		}
+		if s.pacer.Rate != 0 {
+			// Every transmission counts against the pacing rate, including
+			// those that do not wait for their turn.
+			s.pacer.onSent(size, seg.xmitTime)
+		}
 	}
 	seg.xmitCount++
 	seg.lost = false
@@ -2030,6 +2062,90 @@ func (s *sender) updateWriteNext(seg *segment) {
 		seg.IncRef()
 	}
 	s.writeNext = seg
+}
+
+// Pacing ratios applied to the rate that the congestion window allows when
+// SO_MAX_PACING_RATE is set, in percent. They are the defaults of Linux's
+// tcp_pacing_ss_ratio and tcp_pacing_ca_ratio sysctls.
+const (
+	pacingSlowStartPercent           = 200
+	pacingCongestionAvoidancePercent = 120
+)
+
+// updatePacingRate sets the pacing rate from SO_MAX_PACING_RATE. Linux turns
+// on pacing for any congestion control algorithm when that option is set, and
+// paces at the rate the congestion window allows, cwnd * mss / srtt, scaled up
+// so that the window can still grow, but at most at the option's value. The
+// window's rate is doubled in slow start, so that cwnd can double every round
+// trip, and raised by a fifth afterwards. Before there is an RTT estimate the
+// option's value is used.
+//
+// +checklocks:s.ep.mu
+// +checklocksexclude:s.rtt.rttMutex
+func (s *sender) updatePacingRate() {
+	maxRate := s.ep.ops.GetMaxPacingRate()
+	if maxRate == tcpip.UnlimitedPacingRate {
+		if s.pacer.Rate != 0 {
+			s.pacer.setRate(0, s.MaxPayloadSize)
+		}
+		return
+	}
+	rate := maxRate
+	s.rtt.Lock()
+	srtt := s.rtt.TCPRTTState.SRTT
+	srttInited := s.rtt.TCPRTTState.SRTTInited
+	s.rtt.Unlock()
+	if srttInited && srtt > 0 {
+		percent := uint64(pacingCongestionAvoidancePercent)
+		if s.SndCwnd < s.Ssthresh {
+			percent = pacingSlowStartPercent
+		}
+		cwndBytes := uint64(s.SndCwnd) * uint64(s.MaxPayloadSize)
+		rate = min(rate, bytesPerSecond(cwndBytes*percent/100, srtt))
+	}
+	s.pacer.setRate(rate, s.MaxPayloadSize)
+}
+
+// pacingAllows reports whether a paced sender may transmit now and, if it
+// may, lowers *limit to the most data it may send in one segment. If it may
+// not, it arms the pacing timer for when it may.
+//
+// +checklocks:s.ep.mu
+func (s *sender) pacingAllows(limit *int) bool {
+	if wait := s.pacer.ready(s.ep.stack.Clock().NowMonotonic()); wait > 0 {
+		s.pacingTimer.enable(wait)
+		return false
+	}
+	*limit = s.pacer.limit(*limit, s.MaxPayloadSize)
+	return true
+}
+
+// pacingTimerExpired sends the data that a paced sender held back, the same
+// way as the end of ACK processing does.
+//
+// +checklocks:s.ep.mu
+// +checklocksexclude:s.rtt.rttMutex
+func (s *sender) pacingTimerExpired() tcpip.Error {
+	// Check if the timer actually expired or if it's a spurious wake due
+	// to a previously orphaned runtime timer.
+	if s.pacingTimer.isUninitialized() || !s.pacingTimer.checkExpiration() {
+		return nil
+	}
+	s.checkAppLimited()
+
+	if s.FastRecovery.Active && s.ep.SACKPermitted {
+		if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+			s.rc.DoRecovery(nil, false /* fastRetransmit */)
+		} else if sr, ok := s.lr.(*sackRecovery); ok {
+			// RFC 6675 recovery sends new data too. sr.s is s, whose
+			// endpoint lock is held.
+			dataSent := sr.handleSACKRecovery(s.MaxPayloadSize, s.SndUna.Add(s.SndWnd)) // +checklocksforce:sr.s.ep.mu
+			s.postXmit(dataSent, true /* shouldScheduleProbe */)
+			return nil
+		}
+	}
+	s.sendData()
+	return nil
 }
 
 // corkTimerExpired drains all the segments when TCP_CORK is enabled.

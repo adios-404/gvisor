@@ -355,6 +355,8 @@ const DefaultTTL = 64
 
 const sizeOfInt32 int = 4
 
+const sizeOfInt64 int = 8
+
 // truncateInt32Result truncates an int32 value to outLen bytes, mimicking
 // the Linux kernel's getsockopt behavior for small buffers. Linux's
 // do_tcp_getsockopt() clamps the user-supplied buflen via
@@ -1196,6 +1198,21 @@ func GetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, family
 
 		v := primitive.Uint32(ep.SocketOptions().GetMark())
 		return &v, nil
+
+	case linux.SO_MAX_PACING_RATE:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		// As in Linux, an unsigned long is returned if there is room for
+		// one, and otherwise a 32-bit value capped at ~0.
+		rate := ep.SocketOptions().GetMaxPacingRate()
+		if outLen >= sizeOfInt64 {
+			v := primitive.Uint64(rate)
+			return &v, nil
+		}
+		v := primitive.Uint32(min(rate, math.MaxUint32))
+		return &v, nil
 	default:
 		if v, err, handled := getSockOptSocketCustom(t, s, ep, name, outLen); handled {
 			return v, err
@@ -1279,6 +1296,8 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 			SndMss:       v.SndMss,
 			TotalRetrans: v.TotalRetrans,
 		}
+		info.PacingRate = v.PacingRate
+		info.MaxPacingRate = v.MaxPacingRate
 		if v.Timestamps {
 			info.Options |= linux.TCPI_OPT_TIMESTAMPS
 		}
@@ -2173,6 +2192,24 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		v := hostarch.ByteOrder.Uint32(optVal)
 		ep.SocketOptions().SetMark(v)
 		return nil
+
+	case linux.SO_MAX_PACING_RATE:
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+
+		// As in Linux, an unsigned long is read if there is one, and a
+		// 32-bit ~0 means no limit.
+		var v uint64
+		if len(optVal) >= sizeOfInt64 {
+			v = hostarch.ByteOrder.Uint64(optVal)
+		} else if v32 := hostarch.ByteOrder.Uint32(optVal); v32 == math.MaxUint32 {
+			v = tcpip.UnlimitedPacingRate
+		} else {
+			v = uint64(v32)
+		}
+		ep.SocketOptions().SetMaxPacingRate(v)
+		return nil
 	case linux.SO_DEBUG,
 		linux.SO_TYPE,
 		linux.SO_ERROR,
@@ -2198,7 +2235,6 @@ func SetSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name i
 		linux.SO_LOCK_FILTER,
 		linux.SO_SELECT_ERR_QUEUE,
 		linux.SO_BUSY_POLL,
-		linux.SO_MAX_PACING_RATE,
 		linux.SO_BPF_EXTENSIONS,
 		linux.SO_INCOMING_CPU,
 		linux.SO_ATTACH_BPF,

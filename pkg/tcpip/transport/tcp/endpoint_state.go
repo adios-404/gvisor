@@ -188,6 +188,7 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		snd.reorderTimer.init(s.Clock(), timerHandler(e, e.snd.rc.reorderTimerExpired))
 		snd.probeTimer.init(s.Clock(), timerHandler(e, e.snd.probeTimerExpired))
 		snd.corkTimer.init(s.Clock(), timerHandler(e, e.snd.corkTimerExpired))
+		snd.pacingTimer.init(s.Clock(), timerHandler(e, e.snd.pacingTimerExpired))
 	}
 	e.ops.InitHandler(e, e.stack, GetTCPSendBufferLimits, GetTCPReceiveBufferLimits)
 	e.segmentQueue.thaw()
@@ -278,6 +279,12 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 			// Rearm the timer if TCP_CORK is enabled which will
 			// drain all the segments in the queue after restore.
 			e.snd.corkTimer.enable(MinRTO)
+		}
+		if e.snd.pacer.Rate != 0 {
+			// The pacing timer is not saved. Rearm it so that data held
+			// back by pacing is sent after restore.
+			e.snd.pacer.restart()
+			e.snd.pacingTimer.enable(0)
 		}
 		e.mu.Unlock()
 		e.requeueOnRestore()

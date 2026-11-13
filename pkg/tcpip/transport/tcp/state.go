@@ -280,6 +280,24 @@ type TCPDeliveryRateState struct {
 	RateAppLimited bool
 }
 
+// TCPPacingState holds a copy of the internal state of pacing.
+//
+// See: https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-5.6.2
+//
+// +stateify savable
+type TCPPacingState struct {
+	// Rate is the pacing rate in bytes per second, or zero if the sender is
+	// not paced (C.pacing_rate).
+	Rate uint64
+
+	// Quantum is the most data, in bytes, sent at once (C.send_quantum).
+	Quantum int
+
+	// NextSendTime is the earliest time at which the next quantum may be
+	// sent (C.next_send_time).
+	NextSendTime tcpip.MonotonicTime
+}
+
 // TCPSenderState holds a copy of the internal state of the sender for a given
 // TCP Endpoint.
 //
@@ -361,6 +379,9 @@ type TCPSenderState struct {
 
 	// DeliveryRate holds the state related to delivery rate sampling.
 	DeliveryRate TCPDeliveryRateState
+
+	// Pacing holds the state related to pacing.
+	Pacing TCPPacingState
 
 	// RetransmitTS records the timestamp used to detect spurious recovery.
 	RetransmitTS uint32

@@ -168,6 +168,22 @@ go_test(
 )
 
 go_test(
+    name = "tcp_pacing_test",
+    size = "small",
+    srcs = ["tcp_pacing_test.go"],
+    deps = [
+        ":e2e",
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/faketime",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/seqnum",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/tcp/testing/context",
+    ],
+)
+
+go_test(
     name = "tcp_rate_test",
     size = "small",
     srcs = ["tcp_rate_test.go"],

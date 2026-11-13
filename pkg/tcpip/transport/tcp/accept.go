@@ -379,6 +379,7 @@ func (e *Endpoint) propagateInheritableOptionsLocked(n *Endpoint) {
 	n.boundPortFlags = e.boundPortFlags
 	n.userMSS = e.userMSS
 	n.ops.SetMark(e.ops.GetMark())
+	n.ops.SetMaxPacingRateNoNotify(e.ops.GetMaxPacingRate())
 	// n is not yet connected, so there is no delayed data for the handler to
 	// flush. The handler also acquires n.mu, which is already held.
 	n.ops.SetDelayOptionNoNotify(e.ops.GetDelayOption())

@@ -1324,6 +1324,13 @@ type TCPInfoOption struct {
 	// endpoint was limited by the application rather than by the network, in
 	// which case the network may be able to deliver data faster.
 	DeliveryRateAppLimited bool
+
+	// PacingRate is the rate in bytes per second at which the endpoint paces
+	// its data, or zero if it does not pace.
+	PacingRate uint64
+
+	// MaxPacingRate is the value of SO_MAX_PACING_RATE.
+	MaxPacingRate uint64
 }
 
 func (*TCPInfoOption) isGettableSocketOption() {}

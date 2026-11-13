@@ -15,6 +15,8 @@
 package tcpip
 
 import (
+	"math"
+
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -67,6 +69,10 @@ type SocketOptionsHandler interface {
 	// GetAcceptConn returns true if the socket is a TCP socket and is in
 	// listening state.
 	GetAcceptConn() bool
+
+	// OnMaxPacingRateSet is invoked when SO_MAX_PACING_RATE is set for an
+	// endpoint.
+	OnMaxPacingRateSet(v uint64)
 }
 
 // DefaultSocketOptionsHandler is an embeddable type that implements no-op
@@ -120,6 +126,9 @@ func (*DefaultSocketOptionsHandler) OnSetReceiveBufferSize(v, oldSz int64) (newS
 func (*DefaultSocketOptionsHandler) GetAcceptConn() bool {
 	return false
 }
+
+// OnMaxPacingRateSet implements SocketOptionsHandler.OnMaxPacingRateSet.
+func (*DefaultSocketOptionsHandler) OnMaxPacingRateSet(uint64) {}
 
 // StackHandler holds methods to access the stack options. These must be
 // implemented by the stack.
@@ -280,6 +289,13 @@ type SocketOptions struct {
 	//
 	// +checkatomic
 	mark atomicbitops.Uint32
+
+	// maxPacingRateComplement is the bitwise complement of the value set
+	// with SO_MAX_PACING_RATE, so that its zero value is
+	// UnlimitedPacingRate, the default.
+	//
+	// +checkatomic
+	maxPacingRateComplement atomicbitops.Uint64
 
 	mu sync.Mutex `state:"nosave"`
 
@@ -827,4 +843,29 @@ func (so *SocketOptions) GetMark() uint32 {
 // SetMark sets value for SO_MARK option.
 func (so *SocketOptions) SetMark(v uint32) {
 	so.mark.Store(v)
+}
+
+// UnlimitedPacingRate is the SO_MAX_PACING_RATE value that sets no limit. It
+// is the default.
+const UnlimitedPacingRate = math.MaxUint64
+
+// GetMaxPacingRate gets value for SO_MAX_PACING_RATE option, in bytes per
+// second.
+func (so *SocketOptions) GetMaxPacingRate() uint64 {
+	return ^so.maxPacingRateComplement.Load()
+}
+
+// SetMaxPacingRate sets value for SO_MAX_PACING_RATE option, in bytes per
+// second.
+func (so *SocketOptions) SetMaxPacingRate(v uint64) {
+	so.maxPacingRateComplement.Store(^v)
+	so.handler.OnMaxPacingRateSet(v)
+}
+
+// SetMaxPacingRateNoNotify sets value for SO_MAX_PACING_RATE option without
+// notifying the owning endpoint, so it is only safe on an endpoint that is not
+// yet connected, such as an accepted endpoint being initialized from its
+// listener.
+func (so *SocketOptions) SetMaxPacingRateNoNotify(v uint64) {
+	so.maxPacingRateComplement.Store(^v)
 }

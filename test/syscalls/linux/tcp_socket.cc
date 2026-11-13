@@ -2921,6 +2921,138 @@ TEST_P(SimpleTcpSocketTest, SetUnsupportedPMTUDISC) {
               SyscallSucceeds());
 }
 
+// Returns SO_MAX_PACING_RATE of fd read as a 64-bit value.
+uint64_t MaxPacingRate64(int fd) {
+  uint64_t rate = 0;
+  socklen_t len = sizeof(rate);
+  EXPECT_THAT(getsockopt(fd, SOL_SOCKET, SO_MAX_PACING_RATE, &rate, &len),
+              SyscallSucceeds());
+  EXPECT_EQ(len, sizeof(rate));
+  return rate;
+}
+
+// Returns SO_MAX_PACING_RATE of fd read as a 32-bit value.
+uint32_t MaxPacingRate32(int fd) {
+  uint32_t rate = 0;
+  socklen_t len = sizeof(rate);
+  EXPECT_THAT(getsockopt(fd, SOL_SOCKET, SO_MAX_PACING_RATE, &rate, &len),
+              SyscallSucceeds());
+  EXPECT_EQ(len, sizeof(rate));
+  return rate;
+}
+
+// Tests that SO_MAX_PACING_RATE sets no limit by default.
+TEST_P(SimpleTcpSocketTest, MaxPacingRateDefault) {
+  // hostinet does not support SO_MAX_PACING_RATE.
+  SKIP_IF(IsRunningWithHostinet());
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  EXPECT_EQ(MaxPacingRate64(s.get()), std::numeric_limits<uint64_t>::max());
+  EXPECT_EQ(MaxPacingRate32(s.get()), std::numeric_limits<uint32_t>::max());
+}
+
+// Tests that SO_MAX_PACING_RATE reads back as it was set, as a 32-bit or a
+// 64-bit value.
+TEST_P(SimpleTcpSocketTest, MaxPacingRateSetGet) {
+  // hostinet does not support SO_MAX_PACING_RATE.
+  SKIP_IF(IsRunningWithHostinet());
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  uint32_t rate32 = 1000000;
+  ASSERT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &rate32,
+                         sizeof(rate32)),
+              SyscallSucceeds());
+  EXPECT_EQ(MaxPacingRate64(s.get()), rate32);
+  EXPECT_EQ(MaxPacingRate32(s.get()), rate32);
+
+  // A rate that does not fit in 32 bits reads back as ~0 in 32 bits.
+  uint64_t rate64 = 5000000000;
+  ASSERT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &rate64,
+                         sizeof(rate64)),
+              SyscallSucceeds());
+  EXPECT_EQ(MaxPacingRate64(s.get()), rate64);
+  EXPECT_EQ(MaxPacingRate32(s.get()), std::numeric_limits<uint32_t>::max());
+
+  // A 32-bit ~0 sets no limit.
+  rate32 = std::numeric_limits<uint32_t>::max();
+  ASSERT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &rate32,
+                         sizeof(rate32)),
+              SyscallSucceeds());
+  EXPECT_EQ(MaxPacingRate64(s.get()), std::numeric_limits<uint64_t>::max());
+
+  // Shorter than an int.
+  uint16_t rate16 = 1;
+  EXPECT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &rate16,
+                         sizeof(rate16)),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+// Tests that an accepted socket has the SO_MAX_PACING_RATE of its listener.
+TEST_P(SimpleTcpSocketTest, MaxPacingRateInheritedOnAccept) {
+  // hostinet does not support SO_MAX_PACING_RATE.
+  SKIP_IF(IsRunningWithHostinet());
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddrZeroPort(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+  const FileDescriptor listener =
+      ASSERT_NO_ERRNO_AND_VALUE(ReserveLocalPort(GetParam(), addr, addrlen));
+  const uint64_t rate = 1000000;
+  ASSERT_THAT(setsockopt(listener.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &rate,
+                         sizeof(rate)),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(listener.get(), 1), SyscallSucceeds());
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  ASSERT_THAT(RetryEINTR(connect)(s.get(), AsSockAddr(&addr), addrlen),
+              SyscallSucceeds());
+  const FileDescriptor accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listener.get(), nullptr, nullptr));
+
+  EXPECT_EQ(MaxPacingRate64(accepted.get()), rate);
+}
+
+// Tests that SO_MAX_PACING_RATE limits the rate at which a TCP socket sends.
+TEST_P(SimpleTcpSocketTest, MaxPacingRateLimitsThroughput) {
+  // hostinet does not support SO_MAX_PACING_RATE.
+  SKIP_IF(IsRunningWithHostinet());
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddrZeroPort(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+  const FileDescriptor listener =
+      ASSERT_NO_ERRNO_AND_VALUE(ReserveLocalPort(GetParam(), addr, addrlen));
+  ASSERT_THAT(listen(listener.get(), 1), SyscallSucceeds());
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  ASSERT_THAT(RetryEINTR(connect)(s.get(), AsSockAddr(&addr), addrlen),
+              SyscallSucceeds());
+  const FileDescriptor accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listener.get(), nullptr, nullptr));
+
+  // 1 MiB at 1 MiB/s takes about a second.
+  constexpr uint64_t kRate = 1 << 20;
+  constexpr size_t kSize = 1 << 20;
+  ASSERT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_MAX_PACING_RATE, &kRate,
+                         sizeof(kRate)),
+              SyscallSucceeds());
+
+  const absl::Time start = absl::Now();
+  ScopedThread writer([&s] {
+    std::vector<char> data(kSize);
+    ASSERT_THAT(WriteFd(s.get(), data.data(), data.size()),
+                SyscallSucceedsWithValue(data.size()));
+  });
+  std::vector<char> received(kSize);
+  ASSERT_THAT(ReadFd(accepted.get(), received.data(), received.size()),
+              SyscallSucceedsWithValue(received.size()));
+  const absl::Duration elapsed = absl::Now() - start;
+
+  // A burst of up to two send quanta can leave at once, so allow for half
+  // the time. Unpaced, the transfer takes a few milliseconds.
+  EXPECT_GE(elapsed, absl::Milliseconds(500));
+  EXPECT_LE(elapsed, absl::Seconds(30));
+}
+
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,
                          ::testing::Values(AF_INET, AF_INET6));
 

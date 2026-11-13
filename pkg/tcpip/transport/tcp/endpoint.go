@@ -1227,6 +1227,7 @@ func (e *Endpoint) cleanupLocked() {
 		e.snd.probeTimer.cleanup()
 		e.snd.reorderTimer.cleanup()
 		e.snd.corkTimer.cleanup()
+		e.snd.pacingTimer.cleanup()
 	}
 
 	if e.finWait2Timer != nil {
@@ -1868,6 +1869,26 @@ func (e *Endpoint) OnCorkOptionSet(v bool) {
 	}
 }
 
+// OnMaxPacingRateSet implements tcpip.SocketOptionsHandler.OnMaxPacingRateSet.
+//
+// +checklocksexclude:e.segmentQueue.mu
+// +checklocksexclude:e.pendingProcessingMu
+func (e *Endpoint) OnMaxPacingRateSet(uint64) {
+	e.LockUser()
+	defer e.UnlockUser()
+	if e.snd == nil || !e.EndpointState().connected() {
+		// The sender reads the option when it is created.
+		return
+	}
+	wasPaced := e.snd.pacer.Rate != 0
+	e.snd.updatePacingRate()
+	if wasPaced && e.snd.pacer.Rate == 0 {
+		// Send what pacing held back.
+		e.snd.pacingTimer.disable()
+		e.sendData(nil /* next */)
+	}
+}
+
 func (e *Endpoint) getSendBufferSize() int {
 	return int(e.ops.GetSendBufferSize())
 }
@@ -2253,6 +2274,7 @@ func (e *Endpoint) getTCPInfo() tcpip.TCPInfoOption {
 		Timestamps:    e.SendTSOk,
 		SACKPermitted: e.SACKPermitted,
 		TotalRetrans:  uint32(e.stats.SendErrors.Retransmits.Value()),
+		MaxPacingRate: e.ops.GetMaxPacingRate(),
 	}
 	if state := e.EndpointState(); state.internal() {
 		info.State = tcpip.EndpointState(StateClose)
@@ -2277,6 +2299,7 @@ func (e *Endpoint) getTCPInfo() tcpip.TCPInfoOption {
 		info.ReorderSeen = snd.rc.Reord
 		info.DeliveryRate = snd.rate.Rate
 		info.DeliveryRateAppLimited = snd.rate.RateAppLimited
+		info.PacingRate = snd.pacer.Rate
 	}
 	e.UnlockUser()
 	return info
@@ -3361,6 +3384,7 @@ func (e *Endpoint) completeStateLocked(s *TCPEndpointState) {
 
 	s.Sender.RACKState = e.snd.rc.TCPRACKState
 	s.Sender.DeliveryRate = e.snd.rate.TCPDeliveryRateState
+	s.Sender.Pacing = e.snd.pacer.TCPPacingState
 	s.Sender.RetransmitTS = e.snd.retransmitTS
 	s.Sender.SpuriousRecovery = e.snd.spuriousRecovery
 }
