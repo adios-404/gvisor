@@ -30,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp/test/pathmodel"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -49,6 +50,9 @@ type topology struct {
 	endpoints []tcpip.Endpoint
 	pumps     sync.WaitGroup
 	once      sync.Once
+	// path, if not nil, carries the packets between the links instead of
+	// the pumps.
+	path *pathmodel.Path
 }
 
 func newTopology(t testing.TB, rack bool, batch time.Duration) *topology {
@@ -56,45 +60,52 @@ func newTopology(t testing.TB, rack bool, batch time.Duration) *topology {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	n := &topology{ctx: ctx, cancel: cancel}
 	t.Cleanup(n.close)
-	for i, addr := range []tcpip.Address{clientAddr, serverAddr} {
+	for i := range n.stacks {
 		link := channel.New(4096, 1280, "")
-		n.links[i] = link
 		// Inject GSO packets intact to model coalesced reception as frequently
 		// happens on loopback or with tight UDP/GRO. Partial checksums require
 		// RX checksum offload.
 		link.SupportedGSOKind = stack.HostGSOSupported
 		link.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
-		s := stack.New(stack.Options{
-			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-			TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
-		})
-		n.stacks[i] = s
-		if err := s.CreateNIC(1, link); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: addr.WithPrefix()}, stack.AddressProperties{}); err != nil {
-			t.Fatal(err)
-		}
-		s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
-		cc := tcpip.CongestionControlOption("cubic")
-		recovery := tcpip.TCPRecovery(0)
-		if rack {
-			recovery = tcpip.TCPRACKLossDetection
-		}
-		sack := tcpip.TCPSACKEnabled(true)
-		// Keep initial buffers at 1 MiB, not the larger autotuning limits.
-		// The initial buffer sizes affect flight sizes and ACK timing.
-		rx := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: 8 << 20}
-		tx := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: 6 << 20}
-		for _, opt := range []tcpip.SettableTransportProtocolOption{&cc, &recovery, &sack, &rx, &tx} {
-			if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
-				t.Fatalf("SetTransportProtocolOption(%T): %s", opt, err)
-			}
-		}
+		n.addStack(t, i, link, "cubic", rack)
 	}
 	n.startPump(n.links[0], n.links[1], batch)
 	n.startPump(n.links[1], n.links[0], batch)
 	return n
+}
+
+// addStack creates the client (i = 0) or server (i = 1) stack on link, using
+// the congestion control algorithm cc, with SACK and, if rack is true, RACK.
+func (n *topology) addStack(t testing.TB, i int, link *channel.Endpoint, cc tcpip.CongestionControlOption, rack bool) {
+	t.Helper()
+	addr := []tcpip.Address{clientAddr, serverAddr}[i]
+	n.links[i] = link
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	})
+	n.stacks[i] = s
+	if err := s.CreateNIC(1, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: addr.WithPrefix()}, stack.AddressProperties{}); err != nil {
+		t.Fatal(err)
+	}
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	recovery := tcpip.TCPRecovery(0)
+	if rack {
+		recovery = tcpip.TCPRACKLossDetection
+	}
+	sack := tcpip.TCPSACKEnabled(true)
+	// Keep initial buffers at 1 MiB, not the larger autotuning limits.
+	// The initial buffer sizes affect flight sizes and ACK timing.
+	rx := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultReceiveBufferSize, Max: 8 << 20}
+	tx := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: tcp.DefaultSendBufferSize, Max: 6 << 20}
+	for _, opt := range []tcpip.SettableTransportProtocolOption{&cc, &recovery, &sack, &rx, &tx} {
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, opt); err != nil {
+			t.Fatalf("SetTransportProtocolOption(%T): %s", opt, err)
+		}
+	}
 }
 
 type pumpNotifier chan struct{}
@@ -149,6 +160,9 @@ func (n *topology) close() {
 	n.once.Do(func() {
 		n.cancel()
 		n.pumps.Wait()
+		if n.path != nil {
+			n.path.Close()
+		}
 		for _, ep := range n.endpoints {
 			ep.Close()
 		}

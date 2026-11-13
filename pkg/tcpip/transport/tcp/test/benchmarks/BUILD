@@ -11,6 +11,7 @@ go_test(
     srcs = [
         "harness_test.go",
         "netstack_bench_test.go",
+        "path_bench_test.go",
     ],
     deps = [
         "//pkg/buffer",
@@ -21,6 +22,7 @@ go_test(
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/tcp/test/pathmodel",
         "//pkg/waiter",
     ],
 )
