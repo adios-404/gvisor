@@ -168,6 +168,24 @@ go_test(
 )
 
 go_test(
+    name = "tcp_rate_test",
+    size = "small",
+    srcs = ["tcp_rate_test.go"],
+    deps = [
+        ":e2e",
+        "//pkg/buffer",
+        "//pkg/refs",
+        "//pkg/tcpip",
+        "//pkg/tcpip/checker",
+        "//pkg/tcpip/faketime",
+        "//pkg/tcpip/header",
+        "//pkg/tcpip/seqnum",
+        "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/tcp/testing/context",
+    ],
+)
+
+go_test(
     name = "tcp_sack_test",
     size = "small",
     srcs = ["tcp_sack_test.go"],

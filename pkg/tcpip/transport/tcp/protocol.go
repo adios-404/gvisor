@@ -110,6 +110,8 @@ type protocol struct {
 	// +checklocks:mu
 	moderateReceiveBuffer bool
 	// +checklocks:mu
+	deliveryRateSampling bool
+	// +checklocks:mu
 	lingerTimeout time.Duration
 	// +checklocks:mu
 	timeWaitTimeout time.Duration
@@ -336,6 +338,12 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 		p.mu.Unlock()
 		return nil
 
+	case *tcpip.TCPDeliveryRateSamplingEnabled:
+		p.mu.Lock()
+		p.deliveryRateSampling = bool(*v)
+		p.mu.Unlock()
+		return nil
+
 	case *tcpip.TCPLingerTimeoutOption:
 		p.mu.Lock()
 		if *v < 0 {
@@ -472,6 +480,12 @@ func (p *protocol) Option(option tcpip.GettableTransportProtocolOption) tcpip.Er
 	case *tcpip.TCPModerateReceiveBufferOption:
 		p.mu.RLock()
 		*v = tcpip.TCPModerateReceiveBufferOption(p.moderateReceiveBuffer)
+		p.mu.RUnlock()
+		return nil
+
+	case *tcpip.TCPDeliveryRateSamplingEnabled:
+		p.mu.RLock()
+		*v = tcpip.TCPDeliveryRateSamplingEnabled(p.deliveryRateSampling)
 		p.mu.RUnlock()
 		return nil
 

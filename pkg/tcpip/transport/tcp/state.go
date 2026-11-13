@@ -229,6 +229,57 @@ type TCPRTTState struct {
 	SRTTInited bool
 }
 
+// TCPDeliveryRateState holds a copy of the internal state of delivery rate
+// sampling for a given TCP endpoint. Amounts of data are in bytes.
+//
+// See: https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-4.1
+//
+// +stateify savable
+type TCPDeliveryRateState struct {
+	// Delivered is the data delivered over the lifetime of the connection
+	// (C.delivered).
+	Delivered uint64
+
+	// DeliveredTime is when Delivered was last updated (C.delivered_time).
+	DeliveredTime tcpip.MonotonicTime
+
+	// FirstSendTime is the send time of the most recently delivered segment
+	// or, after an idle period, of the first segment sent
+	// (C.first_send_time).
+	FirstSendTime tcpip.MonotonicTime
+
+	// AppLimited is the value Delivered must exceed for the connection to
+	// stop being application-limited, or zero if it is not
+	// application-limited (C.app_limited).
+	AppLimited uint64
+
+	// Lost is the data declared lost over the lifetime of the connection
+	// (C.lost).
+	Lost uint64
+
+	// InFlight is the data that has been sent and neither delivered nor
+	// declared lost since its last transmission (C.inflight). It is kept
+	// separately from TCPSenderState.Outstanding, which counts packets and
+	// is recomputed during SACK recovery.
+	InFlight uint64
+
+	// LostPending is the data declared lost that has not been retransmitted
+	// yet. C.lost_out <= C.retrans_out holds exactly when it is zero.
+	LostPending uint64
+
+	// MinRTT is the lowest RTT sample seen on the connection, or zero if
+	// there is none yet (C.min_rtt).
+	MinRTT time.Duration
+
+	// Rate is the delivery rate reported to the application in bytes per
+	// second, as in Linux's tcpi_delivery_rate.
+	Rate uint64
+
+	// RateAppLimited is true if Rate was measured while the connection was
+	// application-limited, as in Linux's tcpi_delivery_rate_app_limited.
+	RateAppLimited bool
+}
+
 // TCPSenderState holds a copy of the internal state of the sender for a given
 // TCP Endpoint.
 //
@@ -307,6 +358,9 @@ type TCPSenderState struct {
 
 	// RACKState holds the state related to RACK loss detection algorithm.
 	RACKState TCPRACKState
+
+	// DeliveryRate holds the state related to delivery rate sampling.
+	DeliveryRate TCPDeliveryRateState
 
 	// RetransmitTS records the timestamp used to detect spurious recovery.
 	RetransmitTS uint32

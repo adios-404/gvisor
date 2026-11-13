@@ -1180,6 +1180,16 @@ func (*TCPModerateReceiveBufferOption) isGettableTransportProtocolOption() {}
 
 func (*TCPModerateReceiveBufferOption) isSettableTransportProtocolOption() {}
 
+// TCPDeliveryRateSamplingEnabled enables delivery rate sampling, which makes
+// TCPInfoOption.DeliveryRate available, for TCP connections established after
+// it is set. It is off by default because sampling costs CPU time on every
+// segment sent and acknowledged.
+type TCPDeliveryRateSamplingEnabled bool
+
+func (*TCPDeliveryRateSamplingEnabled) isGettableTransportProtocolOption() {}
+
+func (*TCPDeliveryRateSamplingEnabled) isSettableTransportProtocolOption() {}
+
 // GettableSocketOption is a marker interface for socket options that may be
 // queried.
 type GettableSocketOption interface {
@@ -1303,6 +1313,17 @@ type TCPInfoOption struct {
 
 	// SACKPermitted is true if selective acknowledgments were negotiated.
 	SACKPermitted bool
+
+	// DeliveryRate is the most recent estimate of the rate at which the
+	// network delivers the endpoint's data, in bytes per second. It is zero
+	// until there is a delivery rate sample, and always zero if delivery rate
+	// sampling is not enabled (see TCPDeliveryRateSamplingEnabled).
+	DeliveryRate uint64
+
+	// DeliveryRateAppLimited is true if DeliveryRate was measured while the
+	// endpoint was limited by the application rather than by the network, in
+	// which case the network may be able to deliver data faster.
+	DeliveryRateAppLimited bool
 }
 
 func (*TCPInfoOption) isGettableSocketOption() {}

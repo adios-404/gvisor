@@ -90,6 +90,9 @@ type segment struct {
 
 	// lost indicates if the segment is marked as lost by RACK.
 	lost bool
+
+	// rate is the delivery rate sampling state of a transmitted segment.
+	rate segRate
 }
 
 func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) (*segment, error) {
@@ -161,6 +164,8 @@ func (s *segment) clone() *segment {
 	t.rcvdTime = s.rcvdTime
 	t.xmitTime = s.xmitTime
 	t.xmitCount = s.xmitCount
+	// Both parts of a split segment keep the state recorded when it was sent.
+	t.rate = s.rate
 	t.ep = s.ep
 	t.qFlags = s.qFlags
 	t.dataMemSize = s.dataMemSize

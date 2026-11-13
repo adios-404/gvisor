@@ -1717,6 +1717,10 @@ func (e *Endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	e.LockUser()
 	defer e.UnlockUser()
 
+	if e.snd != nil {
+		e.snd.checkAppLimited()
+	}
+
 	// Return if either we didn't queue anything or if an error occurred while
 	// attempting to queue data.
 	nextSeg, n, err := e.queueSegment(p, opts)
@@ -2271,6 +2275,8 @@ func (e *Endpoint) getTCPInfo() tcpip.TCPInfoOption {
 		info.SndCwnd = uint32(snd.SndCwnd)
 		info.SndMss = uint32(snd.MaxPayloadSize)
 		info.ReorderSeen = snd.rc.Reord
+		info.DeliveryRate = snd.rate.Rate
+		info.DeliveryRateAppLimited = snd.rate.RateAppLimited
 	}
 	e.UnlockUser()
 	return info
@@ -3354,6 +3360,7 @@ func (e *Endpoint) completeStateLocked(s *TCPEndpointState) {
 	}
 
 	s.Sender.RACKState = e.snd.rc.TCPRACKState
+	s.Sender.DeliveryRate = e.snd.rate.TCPDeliveryRateState
 	s.Sender.RetransmitTS = e.snd.retransmitTS
 	s.Sender.SpuriousRecovery = e.snd.spuriousRecovery
 }

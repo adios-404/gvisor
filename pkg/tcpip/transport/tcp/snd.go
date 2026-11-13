@@ -200,6 +200,9 @@ type sender struct {
 	// corkTimer is used to drain the segments which are held when TCP_CORK
 	// option is enabled.
 	corkTimer timer `state:"nosave"`
+
+	// rate samples the rate at which the network delivers data.
+	rate rateSampler
 }
 
 // protectedWriteList wraps the write list, checking for invalid state when
@@ -340,6 +343,18 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 		panic(fmt.Sprintf("unable to get maxRetries from stack: %s", err))
 	}
 	ep.snd.maxRetries = uint32(maxRetries)
+
+	var sampling tcpip.TCPDeliveryRateSamplingEnabled
+	if err := ep.snd.ep.stack.TransportProtocolOption(ProtocolNumber, &sampling); err != nil {
+		panic(fmt.Sprintf("unable to get delivery rate sampling from stack: %s", err))
+	}
+	if sampling {
+		ep.snd.rate.enabled = true
+		// A connection that has not delivered anything is limited by the
+		// application. Linux tcp_init_sock() does the same, so
+		// tcpi_delivery_rate_app_limited is set from the start.
+		ep.snd.rate.RateAppLimited = true
+	}
 }
 
 // initCongestionControl initializes the specified congestion control module and
@@ -580,6 +595,7 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 
 	s.ep.stack.Stats().TCP.Timeouts.Increment()
 	s.ep.stats.SendErrors.Timeouts.Increment()
+	s.checkAppLimited()
 
 	// Set TLPRxtOut to false according to
 	// https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.6.1.
@@ -660,6 +676,11 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	// We'll keep on transmitting (or retransmitting) as we get acks for
 	// the data we transmit.
 	s.Outstanding = 0
+	if s.rate.enabled {
+		for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+			s.rate.onLost(&seg.rate, seg.payloadSize())
+		}
+	}
 
 	// Expunge all SACK information as per https://tools.ietf.org/html/rfc6675#section-5.1
 	//
@@ -1413,6 +1434,7 @@ func (s *sender) walkSACK(rcvdSeg *segment) bool {
 			if sb.Start.LessThanEq(seg.sequenceNumber) && segEnd.LessThanEq(sb.End) && !seg.acked {
 				s.rc.update(seg, rcvdSeg)
 				s.rc.detectReorder(seg)
+				s.rateDelivered(seg, rcvdSeg)
 				seg.acked = true
 				s.SackedOut += s.pCount(seg, s.MaxPayloadSize)
 			}
@@ -1580,6 +1602,11 @@ func (s *sender) inRecovery() bool {
 func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	bestRTT := unknownRTT
 
+	if s.rate.enabled {
+		s.checkAppLimited()
+		s.rate.beginACK()
+	}
+
 	// Check if we can extract an RTT measurement from this ack. Measure against
 	// the ACK's ingress time (rcvdSeg.rcvdTime), not the current clock: if the
 	// ACK was delayed inside the stack before being processed (e.g. queued while
@@ -1673,6 +1700,10 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	// receive window to become non-zero.
 	if s.zeroWindowProbing && s.unackZeroWindowProbes > 0 && ack == s.SndUna {
 		s.unackZeroWindowProbes--
+		if s.rate.enabled {
+			// The ACK may still have selectively acknowledged data.
+			s.rate.endACK()
+		}
 		return
 	}
 
@@ -1731,6 +1762,9 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			datalen := seg.logicalLen()
 			if datalen > ackLeft {
 				prevCount := s.pCount(seg, s.MaxPayloadSize)
+				if s.rate.enabled {
+					s.rate.onPartialDelivered(&seg.rate, int(ackLeft), rcvdSeg.rcvdTime)
+				}
 				seg.TrimFront(ackLeft)
 				seg.sequenceNumber.UpdateForward(ackLeft)
 				s.Outstanding -= prevCount - s.pCount(seg, s.MaxPayloadSize)
@@ -1747,6 +1781,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 				s.rc.detectReorder(seg)
 			}
 
+			s.rateDelivered(seg, rcvdSeg)
 			s.writeList.Remove(seg)
 
 			// If SACK is enabled then only reduce outstanding if
@@ -1806,7 +1841,16 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			s.firstRetransmittedSegXmitTime = tcpip.MonotonicTime{}
 			s.resendTimer.disable()
 			s.probeTimer.disable()
+			if s.rate.enabled {
+				s.rate.reset()
+			}
 		}
+	}
+
+	if s.rate.enabled {
+		// Every segment this ACK newly acknowledged has been accounted for.
+		s.rate.onRTT(bestRTT)
+		s.rate.endACK()
 	}
 
 	if s.ep.SACKPermitted && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
@@ -1867,6 +1911,12 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 		}
 	}
 	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
+	if size := seg.payloadSize(); s.rate.enabled && size != 0 {
+		// Without RACK no segment is marked lost, so a retransmission made
+		// during fast recovery is what tells the sampler about the loss. A
+		// tail loss probe is sent outside recovery and is not a loss.
+		s.rate.onSent(&seg.rate, size, seg.xmitTime, seg.xmitCount > 0 && s.FastRecovery.Active)
+	}
 	seg.xmitCount++
 	seg.lost = false
 
@@ -1937,6 +1987,39 @@ func (s *sender) maybeSendOutOfWindowAck(seg *segment) {
 	if seg.payloadSize() > 0 || s.ep.allowOutOfWindowAck() {
 		s.sendAck()
 	}
+}
+
+// checkAppLimited tells the delivery rate sampler when the sender has run out
+// of data to send. It must be called before the application queues new data,
+// and at the start of processing of each ACK and of each timer that can
+// transmit data.
+//
+// See: https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-4.1.2.4
+//
+// +checklocks:s.ep.mu
+func (s *sender) checkAppLimited() {
+	if !s.rate.enabled {
+		return
+	}
+	s.rate.checkAppLimited(s.writeNext == nil, uint64(s.SndCwnd)*uint64(s.MaxPayloadSize))
+}
+
+// rateDelivered tells the delivery rate sampler that seg has been newly
+// acknowledged in full by rcvdSeg, either cumulatively or selectively.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rateDelivered(seg *segment, rcvdSeg *segment) {
+	if !s.rate.enabled {
+		return
+	}
+	size := seg.payloadSize()
+	if size == 0 {
+		// A FIN carries no data.
+		return
+	}
+	// Use the ACK's ingress time, as RTT measurement does, so that an ACK
+	// delayed inside the stack does not stretch the sampling interval.
+	s.rate.onDelivered(&seg.rate, size, seg.xmitTime, seg.sequenceNumber.Add(seqnum.Size(size)), rcvdSeg.rcvdTime, seg.xmitCount == 1)
 }
 
 func (s *sender) updateWriteNext(seg *segment) {

@@ -226,6 +226,7 @@ func (s *sender) probeTimerExpired() tcpip.Error {
 	if s.probeTimer.isUninitialized() || !s.probeTimer.checkExpiration() {
 		return nil
 	}
+	s.checkAppLimited()
 
 	var dataSent bool
 	if s.writeNext != nil && s.writeNext.xmitCount == 0 && s.Outstanding < s.SndCwnd {
@@ -443,6 +444,9 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 			// zero during recovery.
 			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd + clockResolution
 			if timeRemaining < 0 || (timeRemaining == 0 && clockResolution == 0) {
+				if rc.snd.rate.enabled {
+					rc.snd.rate.onLost(&seg.rate, seg.payloadSize())
+				}
 				seg.lost = true
 				numLost++
 			} else {
@@ -476,6 +480,7 @@ func (rc *rackControl) reorderTimerExpired() tcpip.Error {
 	if rc.snd.reorderTimer.isUninitialized() || !rc.snd.reorderTimer.checkExpiration() {
 		return nil
 	}
+	rc.snd.checkAppLimited()
 
 	// Evaluate loss as of the time the reorder timer was scheduled to fire (its
 	// target), not the current clock. The timer is armed for the instant a
