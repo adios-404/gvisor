@@ -91,6 +91,64 @@ type congestionControl interface {
 	PostRecovery()
 }
 
+// rateCongestionControl is implemented by a congestion control algorithm
+// that sets the congestion window and a pacing rate from a model of the
+// network path built from delivery rate samples, such as BBR.
+//
+// Reno and CUBIC do not implement it. For an algorithm that does, the sender
+// samples the delivery rate, paces its transmissions at PacingRate(), and
+// leaves the congestion window to the algorithm: it does not change SndCwnd
+// on entering or leaving recovery, on duplicate ACKs in recovery or after an
+// idle period. The methods of congestionControl are still called where they
+// are for other algorithms. This follows Linux's cong_control hook.
+//
+// See https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-5.2
+// for the events.
+type rateCongestionControl interface {
+	congestionControl
+
+	// OnTransmit is called before a segment carrying size bytes of data is
+	// transmitted, before the segment is counted in flight. It may change
+	// PacingRate(). This is the draft's OnTransmit().
+	OnTransmit(now tcpip.MonotonicTime, size int)
+
+	// OnACK is called for every ACK, including duplicate and SACK-only ACKs
+	// and those received in loss recovery, once the segments it delivers
+	// and those RACK finds lost while it is processed have been accounted
+	// for. now is the time the ACK arrived. rs is valid only during the
+	// call; its loss fields are meaningful only if rs.hasData. This is the
+	// draft's UpdateOnACK(), after GenerateRateSample().
+	OnACK(rs *rateSample, now tcpip.MonotonicTime)
+
+	// OnLoss is called for each transmission of a segment that is declared
+	// lost, with the delivery state recorded when it was sent and its size
+	// in bytes. This is the draft's HandleLostPacket(). Without RACK, a
+	// segment is declared lost only when it is retransmitted in fast
+	// recovery, which happens after OnACK for the ACK that revealed the
+	// loss.
+	OnLoss(p *segRate, size int)
+
+	// OnEnterRecovery is called once the sender has entered loss recovery,
+	// on a retransmission timeout if rto is true. It is called on every
+	// retransmission timeout, including one during fast recovery or after
+	// an earlier timeout, so calls can repeat before the single
+	// OnExitRecovery.
+	OnEnterRecovery(rto bool)
+
+	// OnExitRecovery is called when loss recovery ends because the data that
+	// was outstanding when it started has been acknowledged.
+	OnExitRecovery()
+
+	// OnSpuriousRecovery is called when the current loss recovery is found
+	// to have been spurious (RFC 3522). This is the draft's
+	// HandleSpuriousLossDetection().
+	OnSpuriousRecovery()
+
+	// PacingRate returns the rate, in bytes per second, at which the sender
+	// should pace its transmissions, or zero to send without pacing.
+	PacingRate() uint64
+}
+
 // lossRecovery is an interface that must be implemented by any supported
 // loss recovery algorithm.
 type lossRecovery interface {
@@ -173,6 +231,17 @@ type sender struct {
 
 	// cc is the congestion control algorithm in use for this sender.
 	cc congestionControl
+
+	// rcc is cc if it is a rate-based congestion control algorithm, and nil
+	// otherwise.
+	rcc rateCongestionControl `state:"nosave"`
+
+	// rccInRecovery is true from the rcc.OnEnterRecovery that starts a loss
+	// recovery episode, through any repeats of it, until the episode's
+	// rcc.OnExitRecovery. state cannot tell: a duplicate ACK that does not
+	// start fast recovery moves it from a recovery state to Disorder before
+	// the episode's data is acknowledged.
+	rccInRecovery bool
 
 	// rc has the fields needed for implementing RACK loss detection
 	// algorithm.
@@ -310,7 +379,7 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 		ep.snd.ep.gso.MSS = uint16(maxPayloadSize)
 	}
 
-	ep.snd.cc = ep.snd.initCongestionControl(ep.cc)
+	ep.snd.setCongestionControl(ep.snd.initCongestionControl(ep.cc))
 	ep.snd.lr = ep.snd.initLossRecovery()
 	ep.snd.rc.init(ep.snd, iss)
 
@@ -357,14 +426,118 @@ func initSender(ep *Endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uin
 		panic(fmt.Sprintf("unable to get delivery rate sampling from stack: %s", err))
 	}
 	if sampling {
-		ep.snd.rate.enabled = true
-		// A connection that has not delivered anything is limited by the
-		// application. Linux tcp_init_sock() does the same, so
-		// tcpi_delivery_rate_app_limited is set from the start.
-		ep.snd.rate.RateAppLimited = true
+		ep.snd.enableRateSampling()
 	}
 
 	ep.snd.updatePacingRate()
+}
+
+// setCongestionControl makes cc the congestion control algorithm of the
+// sender. It does not change the congestion window.
+//
+// +checklocks:s.ep.mu
+func (s *sender) setCongestionControl(cc congestionControl) {
+	s.cc = cc
+	s.rcc, _ = cc.(rateCongestionControl)
+	// The new algorithm has not been told of a recovery under way, so it
+	// is not told when that recovery ends either.
+	s.rccInRecovery = false
+	if s.rcc != nil {
+		s.enableRateSampling()
+	}
+}
+
+// rccEnterRecovery tells a rate-based algorithm that the sender has entered
+// loss recovery, on a retransmission timeout if rto is true.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rccEnterRecovery(rto bool) {
+	if s.rcc == nil {
+		return
+	}
+	s.rccInRecovery = true
+	s.rcc.OnEnterRecovery(rto)
+}
+
+// rccExitRecovery tells a rate-based algorithm that the loss recovery it was
+// told of has ended.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rccExitRecovery() {
+	if s.rcc == nil || !s.rccInRecovery {
+		return
+	}
+	s.rccInRecovery = false
+	s.rcc.OnExitRecovery()
+}
+
+// cwndRoom returns how many more packets the congestion window lets the
+// sender put in flight; it is not positive when the window is full.
+//
+// For a rate-based algorithm, what is in flight is what the delivery rate
+// sampler counts: every byte sent and not yet delivered or declared lost.
+// The algorithm's model is built from that count, so its window must be
+// applied to it. Outstanding is an estimate that only loss recovery
+// recomputes; between recoveries it keeps segments that were selectively
+// acknowledged, and after a recovery it misses those that were still waiting
+// for their retransmission to be acknowledged when the recovery ended.
+//
+// The sampler counts bytes, so segments shorter than the maximum payload
+// count for less than a packet each. Without RACK, a lost segment stays
+// counted until it is retransmitted, so its retransmission in fast recovery
+// takes no room of its own.
+//
+// +checklocks:s.ep.mu
+func (s *sender) cwndRoom() int {
+	if s.rcc == nil {
+		return s.SndCwnd - s.Outstanding
+	}
+	return s.rateCCRoomAfter(0)
+}
+
+// rateCCRoomAfter returns what cwndRoom will return for a rate-based
+// algorithm once size more bytes are counted in flight. An algorithm that
+// wants to know whether a transmission uses up its window asks this, so that
+// its answer is the sender's.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rateCCRoomAfter(size int) int {
+	mss := uint64(max(s.MaxPayloadSize, 1))
+	inFlight := (s.rate.InFlight + uint64(max(size, 0)) + mss - 1) / mss
+	return s.SndCwnd - int(min(inFlight, math.MaxInt32))
+}
+
+// enableRateSampling turns on delivery rate sampling. Segments already sent
+// are counted as in flight, but they carry no send-time state, so no rate
+// sample is based on them.
+//
+// +checklocks:s.ep.mu
+func (s *sender) enableRateSampling() {
+	if s.rate.enabled {
+		return
+	}
+	s.rate.enabled = true
+	// A connection that has not delivered anything is limited by the
+	// application. Linux tcp_init_sock() does the same, so
+	// tcpi_delivery_rate_app_limited is set from the start.
+	s.rate.RateAppLimited = true
+	// Start the sampling interval now: a segment sent while the adopted ones
+	// are in flight takes its snapshot from these.
+	now := s.ep.stack.Clock().NowMonotonic()
+	s.rate.FirstSendTime = now
+	s.rate.DeliveredTime = now
+	// Segments sent from writeNext on were sent before a retransmission
+	// timeout and are waiting to be sent again. Without RACK, seg.lost is
+	// never set, so a segment the SACK scoreboard considers lost is taken to
+	// be in flight until it is retransmitted.
+	pastWriteNext := false
+	for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+		pastWriteNext = pastWriteNext || seg == s.writeNext
+		if size := seg.payloadSize(); size != 0 {
+			sacked := seg.acked || (s.ep.SACKPermitted && s.ep.scoreboard.IsSACKED(seg.sackBlock()))
+			s.rate.adopt(&seg.rate, size, sacked, seg.lost || pastWriteNext)
+		}
+	}
 }
 
 // initCongestionControl initializes the specified congestion control module and
@@ -688,9 +861,10 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	s.Outstanding = 0
 	if s.rate.enabled {
 		for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
-			s.rate.onLost(&seg.rate, seg.payloadSize())
+			s.rateLost(seg)
 		}
 	}
+	s.rccEnterRecovery(true /* rto */)
 
 	// Expunge all SACK information as per https://tools.ietf.org/html/rfc6675#section-5.1
 	//
@@ -1143,7 +1317,9 @@ func (s *sender) postXmit(dataSent bool, shouldScheduleProbe bool) {
 			s.schedulePTO()
 		} else if !s.resendTimer.enabled() {
 			s.probeTimer.disable()
-			if s.Outstanding > 0 {
+			// Outstanding may have drifted to zero with data still in
+			// flight (see cwndRoom); the sampler's count has not.
+			if s.Outstanding > 0 || (s.rcc != nil && s.rate.InFlight > 0) {
 				// Enable the resend timer if it's not enabled yet and there is
 				// outstanding data.
 				s.resendTimer.enable(s.RTO)
@@ -1167,7 +1343,9 @@ func (s *sender) sendData() {
 	// "A TCP SHOULD set cwnd to no more than RW before beginning
 	// transmission if the TCP has not sent data in the interval exceeding
 	// the retrasmission timeout."
-	if !s.FastRecovery.Active && s.state != tcpip.RTORecovery && s.ep.stack.Clock().NowMonotonic().Sub(s.LastSendTime) > s.RTO {
+	//
+	// A rate-based algorithm decides itself what to do after an idle period.
+	if s.rcc == nil && !s.FastRecovery.Active && s.state != tcpip.RTORecovery && s.ep.stack.Clock().NowMonotonic().Sub(s.LastSendTime) > s.RTO {
 		if s.SndCwnd > InitialCwnd {
 			s.SndCwnd = InitialCwnd
 			s.cc.HandleWindowRestart()
@@ -1175,9 +1353,9 @@ func (s *sender) sendData() {
 	}
 
 	var dataSent bool
-	for seg := s.writeNext; seg != nil && s.Outstanding < s.SndCwnd; seg = seg.Next() {
+	for seg := s.writeNext; seg != nil && s.cwndRoom() > 0; seg = seg.Next() {
 		// NOTE(gvisor.dev/issue/11632): Use uint64 to avoid overflow.
-		cwndLimit := uint64(s.SndCwnd-s.Outstanding) * uint64(s.MaxPayloadSize)
+		cwndLimit := uint64(s.cwndRoom()) * uint64(s.MaxPayloadSize)
 		if cwndLimit < uint64(limit) {
 			limit = int(cwndLimit)
 		}
@@ -1212,7 +1390,9 @@ func (s *sender) enterRecovery() {
 	// See : https://tools.ietf.org/html/rfc5681#section-3.2 Step 3.
 	// We inflate the cwnd by 3 to account for the 3 packets which triggered
 	// the 3 duplicate ACKs and are now not in flight.
-	s.SndCwnd = s.Ssthresh + 3
+	if s.rcc == nil {
+		s.SndCwnd = s.Ssthresh + 3
+	}
 	s.SackedOut = 0
 	s.DupAckCount = 0
 	s.FastRecovery.First = s.SndUna
@@ -1233,10 +1413,12 @@ func (s *sender) enterRecovery() {
 			s.ep.stack.Stats().TCP.TLPRecovery.Increment()
 		}
 		s.rc.tlpRxtOut = false
-		return
+	} else {
+		s.state = tcpip.FastRecovery
+		s.ep.stack.Stats().TCP.FastRecovery.Increment()
 	}
-	s.state = tcpip.FastRecovery
-	s.ep.stack.Stats().TCP.FastRecovery.Increment()
+
+	s.rccEnterRecovery(false /* rto */)
 }
 
 // +checklocks:s.ep.mu
@@ -1246,7 +1428,9 @@ func (s *sender) leaveRecovery() {
 	s.DupAckCount = 0
 
 	// Deflate cwnd. It had been artificially inflated when new dups arrived.
-	s.SndCwnd = s.Ssthresh
+	if s.rcc == nil {
+		s.SndCwnd = s.Ssthresh
+	}
 	s.cc.PostRecovery()
 }
 
@@ -1600,6 +1784,9 @@ func (s *sender) detectSpuriousRecovery(hasDSACK bool, tsEchoReply uint32) {
 	// between fast, SACK or RTO recovery.
 	s.spuriousRecovery = true
 	s.ep.stack.Stats().TCP.SpuriousRecovery.Increment()
+	if s.rcc != nil {
+		s.rcc.OnSpuriousRecovery()
+	}
 
 	// RFC 3522 will detect all kinds of spurious recoveries (fast, SACK and
 	// timeout). Increment the metric for RTO only as we want to track the
@@ -1682,6 +1869,8 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		//		reordered and RACK.reord is set to TRUE.
 		if s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
 			hasDSACK = s.walkSACK(rcvdSeg)
+		} else if s.rcc != nil {
+			s.rateWalkSACK(rcvdSeg)
 		}
 		s.SetPipe()
 	}
@@ -1722,10 +1911,8 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 	// receive window to become non-zero.
 	if s.zeroWindowProbing && s.unackZeroWindowProbes > 0 && ack == s.SndUna {
 		s.unackZeroWindowProbes--
-		if s.rate.enabled {
-			// The ACK may still have selectively acknowledged data.
-			s.rate.endACK()
-		}
+		// The ACK may still have selectively acknowledged data.
+		s.finishACK(bestRTT, rcvdSeg.rcvdTime)
 		return
 	}
 
@@ -1832,6 +2019,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		if !s.FastRecovery.Active {
 			s.cc.Update(originalOutstanding-s.Outstanding, bestRTT, rcvdSeg.rcvdTime)
 			if s.FastRecovery.Last.LessThan(s.SndUna) {
+				s.rccExitRecovery()
 				s.state = tcpip.Open
 				// Update RACK when we are exiting fast or RTO
 				// recovery as described in the RFC
@@ -1869,15 +2057,8 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 		}
 	}
 
-	if s.rate.enabled {
-		// Every segment this ACK newly acknowledged has been accounted for.
-		s.rate.onRTT(bestRTT)
-		s.rate.endACK()
-	}
-
-	s.updatePacingRate()
-
-	if s.ep.SACKPermitted && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0 {
+	rack := s.ep.SACKPermitted && s.ep.tcpRecovery&tcpip.TCPRACKLossDetection != 0
+	if rack {
 		// Update RACK reorder window.
 		// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
 		//	* Upon receiving an ACK:
@@ -1895,10 +2076,15 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			s.enterRecovery()
 			fastRetransmit = true
 		}
+	}
 
-		if s.FastRecovery.Active {
-			s.rc.DoRecovery(nil, fastRetransmit)
-		}
+	// Every segment this ACK newly acknowledged, and every segment found lost
+	// while processing it, has been accounted for. As in Linux, losses are
+	// detected before the congestion control algorithm sees the ACK.
+	s.finishACK(bestRTT, rcvdSeg.rcvdTime)
+
+	if rack && s.FastRecovery.Active {
+		s.rc.DoRecovery(nil, fastRetransmit)
 	}
 
 	// Now that we've popped all acknowledged data from the retransmit
@@ -1937,11 +2123,18 @@ func (s *sender) sendSegment(seg *segment) tcpip.Error {
 	seg.xmitTime = s.ep.stack.Clock().NowMonotonic()
 	if size := seg.payloadSize(); size != 0 {
 		if s.rate.enabled {
-			// Without RACK no segment is marked lost, so a retransmission
-			// made during fast recovery is what tells the sampler about the
-			// loss. A tail loss probe is sent outside recovery and is not a
-			// loss.
-			s.rate.onSent(&seg.rate, size, seg.xmitTime, seg.xmitCount > 0 && s.FastRecovery.Active)
+			if seg.xmitCount > 0 && s.FastRecovery.Active {
+				// Without RACK no segment is marked lost, so a retransmission
+				// made during fast recovery is what declares the previous
+				// transmission lost, if nothing else has. A tail loss probe is
+				// sent outside recovery and is not a loss.
+				s.rateLost(seg)
+			}
+			if s.rcc != nil {
+				s.rcc.OnTransmit(seg.xmitTime, size)
+				s.setRateCCPacingRate()
+			}
+			s.rate.onSent(&seg.rate, size, seg.xmitTime)
 		}
 		if s.pacer.Rate != 0 {
 			// Every transmission counts against the pacing rate, including
@@ -2054,6 +2247,89 @@ func (s *sender) rateDelivered(seg *segment, rcvdSeg *segment) {
 	s.rate.onDelivered(&seg.rate, size, seg.xmitTime, seg.sequenceNumber.Add(seqnum.Size(size)), rcvdSeg.rcvdTime, seg.xmitCount == 1)
 }
 
+// rateLost tells the delivery rate sampler, and a rate-based congestion
+// control algorithm, that the last transmission of seg has been lost.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rateLost(seg *segment) {
+	if !s.rate.enabled {
+		return
+	}
+	size := seg.payloadSize()
+	if s.rate.onLost(&seg.rate, size) && s.rcc != nil {
+		s.rcc.OnLoss(&seg.rate, size)
+	}
+}
+
+// rateWalkSACK tells the delivery rate sampler about the segments that
+// rcvdSeg selectively acknowledges in full. With RACK, walkSACK does this.
+// Without RACK, only a rate-based congestion control algorithm needs to know
+// before the cumulative ACK reaches the segments, so this runs only for one.
+//
+// +checklocks:s.ep.mu
+func (s *sender) rateWalkSACK(rcvdSeg *segment) {
+	blocks := rcvdSeg.parsedOptions.SACKBlocks
+	if checkDSACK(rcvdSeg) {
+		// The first block reports data received twice.
+		blocks = blocks[1:]
+	}
+	// Sort the valid blocks by their start, so that the segments are walked
+	// once. There are at most four blocks.
+	var sorted [header.TCPMaxSACKBlocks]header.SACKBlock
+	n := 0
+	for _, sb := range blocks {
+		if n == len(sorted) {
+			break
+		}
+		if !sb.Start.LessThan(sb.End) {
+			continue
+		}
+		i := n
+		for ; i > 0 && sb.Start.LessThan(sorted[i-1].Start); i-- {
+			sorted[i] = sorted[i-1]
+		}
+		sorted[i] = sb
+		n++
+	}
+
+	first := 0
+	for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0 && first < n; seg = seg.Next() {
+		size := seg.payloadSize()
+		if size == 0 {
+			continue
+		}
+		start := seg.sequenceNumber
+		end := start.Add(seqnum.Size(size))
+		for first < n && sorted[first].End.LessThanEq(start) {
+			first++
+		}
+		for i := first; i < n && sorted[i].Start.LessThanEq(start); i++ {
+			if end.LessThanEq(sorted[i].End) {
+				s.rateDelivered(seg, rcvdSeg)
+				break
+			}
+		}
+	}
+}
+
+// finishACK completes the processing of an ACK by the delivery rate sampler
+// and a rate-based congestion control algorithm, and updates the pacing rate.
+// rtt is the RTT sample the ACK provided, if any, and now is the time the ACK
+// arrived.
+//
+// +checklocks:s.ep.mu
+// +checklocksexclude:s.rtt.rttMutex
+func (s *sender) finishACK(rtt time.Duration, now tcpip.MonotonicTime) {
+	if s.rate.enabled {
+		s.rate.onRTT(rtt)
+		rs := s.rate.endACK()
+		if s.rcc != nil {
+			s.rcc.OnACK(rs, now)
+		}
+	}
+	s.updatePacingRate()
+}
+
 func (s *sender) updateWriteNext(seg *segment) {
 	if s.writeNext != nil {
 		s.writeNext.DecRef()
@@ -2072,7 +2348,11 @@ const (
 	pacingCongestionAvoidancePercent = 120
 )
 
-// updatePacingRate sets the pacing rate from SO_MAX_PACING_RATE. Linux turns
+// updatePacingRate sets the pacing rate. A sender whose congestion control
+// algorithm is rate-based paces at the rate the algorithm asks for, capped by
+// SO_MAX_PACING_RATE.
+//
+// Otherwise the pacing rate comes from SO_MAX_PACING_RATE. Linux turns
 // on pacing for any congestion control algorithm when that option is set, and
 // paces at the rate the congestion window allows, cwnd * mss / srtt, scaled up
 // so that the window can still grow, but at most at the option's value. The
@@ -2083,6 +2363,10 @@ const (
 // +checklocks:s.ep.mu
 // +checklocksexclude:s.rtt.rttMutex
 func (s *sender) updatePacingRate() {
+	if s.rcc != nil {
+		s.setRateCCPacingRate()
+		return
+	}
 	maxRate := s.ep.ops.GetMaxPacingRate()
 	if maxRate == tcpip.UnlimitedPacingRate {
 		if s.pacer.Rate != 0 {
@@ -2104,6 +2388,17 @@ func (s *sender) updatePacingRate() {
 		rate = min(rate, bytesPerSecond(cwndBytes*percent/100, srtt))
 	}
 	s.pacer.setRate(rate, s.MaxPayloadSize)
+}
+
+// setRateCCPacingRate paces the sender at the rate that the rate-based
+// congestion control algorithm asks for, but at most at SO_MAX_PACING_RATE.
+//
+// +checklocks:s.ep.mu
+func (s *sender) setRateCCPacingRate() {
+	// UnlimitedPacingRate is the largest rate, so it sets no limit here.
+	// The quantum depends on the MSS, so it is set even if the rate has not
+	// changed.
+	s.pacer.setRate(min(s.rcc.PacingRate(), s.ep.ops.GetMaxPacingRate()), s.MaxPayloadSize)
 }
 
 // pacingAllows reports whether a paced sender may transmit now and, if it

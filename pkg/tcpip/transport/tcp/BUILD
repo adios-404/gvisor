@@ -226,6 +226,7 @@ go_test(
         "pacing_test.go",
         "rack_test.go",
         "rate_test.go",
+        "ratecc_test.go",
         "reno_test.go",
         "sack_scoreboard_test.go",
         "segment_test.go",

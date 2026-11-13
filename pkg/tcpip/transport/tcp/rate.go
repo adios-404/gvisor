@@ -76,6 +76,11 @@ type segRate struct {
 	// encodes this as P.delivered_time == 0, which cannot be used here
 	// because a monotonic time of zero is a valid time.
 	done bool
+
+	// unsampled is true if the segment was last sent before sampling was
+	// enabled, so that no snapshot was taken. Its delivery is counted, but no
+	// sample is based on it.
+	unsampled bool
 }
 
 // rateSample is the result of processing one ACK.
@@ -159,12 +164,8 @@ type rateSampler struct {
 // onSent records the delivery state in a segment of size bytes that is being
 // transmitted at time now.
 //
-// lossRetransmit is true if this is a loss recovery retransmission, which is
-// the only loss signal when no segment is ever marked lost (that is, without
-// RACK).
-//
 // See section 4.1.2.2, OnPacketSent().
-func (r *rateSampler) onSent(p *segRate, size int, now tcpip.MonotonicTime, lossRetransmit bool) {
+func (r *rateSampler) onSent(p *segRate, size int, now tcpip.MonotonicTime) {
 	if p.done {
 		// The segment was SACKed and is sent again only because the SACK
 		// information has been discarded. Its delivery is already counted.
@@ -174,11 +175,6 @@ func (r *rateSampler) onSent(p *segRate, size int, now tcpip.MonotonicTime, loss
 	if p.lostPending {
 		p.lostPending = false
 		r.LostPending = subClamped(r.LostPending, n)
-	}
-	if lossRetransmit && p.inFlight {
-		// The transmission being replaced was never declared lost; this
-		// retransmission declares it.
-		r.Lost += n
 	}
 	if r.InFlight == 0 {
 		// Nothing is in flight, so the sampling interval starts now.
@@ -195,6 +191,7 @@ func (r *rateSampler) onSent(p *segRate, size int, now tcpip.MonotonicTime, loss
 	p.appLimited = r.AppLimited != 0
 	p.txInFlight = r.InFlight
 	p.lost = r.Lost
+	p.unsampled = false
 }
 
 // beginACK starts the sample for a newly received ACK.
@@ -217,6 +214,9 @@ func (r *rateSampler) onDelivered(p *segRate, size int, sendTime tcpip.Monotonic
 	}
 	p.done = true
 	r.deliver(p, uint64(size), now)
+	if p.unsampled {
+		return
+	}
 
 	// Base the sample on the most recently sent segment.
 	isNewest := sendTime.After(r.FirstSendTime) ||
@@ -267,10 +267,12 @@ func (r *rateSampler) deliver(p *segRate, n uint64, now tcpip.MonotonicTime) {
 	r.rs.newlyAcked += n
 }
 
-// onLost is called when a segment of size bytes is declared lost.
-func (r *rateSampler) onLost(p *segRate, size int) {
+// onLost is called when a segment of size bytes is declared lost. It returns
+// false if the segment was not in flight, in which case its loss has already
+// been counted, or it has been delivered.
+func (r *rateSampler) onLost(p *segRate, size int) bool {
 	if p.done || !p.inFlight {
-		return
+		return false
 	}
 	n := uint64(size)
 	p.inFlight = false
@@ -278,6 +280,34 @@ func (r *rateSampler) onLost(p *segRate, size int) {
 	r.InFlight = subClamped(r.InFlight, n)
 	r.Lost += n
 	r.LostPending += n
+	return true
+}
+
+// adopt starts tracking a segment of size bytes that was sent before sampling
+// was enabled. It is counted as in flight unless it has already been
+// selectively acknowledged (sacked) or is waiting to be retransmitted (lost).
+// Bytes delivered or lost before sampling was enabled are not counted.
+//
+// Segments are adopted in the order they were sent. Each records the bytes in
+// flight and lost so far, as if the adopted segments had been sent back to
+// back, so that a loss of one can still be compared with the data in flight
+// (draft HandleLostPacket()). Its send and delivery times are unknown, so no
+// rate sample is based on it.
+func (r *rateSampler) adopt(p *segRate, size int, sacked, lost bool) {
+	*p = segRate{unsampled: true}
+	n := uint64(size)
+	switch {
+	case sacked:
+		p.done = true
+	case lost:
+		p.lostPending = true
+		r.LostPending += n
+	default:
+		p.inFlight = true
+		r.InFlight += n
+	}
+	p.txInFlight = r.InFlight
+	p.lost = r.Lost
 }
 
 // onRTT is called with each RTT sample to maintain C.min_rtt. A sample that

@@ -184,6 +184,9 @@ func (e *Endpoint) Restore(s *stack.Stack) {
 		e.keepalive.timer.init(s.Clock(), timerHandler(e, e.keepaliveTimerExpired))
 	}
 	if snd := e.snd; snd != nil {
+		// Whether the congestion control algorithm is rate-based is not
+		// saved.
+		snd.rcc, _ = snd.cc.(rateCongestionControl)
 		snd.resendTimer.init(s.Clock(), timerHandler(e, e.snd.retransmitTimerExpired))
 		snd.reorderTimer.init(s.Clock(), timerHandler(e, e.snd.rc.reorderTimerExpired))
 		snd.probeTimer.init(s.Clock(), timerHandler(e, e.snd.probeTimerExpired))

@@ -47,7 +47,7 @@ func (rt *rateTest) advance(d time.Duration) {
 func (rt *rateTest) send(size int) *ratePacket {
 	rt.nextSeq = rt.nextSeq.Add(seqnum.Size(size))
 	p := &ratePacket{size: size, sendTime: rt.now, end: rt.nextSeq}
-	rt.r.onSent(&p.rate, size, rt.now, false /* lossRetransmit */)
+	rt.r.onSent(&p.rate, size, rt.now)
 	return p
 }
 
@@ -211,7 +211,7 @@ func TestRateSamplerCountsSegmentOnce(t *testing.T) {
 
 	// A delivered segment that is sent again (the SACK scoreboard is dropped
 	// on a retransmission timeout) is neither in flight nor delivered twice.
-	rt.r.onSent(&p.rate, p.size, rt.now, false)
+	rt.r.onSent(&p.rate, p.size, rt.now)
 	if rt.r.InFlight != 0 {
 		t.Errorf("after resending a delivered segment: got inflight = %d, want 0", rt.r.InFlight)
 	}
@@ -380,7 +380,7 @@ func TestRateSamplerLossAccounting(t *testing.T) {
 	// Retransmit the lost packet.
 	rt.advance(10 * time.Millisecond)
 	a.sendTime = rt.now
-	rt.r.onSent(&a.rate, a.size, rt.now, false)
+	rt.r.onSent(&a.rate, a.size, rt.now)
 	if rt.r.InFlight != 3000 || rt.r.Lost != 1000 || rt.r.LostPending != 0 {
 		t.Fatalf("after the retransmission: got inflight = %d, lost = %d, lostPending = %d, want 3000, 1000, 0", rt.r.InFlight, rt.r.Lost, rt.r.LostPending)
 	}
@@ -413,20 +413,81 @@ func TestRateSamplerLossAccounting(t *testing.T) {
 
 func TestRateSamplerLossInferredFromRetransmit(t *testing.T) {
 	// Without RACK no segment is marked lost. A retransmission in recovery of
-	// a segment that is still counted in flight is the loss signal.
+	// a segment that is still counted in flight is the loss signal: the
+	// sender declares the segment lost and then sends it again.
 	rt := rateTest{}
 	a := rt.send(1000)
 	rt.send(1000)
 	rt.advance(10 * time.Millisecond)
-	rt.r.onSent(&a.rate, a.size, rt.now, true /* lossRetransmit */)
+	if !rt.r.onLost(&a.rate, a.size) {
+		t.Fatalf("onLost of a segment in flight returned false")
+	}
+	rt.r.onSent(&a.rate, a.size, rt.now)
 	if rt.r.InFlight != 2000 || rt.r.Lost != 1000 || rt.r.LostPending != 0 {
 		t.Errorf("got inflight = %d, lost = %d, lostPending = %d, want 2000, 1000, 0", rt.r.InFlight, rt.r.Lost, rt.r.LostPending)
 	}
 	// A second retransmission of a segment that is back in flight is another
 	// loss of the same bytes.
-	rt.r.onSent(&a.rate, a.size, rt.now, true)
+	if !rt.r.onLost(&a.rate, a.size) {
+		t.Fatalf("onLost of a retransmitted segment in flight returned false")
+	}
+	rt.r.onSent(&a.rate, a.size, rt.now)
 	if got, want := rt.r.Lost, uint64(2000); got != want {
 		t.Errorf("got lost = %d, want %d", got, want)
+	}
+	// A segment that is no longer in flight is not lost again.
+	if !rt.r.onLost(&a.rate, a.size) || rt.r.onLost(&a.rate, a.size) {
+		t.Errorf("onLost twice in a row: want true, then false")
+	}
+}
+
+func TestRateSamplerAdopt(t *testing.T) {
+	// Sampling is enabled while three segments are outstanding: one in
+	// flight, one SACKed and one declared lost.
+	rt := rateTest{}
+	var inFlight, sacked, lost segRate
+	rt.r.adopt(&inFlight, 1000, false, false)
+	rt.r.adopt(&sacked, 1000, true, false)
+	rt.r.adopt(&lost, 1000, false, true)
+	if rt.r.InFlight != 1000 || rt.r.LostPending != 1000 || rt.r.Delivered != 0 || rt.r.Lost != 0 {
+		t.Fatalf("after adopt: got inflight = %d, lostPending = %d, delivered = %d, lost = %d, want 1000, 1000, 0, 0",
+			rt.r.InFlight, rt.r.LostPending, rt.r.Delivered, rt.r.Lost)
+	}
+	// Each records the data in flight once it was adopted, as if the adopted
+	// segments had been sent back to back.
+	if inFlight.txInFlight != 1000 || sacked.txInFlight != 1000 || lost.txInFlight != 1000 {
+		t.Errorf("adopted txInFlight = %d, %d, %d, want 1000, 1000, 1000", inFlight.txInFlight, sacked.txInFlight, lost.txInFlight)
+	}
+
+	// A new segment is sent and the adopted one in flight is delivered. Its
+	// bytes count, but it carries no snapshot to base a sample on.
+	n := rt.send(1000)
+	rt.advance(10 * time.Millisecond)
+	rt.r.beginACK()
+	rt.r.onDelivered(&inFlight, 1000, tcpip.MonotonicTime{}, 1000, rt.now, true /* once */)
+	rs := *rt.r.endACK()
+	if rs.hasData || rs.newlyAcked != 1000 || rt.r.Delivered != 1000 || rt.r.InFlight != 1000 {
+		t.Errorf("adopted segment delivered: got hasData = %t, newlyAcked = %d, delivered = %d, inflight = %d, want false, 1000, 1000, 1000",
+			rs.hasData, rs.newlyAcked, rt.r.Delivered, rt.r.InFlight)
+	}
+
+	// The SACKed segment is not counted again when it is cumulatively ACKed,
+	// and the new segment yields a sample.
+	rt.r.beginACK()
+	rt.r.onDelivered(&sacked, 1000, tcpip.MonotonicTime{}, 2000, rt.now, true /* once */)
+	rt.r.onDelivered(&n.rate, n.size, n.sendTime, n.end, rt.now, true /* once */)
+	rs = *rt.r.endACK()
+	if !rs.hasData || rs.newlyAcked != 1000 || rt.r.Delivered != 2000 {
+		t.Errorf("new segment delivered: got hasData = %t, newlyAcked = %d, delivered = %d, want true, 1000, 2000",
+			rs.hasData, rs.newlyAcked, rt.r.Delivered)
+	}
+
+	// Retransmitting the lost segment takes a snapshot, so a sample can be
+	// based on it.
+	rt.r.onSent(&lost, 1000, rt.now)
+	if lost.unsampled || rt.r.LostPending != 0 || rt.r.InFlight != 1000 {
+		t.Errorf("lost segment retransmitted: got unsampled = %t, lostPending = %d, inflight = %d, want false, 0, 1000",
+			lost.unsampled, rt.r.LostPending, rt.r.InFlight)
 	}
 }
 
@@ -461,7 +522,7 @@ func TestRateSamplerSplit(t *testing.T) {
 	p.size = 600
 	p.end = p.end - 400
 	rt.advance(10 * time.Millisecond)
-	rt.r.onSent(&q.rate, q.size, rt.now, false)
+	rt.r.onSent(&q.rate, q.size, rt.now)
 	if rt.r.LostPending != 600 || rt.r.InFlight != 400 {
 		t.Errorf("after resending the second half: got lostPending = %d, inflight = %d, want 600, 400", rt.r.LostPending, rt.r.InFlight)
 	}

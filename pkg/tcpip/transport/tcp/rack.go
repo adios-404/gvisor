@@ -229,7 +229,7 @@ func (s *sender) probeTimerExpired() tcpip.Error {
 	s.checkAppLimited()
 
 	var dataSent bool
-	if s.writeNext != nil && s.writeNext.xmitCount == 0 && s.Outstanding < s.SndCwnd {
+	if s.writeNext != nil && s.writeNext.xmitCount == 0 && s.cwndRoom() > 0 {
 		dataSent = s.maybeSendSegment(s.writeNext, int(s.ep.scoreboard.SMSS()), s.SndUna.Add(s.SndWnd))
 		if dataSent {
 			s.Outstanding += s.pCount(s.writeNext, s.MaxPayloadSize)
@@ -444,9 +444,7 @@ func (rc *rackControl) detectLoss(rcvTime tcpip.MonotonicTime) int {
 			// zero during recovery.
 			timeRemaining := seg.xmitTime.Sub(rcvTime) + rc.RTT + rc.ReoWnd + clockResolution
 			if timeRemaining < 0 || (timeRemaining == 0 && clockResolution == 0) {
-				if rc.snd.rate.enabled {
-					rc.snd.rate.onLost(&seg.rate, seg.payloadSize())
-				}
+				rc.snd.rateLost(seg)
 				seg.lost = true
 				numLost++
 			} else {
@@ -551,7 +549,7 @@ func (rc *rackControl) DoRecovery(_ *segment, fastRetransmit bool) {
 		}
 
 		// Check the congestion window after entering recovery.
-		if snd.Outstanding >= snd.SndCwnd {
+		if snd.cwndRoom() <= 0 {
 			break
 		}
 

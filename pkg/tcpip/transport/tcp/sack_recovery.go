@@ -43,7 +43,7 @@ func (sr *sackRecovery) handleSACKRecovery(limit int, end seqnum.Value) (dataSen
 	}
 
 	nextSegHint := snd.writeList.Front()
-	for snd.Outstanding < snd.SndCwnd {
+	for snd.cwndRoom() > 0 {
 		var nextSeg *segment
 		var rescueRtx bool
 		nextSeg, nextSegHint, rescueRtx = snd.NextSeg(nextSegHint)

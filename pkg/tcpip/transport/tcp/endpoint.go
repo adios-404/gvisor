@@ -2113,7 +2113,8 @@ func (e *Endpoint) SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error {
 				switch state {
 				case StateEstablished:
 					if e.EndpointState() == state {
-						e.snd.cc = e.snd.initCongestionControl(e.cc)
+						e.snd.setCongestionControl(e.snd.initCongestionControl(e.cc))
+						e.snd.updatePacingRate()
 					}
 				}
 				e.UnlockUser()

@@ -48,8 +48,9 @@ func (rr *renoRecovery) DoRecovery(rcvdSeg *segment, fastRetransmit bool) {
 		// We received a dup, inflate the congestion window by 1 packet
 		// if we're not at the max yet. Only inflate the window if
 		// regular FastRecovery is in use, RFC6675 does not require
-		// inflating cwnd on duplicate ACKs.
-		if snd.SndCwnd < snd.FastRecovery.MaxCwnd {
+		// inflating cwnd on duplicate ACKs. A rate-based algorithm sets the
+		// window itself.
+		if snd.rcc == nil && snd.SndCwnd < snd.FastRecovery.MaxCwnd {
 			snd.SndCwnd++
 		}
 		return
