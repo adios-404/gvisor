@@ -94,10 +94,17 @@ func (p *pacer) init(resolution time.Duration) {
 // turns pacing off.
 func (p *pacer) setRate(rate uint64, smss int) {
 	p.Rate = rate
+	p.Quantum = sendQuantum(rate, smss)
+}
 
-	// SetSendQuantum(), section 5.6.3.
+// sendQuantum returns C.send_quantum for a pacing rate of rate bytes per
+// second and an SMSS of smss bytes: 1ms of data, at least two segments and at
+// most 64KB.
+//
+// See section 5.6.3, SetSendQuantum().
+func sendQuantum(rate uint64, smss int) int {
 	quantum := min(bytesInTime(rate, sendQuantumTime), maxSendQuantum)
-	p.Quantum = max(int(quantum), 2*smss)
+	return max(int(quantum), 2*smss)
 }
 
 // ready returns how long the sender must wait at time now before it may send

@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -57,6 +58,12 @@ type topology struct {
 
 func newTopology(t testing.TB, rack bool, batch time.Duration) *topology {
 	t.Helper()
+	return newTopologyCC(t, "cubic", rack, batch)
+}
+
+// newTopologyCC is newTopology with the congestion control algorithm cc.
+func newTopologyCC(t testing.TB, cc tcpip.CongestionControlOption, rack bool, batch time.Duration) *topology {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	n := &topology{ctx: ctx, cancel: cancel}
 	t.Cleanup(n.close)
@@ -67,7 +74,7 @@ func newTopology(t testing.TB, rack bool, batch time.Duration) *topology {
 		// RX checksum offload.
 		link.SupportedGSOKind = stack.HostGSOSupported
 		link.LinkEPCapabilities = stack.CapabilityRXChecksumOffload
-		n.addStack(t, i, link, "cubic", rack)
+		n.addStack(t, i, link, cc, rack)
 	}
 	n.startPump(n.links[0], n.links[1], batch)
 	n.startPump(n.links[1], n.links[0], batch)
@@ -92,6 +99,13 @@ func (n *topology) addStack(t testing.TB, i int, link *channel.Endpoint, cc tcpi
 		t.Fatal(err)
 	}
 	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	if cc == "bbr" {
+		// BBR must be made available before it can be selected.
+		avail := tcpip.TCPAvailableCongestionControlOption("reno cubic bbr")
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &avail); err != nil {
+			t.Fatalf("SetTransportProtocolOption(%T): %s", avail, err)
+		}
+	}
 	recovery := tcpip.TCPRecovery(0)
 	if rack {
 		recovery = tcpip.TCPRACKLossDetection
@@ -354,48 +368,68 @@ func transfer(ctx context.Context, pair socketPair, data []byte, size int64, dst
 	return writeErr
 }
 
+// cpuTime returns the CPU time the process has used so far.
+func cpuTime(b *testing.B) time.Duration {
+	var ru unix.Rusage
+	if err := unix.Getrusage(unix.RUSAGE_SELF, &ru); err != nil {
+		b.Fatalf("getrusage: %v", err)
+	}
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
 // Each iteration starts with fresh congestion and RTT state. Only the transfer
-// is timed; cleanup must finish before the next iteration starts.
-func benchmarkTransfer(b *testing.B, rack bool, batch time.Duration, data []byte) (time.Duration, uint64, uint64) {
-	n := newTopology(b, rack, batch)
+// is timed; cleanup must finish before the next iteration starts. It returns
+// the time and CPU time the transfer took, and its retransmissions and SACK
+// recoveries.
+func benchmarkTransfer(b *testing.B, cc tcpip.CongestionControlOption, rack bool, batch time.Duration, data []byte) (time.Duration, time.Duration, uint64, uint64, uint64) {
+	n := newTopologyCC(b, cc, rack, batch)
 	defer n.close()
 	pair, err := n.connect(n.ctx)
 	if err != nil {
 		b.Fatal(err)
 	}
 	stats := n.stacks[0].Stats().TCP
-	beforeRxt, beforeRecovery := stats.Retransmits.Value(), stats.SACKRecovery.Value()
+	beforeRxt, beforeRecovery, beforeSent := stats.Retransmits.Value(), stats.SACKRecovery.Value(), stats.SegmentsSent.Value()
 	b.StartTimer()
-	start := time.Now()
+	start, startCPU := time.Now(), cpuTime(b)
 	err = transfer(n.ctx, pair, data, 64<<20, io.Discard)
-	elapsed := time.Since(start)
+	elapsed, cpu := time.Since(start), cpuTime(b)-startCPU
 	b.StopTimer()
 	if err != nil {
 		b.Fatal(err)
 	}
-	return elapsed, stats.Retransmits.Value() - beforeRxt, stats.SACKRecovery.Value() - beforeRecovery
+	return elapsed, cpu, stats.Retransmits.Value() - beforeRxt, stats.SACKRecovery.Value() - beforeRecovery, stats.SegmentsSent.Value() - beforeSent
 }
 
-// BenchmarkBulkBatchedLocalhost measures CUBIC throughput with and without
-// batching and RACK.
+// BenchmarkBulkBatchedLocalhost measures CUBIC and BBR throughput, and the
+// CPU time per GB transferred, with and without batching and RACK.
 func BenchmarkBulkBatchedLocalhost(b *testing.B) {
 	for _, batch := range []time.Duration{0, 100 * time.Microsecond} {
-		for _, rack := range []bool{true, false} {
-			b.Run(fmt.Sprintf("batchWindow=%v/cc=cubic/rack=%t", batch, rack), func(b *testing.B) {
-				b.StopTimer()
-				data := make([]byte, 128<<10)
-				b.SetBytes(64 << 20)
-				b.ResetTimer()
-				var retransmits, recoveries uint64
-				for i := 0; i < b.N; i++ {
-					elapsed, rxt, rec := benchmarkTransfer(b, rack, batch, data)
-					retransmits += rxt
-					recoveries += rec
-					b.Logf("transfer name=%s iterations=%d iteration=%d bytes=%d elapsed_ns=%d retransmits=%d recoveries=%d", b.Name(), b.N, i, 64<<20, elapsed.Nanoseconds(), rxt, rec)
-				}
-				b.ReportMetric(float64(retransmits)/float64(b.N), "retransmits/op")
-				b.ReportMetric(float64(recoveries)/float64(b.N), "sack-recoveries/op")
-			})
+		for _, cc := range []tcpip.CongestionControlOption{"cubic", "bbr"} {
+			for _, rack := range []bool{true, false} {
+				b.Run(fmt.Sprintf("batchWindow=%v/cc=%s/rack=%t", batch, cc, rack), func(b *testing.B) {
+					b.StopTimer()
+					data := make([]byte, 128<<10)
+					b.SetBytes(64 << 20)
+					b.ResetTimer()
+					var retransmits, recoveries, sent uint64
+					var cpu time.Duration
+					for i := 0; i < b.N; i++ {
+						elapsed, c, rxt, rec, snt := benchmarkTransfer(b, cc, rack, batch, data)
+						cpu += c
+						sent += snt
+						retransmits += rxt
+						recoveries += rec
+						b.Logf("transfer name=%s iterations=%d iteration=%d bytes=%d elapsed_ns=%d cpu_ns=%d retransmits=%d recoveries=%d", b.Name(), b.N, i, 64<<20, elapsed.Nanoseconds(), c.Nanoseconds(), rxt, rec)
+					}
+					b.ReportMetric(float64(retransmits)/float64(b.N), "retransmits/op")
+					b.ReportMetric(float64(recoveries)/float64(b.N), "sack-recoveries/op")
+					b.ReportMetric(cpu.Seconds()*1e3/(float64(b.N)*float64(64<<20)/1e9), "cpu-ms/GB")
+					// A GSO packet counts as one segment, so this shows how
+					// much each transmission carries.
+					b.ReportMetric(float64(sent)/float64(b.N), "segments-sent/op")
+				})
+			}
 		}
 	}
 }

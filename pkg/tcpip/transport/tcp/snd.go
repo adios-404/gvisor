@@ -546,6 +546,15 @@ func (s *sender) enableRateSampling() {
 //
 // +checklocks:s.ep.mu
 func (s *sender) initCongestionControl(congestionControlName tcpip.CongestionControlOption) congestionControl {
+	if congestionControlName == ccBBR {
+		// BBR keeps the window of an established connection, and starts
+		// a new one from the initial window. It never uses ssthresh.
+		if s.SndCwnd == 0 {
+			s.SndCwnd = InitialCwnd
+			s.Ssthresh = InitialSsthresh
+		}
+		return newBBR(s)
+	}
 	s.SndCwnd = InitialCwnd
 	s.Ssthresh = InitialSsthresh
 

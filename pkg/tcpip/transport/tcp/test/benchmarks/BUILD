@@ -24,5 +24,6 @@ go_test(
         "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/tcp/test/pathmodel",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

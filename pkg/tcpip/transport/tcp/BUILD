@@ -144,6 +144,8 @@ go_library(
     name = "tcp",
     srcs = [
         "accept.go",
+        "bbr.go",
+        "bbr_filter.go",
         "accept_mutex.go",
         "connect.go",
         "connect_unsafe.go",
@@ -220,6 +222,7 @@ go_test(
     size = "small",
     srcs = [
         "accept_test.go",
+        "bbr_test.go",
         "cubic_test.go",
         "endpoint_test.go",
         "main_test.go",

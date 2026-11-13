@@ -398,7 +398,14 @@ func (r *rateSampler) checkAppLimited(noUnsentData bool, cwndBytes uint64) {
 	if !noUnsentData || r.InFlight >= cwndBytes || r.LostPending != 0 {
 		return
 	}
-	// MarkConnectionAppLimited().
+	r.markAppLimited()
+}
+
+// markAppLimited marks the connection as application-limited until the data
+// now in flight has been delivered.
+//
+// See section 4.1.2.4, MarkConnectionAppLimited().
+func (r *rateSampler) markAppLimited() {
 	r.AppLimited = max(r.Delivered+r.InFlight, 1)
 }
 

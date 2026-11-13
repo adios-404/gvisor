@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -83,7 +84,13 @@ const (
 const (
 	ccReno  = "reno"
 	ccCubic = "cubic"
+	ccBBR   = "bbr"
 )
+
+// implementedCongestionControl lists the congestion control algorithms that
+// netstack implements. BBR is available only if TCPAvailableCongestionControlOption
+// makes it so.
+var implementedCongestionControl = []string{ccReno, ccCubic, ccBBR}
 
 // +stateify savable
 type protocol struct {
@@ -105,7 +112,10 @@ type protocol struct {
 	recvBufferSize tcpip.TCPReceiveBufferSizeRangeOption
 	// +checklocks:mu
 	congestionControl string
-	// availableCongestionControl is immutable after construction.
+	// availableCongestionControl lists the congestion control algorithms
+	// that the stack and its sockets may select.
+	//
+	// +checklocks:mu
 	availableCongestionControl []string
 	// +checklocks:mu
 	moderateReceiveBuffer bool
@@ -320,17 +330,38 @@ func (p *protocol) SetOption(option tcpip.SettableTransportProtocolOption) tcpip
 		return nil
 
 	case *tcpip.CongestionControlOption:
-		for _, c := range p.availableCongestionControl {
-			if string(*v) == c {
-				p.mu.Lock()
-				p.congestionControl = string(*v)
-				p.mu.Unlock()
-				return nil
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if !slices.Contains(p.availableCongestionControl, string(*v)) {
+			// linux returns ENOENT when an invalid congestion control
+			// is specified.
+			return &tcpip.ErrNoSuchFile{}
+		}
+		p.congestionControl = string(*v)
+		return nil
+
+	case *tcpip.TCPAvailableCongestionControlOption:
+		// Any algorithm netstack implements may be made available, but the
+		// default algorithm must stay available.
+		names := strings.Fields(string(*v))
+		for _, name := range names {
+			if !slices.Contains(implementedCongestionControl, name) {
+				return &tcpip.ErrInvalidOptionValue{}
 			}
 		}
-		// linux returns ENOENT when an invalid congestion control
-		// is specified.
-		return &tcpip.ErrNoSuchFile{}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if !slices.Contains(names, p.congestionControl) {
+			return &tcpip.ErrInvalidOptionValue{}
+		}
+		var avail []string
+		for _, name := range names {
+			if !slices.Contains(avail, name) {
+				avail = append(avail, name)
+			}
+		}
+		p.availableCongestionControl = avail
+		return nil
 
 	case *tcpip.TCPModerateReceiveBufferOption:
 		p.mu.Lock()

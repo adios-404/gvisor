@@ -3382,6 +3382,9 @@ func (e *Endpoint) completeStateLocked(s *TCPEndpointState) {
 		s.Sender.Cubic = cubic.TCPCubicState
 		s.Sender.Cubic.TimeSinceLastCongestion = e.stack.Clock().NowMonotonic().Sub(s.Sender.Cubic.T)
 	}
+	if bbr, ok := e.snd.cc.(*bbrState); ok {
+		s.Sender.BBR = bbr.TCPBBRState
+	}
 
 	s.Sender.RACKState = e.snd.rc.TCPRACKState
 	s.Sender.DeliveryRate = e.snd.rate.TCPDeliveryRateState

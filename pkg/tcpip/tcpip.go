@@ -1164,8 +1164,11 @@ func (*TCPReceiveBufferSizeRangeOption) isGettableTransportProtocolOption() {}
 
 func (*TCPReceiveBufferSizeRangeOption) isSettableTransportProtocolOption() {}
 
-// TCPAvailableCongestionControlOption is the supported congestion control
-// algorithms for TCP
+// TCPAvailableCongestionControlOption is the space-separated list of
+// congestion control algorithms that the stack and its sockets may select.
+// It may be set to any of the algorithms that the stack implements, but it
+// must include the stack's default algorithm. By default it holds "reno
+// cubic"; "bbr" must be added to it to be used.
 type TCPAvailableCongestionControlOption string
 
 func (*TCPAvailableCongestionControlOption) isGettableTransportProtocolOption() {}

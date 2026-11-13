@@ -15,6 +15,7 @@
 package tcp
 
 import (
+	"fmt"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -298,6 +299,140 @@ type TCPPacingState struct {
 	NextSendTime tcpip.MonotonicTime
 }
 
+// BBRState is a state of the BBR state machine.
+//
+// See: https://datatracker.ietf.org/doc/html/draft-ietf-ccwg-bbr-07#section-5.1
+type BBRState uint8
+
+// The states of the BBR state machine. BBRStateNone is used only for
+// TCPBBRState.UndoState.
+const (
+	BBRStateNone BBRState = iota
+	BBRStartup
+	BBRDrain
+	BBRProbeBWDown
+	BBRProbeBWCruise
+	BBRProbeBWRefill
+	BBRProbeBWUp
+	BBRProbeRTT
+)
+
+// String implements fmt.Stringer.
+func (s BBRState) String() string {
+	switch s {
+	case BBRStateNone:
+		return "None"
+	case BBRStartup:
+		return "Startup"
+	case BBRDrain:
+		return "Drain"
+	case BBRProbeBWDown:
+		return "ProbeBW_DOWN"
+	case BBRProbeBWCruise:
+		return "ProbeBW_CRUISE"
+	case BBRProbeBWRefill:
+		return "ProbeBW_REFILL"
+	case BBRProbeBWUp:
+		return "ProbeBW_UP"
+	case BBRProbeRTT:
+		return "ProbeRTT"
+	default:
+		return fmt.Sprintf("BBRState(%d)", uint8(s))
+	}
+}
+
+// TCPBBRState is the state of the BBR congestion control algorithm. Each field
+// is the variable of draft-ietf-ccwg-bbr-07 named in its comment. Volumes of
+// data are in bytes, rates in bytes per second and gains in thousandths.
+// "Infinity" is math.MaxUint64, or the largest time.Duration for MinRTT.
+//
+// +stateify savable
+type TCPBBRState struct {
+	State     BBRState // BBR.state
+	UndoState BBRState // BBR.undo_state
+
+	Cwnd       uint64 // C.cwnd
+	PacingRate uint64 // C.pacing_rate
+	PacingGain uint64 // BBR.pacing_gain
+	CwndGain   uint64 // BBR.cwnd_gain
+
+	// HasSeenRTT is true once the pacing rate has been initialised from a
+	// smoothed RTT (section 5.6.2, InitPacingRate()).
+	HasSeenRTT bool
+
+	RoundCount         uint64 // BBR.round_count
+	RoundStart         bool   // BBR.round_start
+	NextRoundDelivered uint64 // BBR.next_round_delivered
+	IdleRestart        bool   // BBR.idle_restart
+	DrainStartRound    uint64 // BBR.drain_start_round
+
+	// IsCwndLimited is C.is_cwnd_limited for the previous round trip, and
+	// CwndLimitedInRound whether cwnd has been fully used in this one.
+	IsCwndLimited      bool
+	CwndLimitedInRound bool
+
+	MaxBw       uint64 // BBR.max_bw
+	BwShortterm uint64 // BBR.bw_shortterm
+	Bw          uint64 // BBR.bw
+	CycleCount  uint64 // BBR.cycle_count
+
+	MinRTT        time.Duration       // BBR.min_rtt
+	MinRTTStamp   tcpip.MonotonicTime // BBR.min_rtt_stamp
+	MinRTTExpired bool                // BBR.min_rtt_expired
+
+	BDP               uint64 // BBR.bdp
+	ExtraAcked        uint64 // BBR.extra_acked
+	OffloadBudget     uint64 // BBR.offload_budget
+	SendQuantum       uint64 // C.send_quantum
+	MaxInflight       uint64 // BBR.max_inflight
+	InflightLongterm  uint64 // BBR.inflight_longterm
+	InflightShortterm uint64 // BBR.inflight_shortterm
+	BwLatest          uint64 // BBR.bw_latest
+	InflightLatest    uint64 // BBR.inflight_latest
+
+	ExtraAckedIntervalStart tcpip.MonotonicTime // BBR.extra_acked_interval_start
+	ExtraAckedDelivered     uint64              // BBR.extra_acked_delivered
+
+	FullBwReached bool   // BBR.full_bw_reached
+	FullBwNow     bool   // BBR.full_bw_now
+	FullBw        uint64 // BBR.full_bw
+	FullBwCount   uint64 // BBR.full_bw_count
+
+	LossEventsInRound  uint64 // BBR.loss_events_in_round
+	LossRoundDelivered uint64 // BBR.loss_round_delivered
+	LossRoundStart     bool   // BBR.loss_round_start
+	IsLossInRound      bool   // BBR.is_loss_in_round
+
+	IsBwProbeStopping      bool                // BBR.is_bw_probe_stopping
+	CheckProbeLoss         bool                // BBR.check_probe_loss
+	BwProbeUpAcked         uint64              // BBR.bw_probe_up_acked
+	ProbeUpAckedPerInc     uint64              // BBR.probe_up_acked_per_inc
+	BwProbeUpRounds        uint64              // BBR.bw_probe_up_rounds
+	RoundsSinceProbeUp     uint64              // BBR.rounds_since_probe_up
+	BwProbeWait            time.Duration       // BBR.bw_probe_wait
+	CycleStamp             tcpip.MonotonicTime // BBR.cycle_stamp
+	PrevProbeTooHigh       bool                // BBR.prev_probe_too_high
+	PrevProbePrecautionary bool                // BBR.prev_probe_precautionary
+
+	UndoBwShortterm       uint64 // BBR.undo_bw_shortterm
+	UndoInflightShortterm uint64 // BBR.undo_inflight_shortterm
+	UndoInflightLongterm  uint64 // BBR.undo_inflight_longterm
+
+	// ProbeRTTDoneStamp is BBR.probe_rtt_done_stamp, valid only if
+	// ProbeRTTDoneStampSet: the draft encodes "unset" as zero, which is a
+	// valid time on a manual clock.
+	ProbeRTTDoneStamp    tcpip.MonotonicTime
+	ProbeRTTDoneStampSet bool
+	ProbeRTTRoundDone    bool   // BBR.probe_rtt_round_done
+	ProbeRTTCwnd         uint64 // BBR.probe_rtt_cwnd
+
+	PriorCwnd uint64 // BBR.prior_cwnd
+
+	// InLossRecovery is InLossRecovery(): true between OnEnterRecovery and
+	// OnExitRecovery.
+	InLossRecovery bool
+}
+
 // TCPSenderState holds a copy of the internal state of the sender for a given
 // TCP Endpoint.
 //
@@ -382,6 +517,9 @@ type TCPSenderState struct {
 
 	// Pacing holds the state related to pacing.
 	Pacing TCPPacingState
+
+	// BBR holds the state of BBR congestion control, if it is in use.
+	BBR TCPBBRState
 
 	// RetransmitTS records the timestamp used to detect spurious recovery.
 	RetransmitTS uint32

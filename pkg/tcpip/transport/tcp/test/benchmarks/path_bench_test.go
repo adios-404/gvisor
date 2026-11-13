@@ -83,7 +83,7 @@ func newPathTopology(t testing.TB, c pathCase, cc tcpip.CongestionControlOption,
 // path intact, with and without RACK.
 func TestTransferOverLossyPath(t *testing.T) {
 	c := pathCase{name: "lossy", rate: 2_500_000, rtt: 20 * time.Millisecond, queueBDPs: 1, lossPPM: 10_000}
-	for _, cc := range []tcpip.CongestionControlOption{"reno", "cubic"} {
+	for _, cc := range []tcpip.CongestionControlOption{"reno", "cubic", "bbr"} {
 		for _, rack := range []bool{true, false} {
 			t.Run(fmt.Sprintf("cc=%s/rack=%t", cc, rack), func(t *testing.T) {
 				n := newPathTopology(t, c, cc, rack)
@@ -130,7 +130,7 @@ var pathCases = []pathCase{
 func BenchmarkBulkPath(b *testing.B) {
 	const size = 8 << 20
 	for _, c := range pathCases {
-		for _, cc := range []tcpip.CongestionControlOption{"cubic"} {
+		for _, cc := range []tcpip.CongestionControlOption{"cubic", "bbr"} {
 			for _, rack := range []bool{true, false} {
 				b.Run(fmt.Sprintf("path=%s/cc=%s/rack=%t", c.name, cc, rack), func(b *testing.B) {
 					b.StopTimer()

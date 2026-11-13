@@ -63,6 +63,8 @@ var (
 	rack               = flag.Bool("rack", true, "enable RACK in TCP")
 	moderateRecvBuf    = flag.Bool("moderate_recv_buf", true, "enable TCP Receive Buffer Auto-tuning")
 	cubic              = flag.Bool("cubic", false, "enable use of CUBIC congestion control for netstack")
+	cc                 = flag.String("cc", "", "congestion control algorithm for netstack: reno, cubic or bbr (overrides -cubic)")
+	bufferSize         = flag.Int("buffer_size", 0, "size in bytes of netstack's TCP send and receive buffers, and the most they may grow to (0: netstack's defaults)")
 	gso                = flag.Int("gso", 0, "GSO maximum size")
 	swgso              = flag.Bool("swgso", false, "gVisor-level GSO")
 	gro                = flag.Bool("gro", false, "gVisor-level GRO")
@@ -315,9 +317,32 @@ func newNetstackImpl(mode, probeFileName string) (*netstackImpl, func() error, e
 		}
 	}
 
-	// Set Congestion Control to cubic if requested.
-	if *cubic {
-		opt := tcpip.CongestionControlOption("cubic")
+	// Set the socket buffer sizes if requested.
+	if *bufferSize != 0 {
+		snd := tcpip.TCPSendBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: *bufferSize, Max: *bufferSize}
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &snd); err != nil {
+			return nil, probeFile.Close, fmt.Errorf("SetTransportProtocolOption(%d, &%T(%+v)): %s", tcp.ProtocolNumber, snd, snd, err)
+		}
+		rcv := tcpip.TCPReceiveBufferSizeRangeOption{Min: tcp.MinBufferSize, Default: *bufferSize, Max: *bufferSize}
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcv); err != nil {
+			return nil, probeFile.Close, fmt.Errorf("SetTransportProtocolOption(%d, &%T(%+v)): %s", tcp.ProtocolNumber, rcv, rcv, err)
+		}
+	}
+
+	// Set the congestion control algorithm if requested. BBR has to be made
+	// available first.
+	ccName := *cc
+	if ccName == "" && *cubic {
+		ccName = "cubic"
+	}
+	if ccName == "bbr" {
+		opt := tcpip.TCPAvailableCongestionControlOption("reno cubic bbr")
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+			return nil, probeFile.Close, fmt.Errorf("SetTransportProtocolOption(%d, &%T(%s)): %s", tcp.ProtocolNumber, opt, opt, err)
+		}
+	}
+	if ccName != "" {
+		opt := tcpip.CongestionControlOption(ccName)
 		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
 			return nil, probeFile.Close, fmt.Errorf("SetTransportProtocolOption(%d, &%T(%s)): %s", tcp.ProtocolNumber, opt, opt, err)
 		}

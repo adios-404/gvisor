@@ -44,6 +44,9 @@ latency_variation=1     # +/- 1ms is a relatively low amount of jitter.
 loss=0.1                # 0.1% loss is non-zero, but not extremely high.
 duplicate=0.1           # 0.1% means duplicates are 1/10x as frequent as losses.
 duration=30             # 30s is enough time to consistent results (experimentally).
+rate=                   # Bottleneck rate in Mbit/s; empty means none.
+queue=                  # Bottleneck queue in bytes; empty means one BDP.
+linux_cc=               # Congestion control of Linux senders; empty keeps the default.
 helper_dir="$(dirname "$0")"
 netstack_opts=
 disable_linux_gso=
@@ -117,8 +120,33 @@ while [[ $# -gt 0 ]]; do
     --cubic)
       netstack_opts="${netstack_opts} -cubic"
       ;;
+    --cc)
+      shift
+      [[ "$#" -le 0 ]] && echo "no congestion control provided" && exit 1
+      netstack_opts="${netstack_opts} -cc=$1"
+      ;;
+    --linux-cc)
+      shift
+      [[ "$#" -le 0 ]] && echo "no congestion control provided" && exit 1
+      linux_cc=$1
+      ;;
+    --rate)
+      shift
+      [[ "$#" -le 0 ]] && echo "no rate provided" && exit 1
+      rate=$1
+      ;;
+    --queue)
+      shift
+      [[ "$#" -le 0 ]] && echo "no queue size provided" && exit 1
+      queue=$1
+      ;;
     --moderate-recv-buf)
       netstack_opts="${netstack_opts} -moderate_recv_buf"
+      ;;
+    --buffer-size)
+      shift
+      [[ "$#" -le 0 ]] && echo "no buffer size provided" && exit 1
+      netstack_opts="${netstack_opts} -buffer_size=$1"
       ;;
     --duration)
       shift
@@ -227,7 +255,12 @@ while [[ $# -gt 0 ]]; do
       echo " --sack                enable SACK support"
       echo " --rack                enable RACK support"
       echo " --moderate-recv-buf   enable TCP receive buffer auto-tuning"
+      echo " --buffer-size         Netstack's TCP send and receive buffer size in bytes"
       echo " --cubic               enable CUBIC congestion control for Netstack"
+      echo " --cc                  congestion control for Netstack: reno, cubic or bbr"
+      echo " --linux-cc            congestion control for Linux senders, e.g. bbr"
+      echo " --rate                bottleneck rate in Mbit/s (default: none)"
+      echo " --queue               bottleneck queue in bytes (default: one BDP)"
       echo " --duration            set the test duration (s)"
       echo " --latency             set the latency (ms)"
       echo " --latency-variation   set the latency variation"
@@ -307,6 +340,21 @@ if ${server}; then
       --xdp=${xdp}"
 fi
 
+# A bottleneck is a token bucket filter after the delay and loss, so that its
+# queue holds only the packets waiting for the bottleneck. netem's own limit
+# counts the packets in its delay line too.
+bottleneck=""
+if [[ -n "${rate}" ]]; then
+  rate_bytes=$(echo "${rate} * 125000" | bc -l | awk '{printf "%d", $0}')
+  if [[ -z "${queue}" ]]; then
+    queue=$(echo "${rate_bytes} * ${latency} / 1000" | bc -l | awk '{printf "%d", $0}')
+  fi
+  # The bucket holds 1ms of data, and at least two packets.
+  burst=$(( rate_bytes / 1000 > 2 * mtu ? rate_bytes / 1000 : 2 * mtu ))
+  queue=$(( queue > burst ? queue : burst ))
+  bottleneck="tbf rate ${rate}mbit burst ${burst} limit ${queue}"
+fi
+
 # Specify loss and duplicate parameters only if they are non-zero
 loss_opt=""
 if [[ "$(echo "$half_loss" | bc -q)" != "0" ]]; then
@@ -363,9 +411,16 @@ for device in wan.0 wan.1; do
   # actually doesn't work. The man page actually has a small comment about this
   # "It is also possible to add a correlation, but this option is now deprecated
   # due to the noticed bad behavior." For more information see netem(8).
-  tc qdisc add dev \$device root netem \\
-    delay ${half_latency}ms ${latency_variation}ms ${distribution} \\
-    ${loss_opt} ${duplicate_opt}
+  if [[ -n "${bottleneck}" ]]; then
+    tc qdisc add dev \$device root handle 1: netem limit 100000 \\
+      delay ${half_latency}ms ${latency_variation}ms ${distribution} \\
+      ${loss_opt} ${duplicate_opt}
+    tc qdisc add dev \$device parent 1:1 handle 10: ${bottleneck}
+  else
+    tc qdisc add dev \$device root netem \\
+      delay ${half_latency}ms ${latency_variation}ms ${distribution} \\
+      ${loss_opt} ${duplicate_opt}
+  fi
 done
 
 # Start a client proxy.
@@ -425,6 +480,10 @@ iperf_pid=\$!
 
 # Give services time to start.
 sleep 5
+
+if [[ -n "${linux_cc}" ]]; then
+  ${nsjoin_binary} /tmp/client.netns /bin/sh -c "echo ${linux_cc} > /proc/sys/net/ipv4/tcp_congestion_control"
+fi
 
 ${nsjoin_binary} /tmp/client.netns ${client_args} &
 client_pid=\$!
