@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -1268,8 +1269,15 @@ type sackTest struct {
 // of maxPayload bytes to send.
 func newSACKTest(t *testing.T, numSegments int) *sackTest {
 	t.Helper()
+	return newSACKTestOnClock(t, numSegments, 0)
+}
+
+// newSACKTestOnClock is newSACKTest for a stack that is told that its clock
+// advances in steps of up to resolution.
+func newSACKTestOnClock(t *testing.T, numSegments int, resolution time.Duration) *sackTest {
+	t.Helper()
 	st := &sackTest{t: t, clock: faketime.NewManualClock()}
-	st.c = context.NewWithOpts(t, context.Options{MTU: uint32(mtu), EnableV4: true, Clock: st.clock})
+	st.c = context.NewWithOpts(t, context.Options{MTU: uint32(mtu), EnableV4: true, Clock: st.clock, ClockResolution: resolution})
 	t.Cleanup(st.c.Cleanup)
 	e2e.SetStackSACKPermitted(t, st.c, true)
 	e2e.SetStackTCPRecovery(t, st.c, int(tcpip.TCPRACKLossDetection))
@@ -1422,6 +1430,196 @@ func TestRACKRetransmitsPartlySACKedSegment(t *testing.T) {
 		t.Errorf("sent %v, want a retransmission of segment 2", resent)
 	}
 	if got := st.c.Stack().Stats().TCP.Timeouts.Value(); got != 0 {
+		t.Errorf("%d retransmission timeouts, want 0", got)
+	}
+}
+
+// repairInFlight plays a connection to the end of a recovery that leaves the
+// repair of a segment in flight: the segment, lost, is above that recovery's
+// end point. Every segment that was acknowledged arrived in the order in
+// which it was sent. On return, the segments from next on that were sent
+// before the repair are in flight, and so are the repair and the segments in
+// after[1:], which were sent after it; after[0] is the repair.
+func repairInFlight(t *testing.T) (st *sackTest, lost, next int, after []int) {
+	t.Helper()
+	st = newSACKTest(t, 80)
+
+	// Slow start: the first flight arrives, the second is segments 10 to 29.
+	if flight := st.sent(); len(flight) != 10 {
+		t.Fatalf("first flight %v, want 10 segments", flight)
+	}
+	if flight := st.ack(10); len(flight) != 20 {
+		t.Fatalf("second flight %v, want 20 segments", flight)
+	}
+
+	// Segments 10 and 28 are lost. While the segments between them arrive
+	// the sender enters recovery, which ends once segment 29 is
+	// acknowledged, repairs segment 10 and sends new segments as the window
+	// allows.
+	var early []int
+	for last := 11; last <= 27; last++ {
+		early = append(early, st.ack(10, sackRange(11, last))...)
+	}
+	// lost is one of those new segments. It is lost as well.
+	lost = 32
+	if len(early) < 2 || early[0] != 10 || early[1] != 30 || early[len(early)-1] < lost+2 {
+		t.Fatalf("sent %v, want the repair of segment 10 and new segments from 30 to at least %d", early, lost+2)
+	}
+	// next is the first segment not sent yet.
+	next = early[len(early)-1] + 1
+
+	// Segment 29 arrives, which shows the loss of segment 28: it is
+	// repaired. Then the repair of segment 10 arrives, and the new segments
+	// before the lost one. More new segments follow the repair of segment
+	// 28.
+	late := st.ack(10, sackRange(11, 27), sackRange(29, 29))
+	if len(late) == 0 || late[0] != 28 {
+		t.Fatalf("sent %v, want the repair of segment 28 first", late)
+	}
+	late = append(late[1:], st.ack(28, sackRange(29, 29))...)
+	for last := 30; last < lost; last++ {
+		late = append(late, st.ack(28, sackRange(29, last))...)
+	}
+	if len(late) < 3 || late[0] != next {
+		t.Fatalf("sent %v after the repair of segment 28, want at least three new segments from %d", late, next)
+	}
+
+	// The rest of the segments sent before the repair of segment 28
+	// arrive. The first of them shows the loss, which is repaired.
+	after = st.ack(28, sackRange(29, lost-1), sackRange(lost+1, lost+1))
+	if len(after) == 0 || after[0] != lost {
+		t.Fatalf("sent %v, want the repair of segment %d first", after, lost)
+	}
+	for last := lost + 2; last < next; last++ {
+		after = append(after, st.ack(28, sackRange(29, lost-1), sackRange(lost+1, last))...)
+	}
+
+	// The repair of segment 28 arrives, which ends the recovery while the
+	// repair of the lost segment is in flight.
+	after = append(after, st.ack(lost, sackRange(lost+1, next-1))...)
+	if len(after) < 2 || after[1] < next+3 {
+		t.Fatalf("sent %v, want the repair of segment %d and then new segments from %d or later", after, lost, next+3)
+	}
+	return st, lost, next, after
+}
+
+// sackRange returns the byte range of segments from to to, for sackTest.ack.
+func sackRange(from, to int) [2]int {
+	return [2]int{from * maxPayload, (to + 1) * maxPayload}
+}
+
+// TestRACKFastRetransmitSparesRepairInFlight checks that three duplicate ACKs
+// do not make the sender repeat a retransmission of the first unacknowledged
+// segment that is still in flight: the duplicate ACKs are for segments sent
+// before that retransmission and say nothing about it. Every segment the test
+// acknowledges arrives in the order in which it was sent.
+func TestRACKFastRetransmitSparesRepairInFlight(t *testing.T) {
+	st, lost, next, after := repairInFlight(t)
+	stats := st.c.Stack().Stats().TCP
+
+	// The first three segments sent after the repair of segment 28 arrive.
+	// They are duplicate ACKs and start a new recovery, but they were sent
+	// before the repair of the lost segment and are no evidence that it was
+	// lost too.
+	recoveries := stats.SACKRecovery.Value()
+	fastRetransmits := stats.FastRetransmit.Value()
+	for last := next; last < next+3; last++ {
+		after = append(after, st.ack(lost, sackRange(lost+1, last))...)
+	}
+	if got := stats.SACKRecovery.Value() - recoveries; got != 1 {
+		t.Errorf("three duplicate ACKs started %d recoveries, want 1", got)
+	}
+	if got := stats.FastRetransmit.Value() - fastRetransmits; got != 0 {
+		t.Errorf("%d fast retransmissions after three duplicate ACKs, want 0", got)
+	}
+	if slices.Contains(after[1:], lost) {
+		t.Fatalf("sent %v from the repair of segment %d on, want no second repair of it", after, lost)
+	}
+
+	// The segments sent after that repair arrive: now the repair is known
+	// lost, and the segment is retransmitted again as soon as the window
+	// allows. The segments sent before the repair do not have that effect.
+	firstAfter, newest := after[1], after[len(after)-1]
+	repaired := false
+	for last := next + 3; last <= newest && !repaired; last++ {
+		repaired = slices.Contains(st.ack(lost, sackRange(lost+1, last)), lost)
+		if repaired && last < firstAfter {
+			t.Errorf("second repair of segment %d when segment %d arrived, which was sent before the first", lost, last)
+		}
+	}
+	if !repaired {
+		t.Errorf("no second repair of segment %d after segments %d to %d arrived, which were sent after the first", lost, firstAfter, newest)
+	}
+	if got := stats.Timeouts.Value(); got != 0 {
+		t.Errorf("%d retransmission timeouts, want 0", got)
+	}
+}
+
+// TestRACKFastRetransmitRepeatsLostRepair checks that a recovery does start
+// by retransmitting the first unacknowledged segment again when RACK has
+// marked its earlier retransmission lost, whether or not the congestion
+// window has room: the retransmission that starts a recovery never waits for
+// the window.
+func TestRACKFastRetransmitRepeatsLostRepair(t *testing.T) {
+	st, lost, next, after := repairInFlight(t)
+	stats := st.c.Stack().Stats().TCP
+	firstAfter := after[1]
+
+	// The segments sent between the two repairs are lost as well. The first
+	// segment sent after the repair of the lost segment arrives: the repair
+	// was sent before it and has not arrived, so it was lost. That starts a
+	// recovery, which halves a congestion window that was in full use.
+	recoveries := stats.SACKRecovery.Value()
+	resent := st.ack(lost, sackRange(lost+1, next-1), sackRange(firstAfter, firstAfter))
+	if got := stats.SACKRecovery.Value() - recoveries; got != 1 {
+		t.Fatalf("the loss of the repair started %d recoveries, want 1", got)
+	}
+	if len(resent) == 0 || resent[0] != lost {
+		t.Errorf("sent %v, want the second repair of segment %d first", resent, lost)
+	}
+	// The window had no room: nothing else was sent, not even the other
+	// segments RACK marked lost, so only the rule under test sent the
+	// repair.
+	if len(resent) > 1 {
+		t.Errorf("sent %v, want only the repair of segment %d: the test needs a full window", resent, lost)
+	}
+	if got := stats.Timeouts.Value(); got != 0 {
+		t.Errorf("%d retransmission timeouts, want 0", got)
+	}
+}
+
+// TestRACKFastRetransmitOnCoarseClock checks that the third duplicate ACK
+// retransmits a first unacknowledged segment that was sent only once, at
+// once, also when RACK cannot say yet that the segment was lost: on a clock
+// that advances in steps, RACK waits out a step before it takes a segment
+// sent in the same step as one that arrived for lost.
+func TestRACKFastRetransmitOnCoarseClock(t *testing.T) {
+	st := newSACKTestOnClock(t, 40, time.Millisecond)
+	stats := st.c.Stack().Stats().TCP
+
+	// Slow start: the first flight arrives, the second is segments 10 to 29.
+	if flight := st.sent(); len(flight) != 10 {
+		t.Fatalf("first flight %v, want 10 segments", flight)
+	}
+	if flight := st.ack(10); len(flight) != 20 {
+		t.Fatalf("second flight %v, want 20 segments", flight)
+	}
+
+	// Segment 10 is lost and the three after it arrive, well within one
+	// step of the clock.
+	for last := 11; last <= 12; last++ {
+		if resent := st.ack(10, sackRange(11, last)); slices.Contains(resent, 10) {
+			t.Fatalf("sent %v after %d duplicate ACKs, want no repair of segment 10 yet", resent, last-10)
+		}
+	}
+	resent := st.ack(10, sackRange(11, 13))
+	if len(resent) == 0 || resent[0] != 10 {
+		t.Errorf("sent %v after the third duplicate ACK, want the repair of segment 10 first", resent)
+	}
+	if got := stats.FastRetransmit.Value(); got != 1 {
+		t.Errorf("%d fast retransmissions, want 1", got)
+	}
+	if got := stats.Timeouts.Value(); got != 0 {
 		t.Errorf("%d retransmission timeouts, want 0", got)
 	}
 }
