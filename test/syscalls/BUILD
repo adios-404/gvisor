@@ -1272,6 +1272,18 @@ syscall_test(
     test = "//test/syscalls/linux:tcp_socket_test",
 )
 
+# The TCP tests again, with BBR as the sandbox's default congestion control.
+syscall_test(
+    size = "medium",
+    add_directfs = False,
+    allow_native = False,
+    # Takes too long to run with S/R.
+    save = False,
+    shard_count = more_shards,
+    tcp_congestion_control = "bbr",
+    test = "//test/syscalls/linux:tcp_socket_test",
+)
+
 syscall_test(
     test = "//test/syscalls/linux:tgkill_test",
 )

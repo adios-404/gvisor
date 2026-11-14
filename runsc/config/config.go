@@ -148,6 +148,10 @@ type Config struct {
 	// AllowLiveTCPMigration allows TCP connection state to be migrated.
 	AllowLiveTCPMigration bool `flag:"allow-live-tcp-migration"`
 
+	// TCPCongestionControl is the default TCP congestion control algorithm
+	// of the sandbox's network stack.
+	TCPCongestionControl TCPCongestionControl `flag:"net-tcp-congestion-control"`
+
 	// SignalUnkillablePolicy controls protection of PID namespace init processes
 	// from signals under Linux SIGNAL_UNKILLABLE semantics (see SignalUnkillablePolicy).
 	SignalUnkillablePolicy SignalUnkillablePolicy `flag:"signal-unkillable-policy"`
@@ -632,6 +636,9 @@ func (c *Config) Validate() error {
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("netgofer flag is incompatible with XDP")
 		}
+	}
+	if c.TCPCongestionControl != TCPCongestionControlDefault && c.Network != NetworkSandbox && c.Network != NetworkNone {
+		return fmt.Errorf("net-tcp-congestion-control flag is only supported with sandbox or none networking")
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
 		return fmt.Errorf("qdisc-tbf-burst must be <= %d, got: %d", maxQDiscTBFBurst, c.TBFBurst)
@@ -2046,6 +2053,69 @@ func (p StateEnginePolicy) String() string {
 	default:
 		panic(fmt.Sprintf("invalid state engine policy %d", p))
 	}
+}
+
+// TCPCongestionControl selects the default TCP congestion control algorithm of
+// the sandbox's network stack.
+type TCPCongestionControl int
+
+const (
+	// TCPCongestionControlDefault keeps netstack's default algorithm, Reno.
+	TCPCongestionControlDefault TCPCongestionControl = iota
+
+	// TCPCongestionControlReno selects Reno.
+	TCPCongestionControlReno
+
+	// TCPCongestionControlCubic selects CUBIC.
+	TCPCongestionControlCubic
+
+	// TCPCongestionControlBBR selects BBR, which is experimental. Applications
+	// can select BBR with TCP_CONGESTION only if it is the default.
+	TCPCongestionControlBBR
+)
+
+// Ptr returns a pointer to t.
+func (t TCPCongestionControl) Ptr() *TCPCongestionControl {
+	return &t
+}
+
+// Get implements flag.Getter.
+func (t *TCPCongestionControl) Get() any {
+	return *t
+}
+
+// String implements flag.Getter. Except for "default", it is the algorithm's
+// name in netstack and in TCP_CONGESTION.
+func (t TCPCongestionControl) String() string {
+	switch t {
+	case TCPCongestionControlDefault:
+		return "default"
+	case TCPCongestionControlReno:
+		return "reno"
+	case TCPCongestionControlCubic:
+		return "cubic"
+	case TCPCongestionControlBBR:
+		return "bbr"
+	default:
+		panic(fmt.Sprintf("invalid TCP congestion control %d", t))
+	}
+}
+
+// Set implements flag.Getter. Set(String()) should be idempotent.
+func (t *TCPCongestionControl) Set(v string) error {
+	switch v {
+	case "", "default":
+		*t = TCPCongestionControlDefault
+	case "reno":
+		*t = TCPCongestionControlReno
+	case "cubic":
+		*t = TCPCongestionControlCubic
+	case "bbr":
+		*t = TCPCongestionControlBBR
+	default:
+		return fmt.Errorf("invalid TCP congestion control %q (must be one of: default, reno, cubic, bbr)", v)
+	}
+	return nil
 }
 
 // NetgoferMode specifies whether and how the netgofer UDS proxy is used.

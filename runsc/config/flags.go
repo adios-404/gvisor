@@ -178,6 +178,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
 	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")
 	flagSet.Bool("allow-live-tcp-migration", true, "allow TCP connection state to be migrated. If false, connected TCP endpoints will be terminated during save/restore.")
+	flagSet.Var(TCPCongestionControlDefault.Ptr(), "net-tcp-congestion-control", "default TCP congestion control algorithm of the sandbox's network stack: default (netstack's default, reno), reno, cubic or bbr. bbr is experimental, and applications can select it with TCP_CONGESTION only if it is the default. Only supported with sandbox or none networking.")
 	flagSet.Bool("gso", true, "enable host segmentation offload if it is supported by a network device.")
 	flagSet.Bool("software-gso", true, "enable gVisor segmentation offload when host offload can't be enabled.")
 	flagSet.Bool("gvisor-gro", false, "enable gVisor generic receive offload")

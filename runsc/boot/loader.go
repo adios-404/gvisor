@@ -22,6 +22,7 @@ import (
 	"os"
 	"runtime"
 	runtimedebug "runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	gtime "time"
@@ -2283,7 +2284,34 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		}
 	}
 
+	if c.tcpCongestionControl != "" {
+		if err := setDefaultTCPCongestionControl(s.Stack, c.tcpCongestionControl); err != nil {
+			return nil, fmt.Errorf("--net-tcp-congestion-control=%s: %w", c.tcpCongestionControl, err)
+		}
+	}
+
 	return s, nil
+}
+
+// setDefaultTCPCongestionControl makes the TCP congestion control algorithm
+// cc the stack's default, and makes it available to sockets if it is not
+// already.
+func setDefaultTCPCongestionControl(s *stack.Stack, cc string) error {
+	var avail tcpip.TCPAvailableCongestionControlOption
+	if err := s.TransportProtocolOption(tcp.ProtocolNumber, &avail); err != nil {
+		return fmt.Errorf("TransportProtocolOption(%d, &%T): %s", tcp.ProtocolNumber, avail, err)
+	}
+	if names := strings.Fields(string(avail)); !slices.Contains(names, cc) {
+		avail = tcpip.TCPAvailableCongestionControlOption(strings.Join(append(names, cc), " "))
+		if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &avail); err != nil {
+			return fmt.Errorf("SetTransportProtocolOption(%d, &%T(%q)): %s", tcp.ProtocolNumber, avail, avail, err)
+		}
+	}
+	opt := tcpip.CongestionControlOption(cc)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		return fmt.Errorf("SetTransportProtocolOption(%d, &%T(%q)): %s", tcp.ProtocolNumber, opt, opt, err)
+	}
+	return nil
 }
 
 // sandboxNetstackCreator implements inet.NetworkStackCreator and
@@ -2295,17 +2323,25 @@ type sandboxNetstackCreator struct {
 	allowPacketEndpointWrite bool
 	allowLiveTCPMigration    bool
 	uid                      uniqueid.Provider
+
+	// tcpCongestionControl is the default TCP congestion control algorithm of
+	// the network stacks, or "" for netstack's default.
+	tcpCongestionControl string
 }
 
 var _ inet.RestoreNetworkStackCreator = (*sandboxNetstackCreator)(nil)
 
 func newSandboxNetstackCreator(conf *config.Config, clock tcpip.Clock, uid uniqueid.Provider) *sandboxNetstackCreator {
-	return &sandboxNetstackCreator{
+	c := &sandboxNetstackCreator{
 		clock:                    clock,
 		allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
 		allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
 		uid:                      uid,
 	}
+	if conf.TCPCongestionControl != config.TCPCongestionControlDefault {
+		c.tcpCongestionControl = conf.TCPCongestionControl.String()
+	}
+	return c
 }
 
 // CreateStack implements inet.NetworkStackCreator.CreateStack.

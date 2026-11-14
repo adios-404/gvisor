@@ -1323,6 +1323,11 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 			info.ReordSeen = 1
 		}
 
+		info.DeliveryRate = v.DeliveryRate
+		if v.DeliveryRateAppLimited {
+			info.DeliveryRateAppLimited = 1
+		}
+
 		// Linux truncates the output binary to outLen.
 		buf := t.CopyScratchBuffer(info.SizeBytes())
 		info.MarshalUnsafe(buf)

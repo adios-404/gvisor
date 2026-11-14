@@ -152,6 +152,45 @@ func TestFromFlags(t *testing.T) {
 	}
 }
 
+func TestTCPCongestionControl(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    TCPCongestionControl
+		network string
+	}{
+		{value: "", want: TCPCongestionControlDefault},
+		{value: "default", want: TCPCongestionControlDefault, network: "host"},
+		{value: "reno", want: TCPCongestionControlReno},
+		{value: "cubic", want: TCPCongestionControlCubic, network: "none"},
+		{value: "bbr", want: TCPCongestionControlBBR},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
+			RegisterFlags(testFlags)
+			if err := testFlags.Lookup("net-tcp-congestion-control").Value.Set(tc.value); err != nil {
+				t.Fatalf("Flag set: %v", err)
+			}
+			if tc.network != "" {
+				if err := testFlags.Lookup("network").Value.Set(tc.network); err != nil {
+					t.Fatalf("Flag set: %v", err)
+				}
+			}
+			c, err := NewFromFlags(testFlags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.TCPCongestionControl != tc.want {
+				t.Errorf("TCPCongestionControl = %v, want %v", c.TCPCongestionControl, tc.want)
+			}
+			// Set(String()) must be idempotent.
+			var got TCPCongestionControl
+			if err := got.Set(tc.want.String()); err != nil || got != tc.want {
+				t.Errorf("Set(%q) = %v, %v, want %v, nil", tc.want.String(), got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestToFlagsFromFlags(t *testing.T) {
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
 	RegisterFlags(testFlags)
@@ -287,6 +326,11 @@ func TestInvalidFlags(t *testing.T) {
 			error: "invalid qdisc",
 		},
 		{
+			name:  "net-tcp-congestion-control",
+			value: "vegas",
+			error: "invalid TCP congestion control",
+		},
+		{
 			name:  "ref-leak-mode",
 			value: "invalid",
 			error: "invalid ref leak mode",
@@ -367,6 +411,14 @@ func TestValidationFail(t *testing.T) {
 				"num-network-channels": "-1",
 			},
 			error: "num_network_channels must be > 0",
+		},
+		{
+			name: "net-tcp-congestion-control+network:host",
+			flags: map[string]string{
+				"network":                    "host",
+				"net-tcp-congestion-control": "bbr",
+			},
+			error: "net-tcp-congestion-control flag is only supported with sandbox or none networking",
 		},
 		{
 			name: "qdisc-tbf-burst-overflow",

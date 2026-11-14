@@ -213,6 +213,7 @@ go_test(
         "//pkg/tcpip/header",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/transport/icmp",
+        "//pkg/tcpip/transport/tcp",
         "//pkg/test/capabilitytest",
         "//pkg/unet",
         "//pkg/urpc",

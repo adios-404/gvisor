@@ -199,6 +199,37 @@ Offload (GSO) to run with a kernel that is newer than 3.17. Add the
 }
 ```
 
+## TCP congestion control
+
+Netstack implements three TCP congestion control algorithms: Reno (the
+default), CUBIC and BBR. Applications can select Reno or CUBIC per socket with
+the `TCP_CONGESTION` socket option. To change the default for every TCP
+connection in the sandbox, use `--net-tcp-congestion-control`:
+
+```json
+{
+    "runtimes": {
+        "runsc": {
+            "path": "/usr/local/bin/runsc",
+            "runtimeArgs": [
+                "--net-tcp-congestion-control=bbr"
+            ]
+       }
+    }
+}
+```
+
+BBR ([draft-ietf-ccwg-bbr][bbr-draft], version 3) is experimental. It paces
+packets and keeps its throughput on paths with random packet loss, where Reno
+and CUBIC slow down, and it keeps queues short on paths with deep buffers.
+Applications can select BBR with `TCP_CONGESTION` only if it is the sandbox's
+default. The flag requires `--network=sandbox` or `--network=none`, and takes
+effect when the sandbox starts: a restored checkpoint keeps the setting it was
+saved with. Inside the sandbox, `/proc/sys/net/ipv4/tcp_congestion_control`
+shows the default and `/proc/sys/net/ipv4/tcp_available_congestion_control` the
+algorithms applications may select.
+
+[bbr-draft]: https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/
 [netstack]: /docs/architecture_guide/networking/
 [Production guide]: /docs/user_guide/production/
 [tbf-source]: https://cs.opensource.google/gvisor/gvisor/+/master:pkg/tcpip/link/qdisc/tbf/

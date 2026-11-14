@@ -49,9 +49,12 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
 #include "test/util/linux_capability_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/save_util.h"
@@ -3051,6 +3054,138 @@ TEST_P(SimpleTcpSocketTest, MaxPacingRateLimitsThroughput) {
   // the time. Unpaced, the transfer takes a few milliseconds.
   EXPECT_GE(elapsed, absl::Milliseconds(500));
   EXPECT_LE(elapsed, absl::Seconds(30));
+}
+
+// Returns true if the TCP congestion control algorithm name is listed in
+// /proc/sys/net/ipv4/tcp_available_congestion_control.
+PosixErrorOr<bool> CongestionControlAvailable(absl::string_view name) {
+  ASSIGN_OR_RETURN_ERRNO(
+      std::string available,
+      GetContents("/proc/sys/net/ipv4/tcp_available_congestion_control"));
+  for (absl::string_view n :
+       absl::StrSplit(available, absl::ByAnyChar(" \t\n"), absl::SkipEmpty())) {
+    if (n == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Tests that BBR can be selected if and only if it is available. In gVisor it
+// is available only if it is the sandbox's default
+// (--net-tcp-congestion-control=bbr).
+TEST_P(SimpleTcpSocketTest, SetCongestionControlBBR) {
+  const bool available =
+      ASSERT_NO_ERRNO_AND_VALUE(CongestionControlAvailable("bbr"));
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  constexpr char kBBR[] = "bbr";
+  const int ret =
+      setsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, kBBR, strlen(kBBR));
+  const int err = errno;
+  if (IsRunningOnGvisor() && !IsRunningWithHostinet()) {
+    if (!available) {
+      EXPECT_EQ(ret, -1);
+      EXPECT_EQ(err, ENOENT);
+      return;
+    }
+  } else if (ret != 0) {
+    // Linux loads tcp_bbr on demand if it can, and a kernel may restrict it
+    // to privileged users.
+    SKIP_IF(!available || err == EPERM);
+  }
+  ASSERT_EQ(ret, 0) << "setsockopt(TCP_CONGESTION, bbr): " << strerror(err);
+
+  // Linux's TCP_CA_NAME_MAX.
+  char got[16] = {};
+  socklen_t len = sizeof(got);
+  ASSERT_THAT(getsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, got, &len),
+              SyscallSucceeds());
+  EXPECT_STREQ(got, kBBR);
+}
+
+// Tests that TCP_INFO reports the delivery rate once data has been delivered,
+// and under BBR the pacing rate.
+TEST_P(SimpleTcpSocketTest, TCPInfoDeliveryRate) {
+  // struct tcp_info in older C library headers ends before these fields, so
+  // read them at their offsets in the Linux UAPI struct tcp_info.
+  constexpr size_t kDeliveryRateAppLimitedOffset = 7;  // Lowest bit.
+  constexpr size_t kPacingRateOffset = 104;            // 64-bit, bytes/s.
+  constexpr size_t kDeliveryRateOffset = 160;          // 64-bit, bytes/s.
+  constexpr size_t kInfoSize = kDeliveryRateOffset + sizeof(uint64_t);
+  struct Rates {
+    uint64_t delivery;
+    bool app_limited;
+    uint64_t pacing;
+  };
+  auto rates = [](int fd) -> Rates {
+    uint8_t info[kInfoSize] = {};
+    socklen_t len = sizeof(info);
+    EXPECT_THAT(getsockopt(fd, IPPROTO_TCP, TCP_INFO, info, &len),
+                SyscallSucceeds());
+    EXPECT_EQ(len, sizeof(info));
+    Rates r;
+    memcpy(&r.delivery, &info[kDeliveryRateOffset], sizeof(r.delivery));
+    memcpy(&r.pacing, &info[kPacingRateOffset], sizeof(r.pacing));
+    r.app_limited = (info[kDeliveryRateAppLimitedOffset] & 1) != 0;
+    return r;
+  };
+
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddrZeroPort(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+  const FileDescriptor listener =
+      ASSERT_NO_ERRNO_AND_VALUE(ReserveLocalPort(GetParam(), addr, addrlen));
+  ASSERT_THAT(listen(listener.get(), 1), SyscallSucceeds());
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  // Linux always samples the delivery rate. Netstack samples it for
+  // algorithms that need it, such as BBR. With hostinet, the host's TCP_INFO
+  // is what the native test checks.
+  SKIP_IF(IsRunningWithHostinet());
+  constexpr char kBBR[] = "bbr";
+  const bool bbr =
+      setsockopt(s.get(), IPPROTO_TCP, TCP_CONGESTION, kBBR, strlen(kBBR)) == 0;
+  SKIP_IF(IsRunningOnGvisor() && !bbr);
+
+  ASSERT_THAT(RetryEINTR(connect)(s.get(), AsSockAddr(&addr), addrlen),
+              SyscallSucceeds());
+  const FileDescriptor accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept(listener.get(), nullptr, nullptr));
+
+  // Nothing has been delivered yet. A connection starts out limited by the
+  // application.
+  Rates r = rates(s.get());
+  EXPECT_EQ(r.delivery, 0);
+  EXPECT_TRUE(r.app_limited);
+
+  // A small write leaves the connection with nothing more to send, so the
+  // rate measured from it is limited by the application. As in Linux, a
+  // sample taken over less than the minimum RTT seen so far is discarded,
+  // which timing noise on loopback can cause, so try a few round trips.
+  char data[100] = {};
+  char received[sizeof(data)];
+  for (int round = 0; round < 10 && r.delivery == 0; round++) {
+    ASSERT_THAT(RetryEINTR(write)(s.get(), data, sizeof(data)),
+                SyscallSucceedsWithValue(sizeof(data)));
+    ASSERT_THAT(ReadFd(accepted.get(), received, sizeof(received)),
+                SyscallSucceedsWithValue(sizeof(received)));
+
+    // The ACK may arrive after the read returns.
+    for (int i = 0; i < 50; i++) {
+      r = rates(s.get());
+      if (r.delivery != 0) {
+        break;
+      }
+      absl::SleepFor(absl::Milliseconds(10));
+    }
+  }
+  EXPECT_GT(r.delivery, 0);
+  EXPECT_TRUE(r.app_limited);
+  if (bbr) {
+    EXPECT_GT(r.pacing, 0);
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,

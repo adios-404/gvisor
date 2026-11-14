@@ -100,7 +100,10 @@ def _syscall_test(
         kvm_use_cpu_nums = True,
         in_sandbox_cgroup = "v1",
         requires_atime = False,
+        tcp_congestion_control = "",
         **kwargs):
+    if tcp_congestion_control and platform == "native":
+        fail("tcp_congestion_control applies only to gVisor; set allow_native = False")
     limit_ephemeral_ports = limit_ephemeral_ports and (network == "host" or platform == "native")
     if limit_ephemeral_ports:
         container = True
@@ -126,6 +129,8 @@ def _syscall_test(
         name += "_save_resume"
     if nftables:
         name += "_nftables"
+    if tcp_congestion_control:
+        name += "_" + tcp_congestion_control
 
     # Apply all tags.
     if tags == None:
@@ -206,6 +211,9 @@ def _syscall_test(
 
     if limit_ephemeral_ports:
         runner_args.append("--limit-ephemeral-ports")
+
+    if tcp_congestion_control:
+        runner_args.append("--tcp-congestion-control=" + tcp_congestion_control)
 
     # Trace points are platform agnostic, so enable them for ptrace only.
     if platform == "ptrace":

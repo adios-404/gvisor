@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 )
@@ -253,6 +254,51 @@ func TestCreateLinksAndRoutesExternalLoopback(t *testing.T) {
 			waitForStatIncrement(t, "InvalidSourceAddressesReceived", invalidSrc, beforeInvalidSrc)
 			if got := delivered.Value() - beforeDelivered; got != 0 {
 				t.Errorf("eth0 IPv4 loopback src PacketsDelivered delta = %d, want 0", got)
+			}
+		})
+	}
+}
+
+// TestTCPCongestionControl tests that --net-tcp-congestion-control sets the
+// default TCP congestion control algorithm of the sandbox's network stacks and
+// makes it available to sockets.
+func TestTCPCongestionControl(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cc        string
+		wantCC    string
+		wantAvail string
+	}{
+		{name: "default", cc: "", wantCC: "reno", wantAvail: "reno cubic"},
+		{name: "cubic", cc: "cubic", wantCC: "cubic", wantAvail: "reno cubic"},
+		{name: "bbr", cc: "bbr", wantCC: "bbr", wantAvail: "reno cubic bbr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			creator := &sandboxNetstackCreator{
+				clock:                tcpip.NewStdClock(),
+				uid:                  &testUniqueIDProvider{},
+				tcpCongestionControl: tc.cc,
+			}
+			inetStack, err := creator.CreateStack()
+			if err != nil {
+				t.Fatalf("CreateStack(): %v", err)
+			}
+			s := inetStack.(*netstack.Stack).Stack
+			defer s.Destroy()
+
+			var cc tcpip.CongestionControlOption
+			if err := s.TransportProtocolOption(tcp.ProtocolNumber, &cc); err != nil {
+				t.Fatalf("TransportProtocolOption(&%T): %s", cc, err)
+			}
+			if string(cc) != tc.wantCC {
+				t.Errorf("default congestion control = %q, want %q", cc, tc.wantCC)
+			}
+			var avail tcpip.TCPAvailableCongestionControlOption
+			if err := s.TransportProtocolOption(tcp.ProtocolNumber, &avail); err != nil {
+				t.Fatalf("TransportProtocolOption(&%T): %s", avail, err)
+			}
+			if string(avail) != tc.wantAvail {
+				t.Errorf("available congestion control = %q, want %q", avail, tc.wantAvail)
 			}
 		})
 	}

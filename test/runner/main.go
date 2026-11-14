@@ -77,6 +77,7 @@ var (
 	save             = flag.Bool("save", false, "enables save restore")
 	saveResume       = flag.Bool("save-resume", false, "enables save resume")
 	nftables         = flag.Bool("nftables", false, "enables nftables")
+	tcpCC            = flag.String("tcp-congestion-control", "", "default TCP congestion control algorithm of the sandbox's network stack (runsc --net-tcp-congestion-control)")
 	kvmUseCPUNums    = flag.Bool("kvm-use-cpu-nums", false, "use cpu numbers in kvm platform")
 	inSandboxCgroup  = flag.String("in-sandbox-cgroup", "v1", "cgroup setup to use inside the sandbox (v1 or v2)")
 )
@@ -482,6 +483,9 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	}
 	if *inSandboxCgroup != "" {
 		args = append(args, "-in-sandbox-cgroup="+*inSandboxCgroup)
+	}
+	if *tcpCC != "" {
+		args = append(args, "-net-tcp-congestion-control="+*tcpCC)
 	}
 
 	testLogDir := ""
