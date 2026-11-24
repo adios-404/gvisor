@@ -15,12 +15,15 @@
 package tcp
 
 import (
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -519,6 +522,88 @@ func TestRACKPTODuration(t *testing.T) {
 			clock.Advance(time.Nanosecond)
 			if expirations != 1 {
 				t.Fatalf("probe expirations at PTO = %d, want 1", expirations)
+			}
+		})
+	}
+}
+
+// TestSplitAtSACKBlock checks where a segment sent as several packets is split
+// for a SACK block that covers part of it.
+func TestSplitAtSACKBlock(t *testing.T) {
+	// The segment starts at 100 and holds four packets of 10 bytes and one
+	// of 5.
+	const seq = 100
+	for _, test := range []struct {
+		name  string
+		block header.SACKBlock
+		want  []int
+	}{
+		{"covers all", header.SACKBlock{Start: 100, End: 145}, []int{45}},
+		{"covers all and more", header.SACKBlock{Start: 90, End: 200}, []int{45}},
+		{"ends inside a packet", header.SACKBlock{Start: 100, End: 125}, []int{20, 25}},
+		{"ends inside the first packet", header.SACKBlock{Start: 100, End: 105}, []int{45}},
+		{"starts at a packet", header.SACKBlock{Start: 120, End: 145}, []int{20, 25}},
+		{"starts inside a packet", header.SACKBlock{Start: 125, End: 145}, []int{30, 15}},
+		{"starts inside the last packet", header.SACKBlock{Start: 142, End: 145}, []int{45}},
+		{"after the segment", header.SACKBlock{Start: 150, End: 160}, []int{45}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+			ctx.snd.MaxPayloadSize = 10
+			seg := newOutgoingSegment(stack.TransportEndpointID{}, clock, buffer.MakeWithView(buffer.NewViewSize(45)), 0)
+			seg.sequenceNumber = seq
+			seg.xmitCount = 1
+			ctx.snd.writeList.PushBack(seg)
+
+			ctx.snd.splitAtSACKBlock(seg, test.block)
+
+			var got []int
+			next := seqnum.Value(seq)
+			for s := ctx.snd.writeList.Front(); s != nil; s = s.Next() {
+				ctx.segs = append(ctx.segs, s)
+				if s.sequenceNumber != next {
+					t.Errorf("segment at %d, want %d", s.sequenceNumber, next)
+				}
+				got = append(got, s.payloadSize())
+				next = s.sequenceNumber.Add(seqnum.Size(s.payloadSize()))
+			}
+			if !slices.Equal(got, test.want) {
+				t.Errorf("segment sizes %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+// BenchmarkWalkSACK measures walkSACK on an ACK with three SACK blocks at the
+// top of the flight, as during a recovery.
+func BenchmarkWalkSACK(b *testing.B) {
+	for _, inFlight := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("inFlight=%d", inFlight), func(b *testing.B) {
+			clock := faketime.NewManualClock()
+			ctx := newRACKTestContext(clock, 0)
+			defer ctx.cleanup()
+			ctx.snd.ep.mu.Lock()
+			defer ctx.snd.ep.mu.Unlock()
+			ctx.snd.MaxPayloadSize = 1
+			for i := 0; i < inFlight; i++ {
+				ctx.addSegment(seqnum.Value(i), clock.NowMonotonic())
+			}
+			ctx.snd.SndNxt = seqnum.Value(inFlight)
+
+			top := seqnum.Value(inFlight)
+			ack := &segment{}
+			ack.parsedOptions.SACKBlocks = []header.SACKBlock{
+				{Start: top - 2, End: top - 1},
+				{Start: top - 4, End: top - 3},
+				{Start: top - 6, End: top - 5},
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ctx.snd.walkSACK(ack)
 			}
 		})
 	}

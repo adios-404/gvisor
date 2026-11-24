@@ -400,16 +400,9 @@ func (rc *rackControl) exitRecovery() {
 
 // sacked reports whether seg has been selectively acknowledged.
 //
-// The scoreboard alone cannot tell. It holds a limited number of blocks, and
-// does not record a block that arrives when it is full, as happens when a
-// burst loses every other segment of a large window. The segment records
-// itself that a block covered it (walkSACK).
-//
-// A retransmission timeout expunges the scoreboard and resends from the first
-// unacknowledged segment whatever was selectively acknowledged before it, as
-// RFC 6675 section 5.1 asks. The segments keep their record, so if the
-// receiver has discarded such a segment and its retransmission is lost too,
-// it is the next timeout that repairs it, not RACK.
+// The scoreboard alone cannot tell: it holds a limited number of blocks, and
+// does not record a block that arrives when it is full. The segment itself
+// records that a block covered it.
 //
 // +checklocks:rc.snd.ep.mu
 func (rc *rackControl) sacked(seg *segment) bool {

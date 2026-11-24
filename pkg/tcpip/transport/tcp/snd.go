@@ -17,7 +17,7 @@ package tcp
 import (
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -689,6 +689,10 @@ func (s *sender) retransmitTimerExpired() tcpip.Error {
 	// information as we lack more rigorous checks to validate if the SACK
 	// information is usable after an RTO.
 	s.ep.scoreboard.Reset()
+	for seg := s.writeList.Front(); seg != nil && seg.xmitCount != 0; seg = seg.Next() {
+		seg.acked = false
+	}
+	s.SackedOut = 0
 	s.updateWriteNext(s.writeList.Front())
 
 	// RFC 1122 4.2.2.17: Start sending zero window probes when we still see a
@@ -1405,35 +1409,81 @@ func (s *sender) walkSACK(rcvdSeg *segment) bool {
 		hasDSACK = true
 	}
 
-	if n == 0 {
+	var blocks [header.TCPMaxSACKBlocks]header.SACKBlock
+	sackBlocks := blocks[:0]
+	for _, sb := range rcvdSeg.parsedOptions.SACKBlocks[idx:] {
+		if s.sackBlockInWindow(sb, rcvdSeg.ackNumber) {
+			sackBlocks = append(sackBlocks, sb)
+		}
+	}
+	if len(sackBlocks) == 0 {
 		return hasDSACK
 	}
-
-	// Sort the SACK blocks. The first block is the most recent unacked
-	// block. The following blocks can be in arbitrary order.
-	sackBlocks := make([]header.SACKBlock, n)
-	copy(sackBlocks, rcvdSeg.parsedOptions.SACKBlocks[idx:])
-	sort.Slice(sackBlocks, func(i, j int) bool {
-		return sackBlocks[j].Start.LessThan(sackBlocks[i].Start)
+	// Walk the blocks in sequence order, as the write list is. The first
+	// block is the most recent one, the others can be in any order.
+	slices.SortFunc(sackBlocks, func(a, b header.SACKBlock) int {
+		switch {
+		case a.Start.LessThan(b.Start):
+			return -1
+		case b.Start.LessThan(a.Start):
+			return 1
+		}
+		return 0
 	})
 
 	seg := s.writeList.Front()
 	for _, sb := range sackBlocks {
-		for seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0 {
-			// A block may end inside a segment that left as several
-			// packets. Its last part is still missing then, so it does
-			// not count as acknowledged.
+		for ; seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0; seg = seg.Next() {
+			if seg.acked {
+				continue
+			}
+			// Sent segments are contiguous, so seg ends where the next
+			// one starts.
+			if next := seg.Next(); next != nil && next.xmitCount != 0 && next.sequenceNumber.LessThanEq(sb.Start) {
+				continue
+			}
+			s.splitAtSACKBlock(seg, sb)
+			// The block may still end inside the last packet of the
+			// segment, which then does not count as acknowledged.
 			segEnd := seg.sequenceNumber.Add(seqnum.Size(seg.payloadSize()))
-			if sb.Start.LessThanEq(seg.sequenceNumber) && segEnd.LessThanEq(sb.End) && !seg.acked {
+			if sb.Start.LessThanEq(seg.sequenceNumber) && segEnd.LessThanEq(sb.End) {
 				s.rc.update(seg, rcvdSeg)
 				s.rc.detectReorder(seg)
 				seg.acked = true
 				s.SackedOut += s.pCount(seg, s.MaxPayloadSize)
 			}
-			seg = seg.Next()
 		}
 	}
 	return hasDSACK
+}
+
+// sackBlockInWindow reports whether sb covers only data that was sent and is
+// above both ack, the cumulative acknowledgement that carries sb, and SND.UNA.
+//
+// +checklocks:s.ep.mu
+func (s *sender) sackBlockInWindow(sb header.SACKBlock, ack seqnum.Value) bool {
+	return ack.LessThan(sb.Start) && s.SndUna.LessThan(sb.Start) && sb.End.LessThanEq(s.SndNxt)
+}
+
+// splitAtSACKBlock splits seg, a segment sent as packets of MaxPayloadSize
+// bytes, so that the packets sb covers form a segment of their own: seg if sb
+// covers the first packet of seg, else the next segment. A packet that sb
+// covers only in part counts as not covered. seg is not split if sb covers
+// all of it or none of its packets.
+//
+// +checklocks:s.ep.mu
+func (s *sender) splitAtSACKBlock(seg *segment, sb header.SACKBlock) {
+	mss := s.MaxPayloadSize
+	size := seg.payloadSize()
+	at := 0
+	if seg.sequenceNumber.LessThan(sb.Start) {
+		at = (int(seg.sequenceNumber.Size(sb.Start)) + mss - 1) / mss * mss
+	} else if sb.End.LessThan(seg.sequenceNumber.Add(seqnum.Size(size))) {
+		at = int(seg.sequenceNumber.Size(sb.End)) / mss * mss
+	}
+	if at > 0 && at < size {
+		s.splitSeg(seg, at)
+	}
 }
 
 // checkDSACK checks if a DSACK is reported.
@@ -1610,7 +1660,7 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			// NOTE: This check specifically excludes DSACK blocks
 			// which have start/end before sndUna and are used to
 			// indicate spurious retransmissions.
-			if rcvdSeg.ackNumber.LessThan(sb.Start) && s.SndUna.LessThan(sb.Start) && sb.End.LessThanEq(s.SndNxt) && !s.ep.scoreboard.IsSACKED(sb) {
+			if s.sackBlockInWindow(sb, rcvdSeg.ackNumber) && !s.ep.scoreboard.IsSACKED(sb) {
 				s.ep.scoreboard.Insert(sb)
 				rcvdSeg.hasNewSACKInfo = true
 			}
