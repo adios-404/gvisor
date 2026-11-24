@@ -203,6 +203,10 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 
 		// Detach the set before taking any EpollInstance.interestMu:
 		// registering or deleting an interest takes interestMu before epollMu.
+		//
+		// Linux's eventpoll_release_file likewise drops file->f_lock before
+		// acquiring ep->mtx:
+		// https://github.com/torvalds/linux/blob/adc218676/fs/eventpoll.c#L1095-L1107
 		fd.epollMu.Lock()
 		epolls := fd.epolls
 		fd.epolls = nil
@@ -1120,7 +1124,7 @@ func (fd *FileDescription) GetFilePrivileges(ctx context.Context) (auth.FilePriv
 		}
 	}
 
-	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3})
+	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3, RawCapability: true})
 	switch {
 	case linuxerr.Equals(linuxerr.ENODATA, err), linuxerr.Equals(linuxerr.EOPNOTSUPP, err):
 		return filePrivs, nil

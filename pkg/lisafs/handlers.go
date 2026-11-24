@@ -94,14 +94,15 @@ func ErrorHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 	return 0, unix.EINVAL
 }
 
-// MountHandler handles the Mount RPC. Note that there can not be concurrent
-// executions of MountHandler on a connection because the connection enforces
-// that Mount is the first message on the connection. Only after the connection
-// has been successfully mounted can other channels be created.
+// MountHandler handles the Mount RPC. A connection is only ever mounted once.
 //
 // +checklocksexclude:c.fdsMu
 // +checklocksexclude:c.server.renameMu
 func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, error) {
+	if !c.mounted.CompareAndSwap(false, true) {
+		log.Warningf("received Mount request on a connection which is mounted or is being mounted, mountPath = %q", c.mountPath)
+		return 0, unix.EBUSY
+	}
 	var (
 		mountPointFD     *ControlFD
 		mountPointHostFD = -1
@@ -154,6 +155,7 @@ func MountHandler(c *Connection, comm Communicator, payloadLen uint32) (uint32, 
 		mountPointFD, mountPointStat, mountPointHostFD, err = c.impl.Mount(c, mountNode)
 		return err
 	}); err != nil {
+		c.mounted.Store(false)
 		return 0, err
 	}
 
@@ -1614,12 +1616,14 @@ func FGetXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uint
 	// FGetXattrResp simply is a wrapper around SizedString.
 	var valueLen primitive.Uint16
 	respMetaSize := uint32(valueLen.SizeBytes())
+	// Linux's fs/xattr.c:do_getxattr() caps the value at XATTR_SIZE_MAX.
+	bufSize := min(uint32(req.BufSize), linux.XATTR_SIZE_MAX)
 	var n uint16
 	if err := fd.safelyRead(func() error {
 		if fd.node.isDeleted() {
 			return unix.EINVAL
 		}
-		n, err = fd.impl.GetXattr(string(req.Name), uint32(req.BufSize), func(dataLen uint32) []byte {
+		n, err = fd.impl.GetXattr(string(req.Name), bufSize, func(dataLen uint32) []byte {
 			return comm.PayloadBuf(dataLen + respMetaSize)[respMetaSize:]
 		})
 		return err
@@ -1679,7 +1683,8 @@ func FListXattrHandler(c *Connection, comm Communicator, payloadLen uint32) (uin
 		if fd.node.isDeleted() {
 			return unix.EINVAL
 		}
-		resp.Xattrs, err = fd.impl.ListXattr(req.Size)
+		// Linux's fs/xattr.c:listxattr() caps the list at XATTR_LIST_MAX.
+		resp.Xattrs, err = fd.impl.ListXattr(min(req.Size, linux.XATTR_LIST_MAX))
 		return err
 	}); err != nil {
 		return 0, err

@@ -1,8 +1,8 @@
 ![gVisor](g3doc/logo.png)
 
 [![Build status](https://badge.buildkite.com/3b159f20b9830461a71112566c4171c0bdfd2f980a8e4c0ae6.svg?branch=master)](https://buildkite.com/gvisor/pipeline)
-[![Issue reviver](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml)
-[![CodeQL](https://github.com/google/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/codeql.yml)
+[![Issue reviver](https://github.com/gvisor/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/gvisor/gvisor/actions/workflows/issue_reviver.yml)
+[![CodeQL](https://github.com/gvisor/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/gvisor/gvisor/actions/workflows/codeql.yml)
 [![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
 
 ## What is gVisor?
@@ -156,7 +156,8 @@ the `master` branch, which is then reflected into the `go` branch.
 
 ## Community & Governance
 
-See [GOVERNANCE.md](GOVERNANCE.md) for project governance information.
+See [GOVERNANCE.md](GOVERNANCE.md) for project governance information. gVisor
+follows the CNCF Code of Conduct. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 See [ADOPTERS.md](ADOPTERS.md) for a list of known production users and
 adopters.

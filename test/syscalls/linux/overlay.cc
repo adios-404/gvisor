@@ -65,6 +65,7 @@ namespace testing {
 
 namespace {
 
+using ::testing::Contains;
 using ::testing::UnorderedElementsAreArray;
 
 constexpr char kTmpfs[] = "tmpfs";
@@ -707,6 +708,71 @@ TEST(OverlayTest, NestedDeviceInodeNumberUniqueness) {
       << "files " << kLowerFile1 << " and " << kLowerFile2
       << " both have device number " << ovl_lower1_stat.st_dev
       << " and inode number " << ovl_lower2_stat.st_ino;
+}
+
+// Overlays may stack two deep, with one overlay as a lower layer of another,
+// but not three deep. Linux fails the mount with EINVAL beyond two levels. The
+// deepest lower layer sets the depth, wherever it is in lowerdir.
+TEST(OverlayTest, StackingDepthLimit) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  OverlayOnTmpfs inner = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
+  SKIP_IF(!SupportsOverlayUpperXattrs(inner.upper));
+  const std::string base = inner.base.path();
+  const std::string extra1 = JoinPath(base, "extra1");
+  const std::string extra2 = JoinPath(base, "extra2");
+  const std::string middle = JoinPath(base, "middle");
+  const std::string mixed = JoinPath(base, "mixed");
+  const std::string outer = JoinPath(base, "outer");
+  for (const std::string& dir : {extra1, extra2, middle, mixed, outer}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+  ASSERT_NO_ERRNO(CreateWithContents(inner.LowerPath("file"), "data"));
+  ASSERT_NO_ERRNO(inner.MountOverlay());
+
+  // Depth 2: the inner overlay is a lower layer of the middle overlay.
+  const Cleanup middle_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", middle, "overlay", 0,
+            absl::StrCat("lowerdir=", inner.merged, ":", extra1), MNT_DETACH));
+  EXPECT_THAT(ListDir(middle, /*skipdots=*/true),
+              IsPosixErrorOkAndHolds(Contains("file")));
+
+  // Depth 2: the inner overlay is the bottom lower layer.
+  const Cleanup mixed_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("overlay", mixed, "overlay", 0,
+            absl::StrCat("lowerdir=", extra2, ":", inner.merged), MNT_DETACH));
+
+  // Depth 3: the middle overlay is a lower layer of the outer overlay.
+  EXPECT_THAT(Mount("overlay", outer, "overlay", 0,
+                    absl::StrCat("lowerdir=", middle, ":", extra2), MNT_DETACH),
+              PosixErrorIs(EINVAL));
+
+  // Depth 3: the middle overlay is the bottom lower layer.
+  EXPECT_THAT(Mount("overlay", outer, "overlay", 0,
+                    absl::StrCat("lowerdir=", extra2, ":", middle), MNT_DETACH),
+              PosixErrorIs(EINVAL));
+}
+
+// An overlay cannot be the upper layer of another overlay.
+TEST(OverlayTest, OverlayRejectedAsUpperLayer) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  OverlayOnTmpfs inner = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
+  SKIP_IF(!SupportsOverlayUpperXattrs(inner.upper));
+  ASSERT_NO_ERRNO(inner.MountOverlay());
+  const std::string lower = JoinPath(inner.base.path(), "lower2");
+  const std::string outer = JoinPath(inner.base.path(), "outer");
+  const std::string upper = inner.MergedPath("upper");
+  const std::string work = inner.MergedPath("work");
+  for (const std::string& dir : {lower, outer, upper, work}) {
+    ASSERT_THAT(mkdir(dir.c_str(), 0755), SyscallSucceeds());
+  }
+
+  EXPECT_THAT(Mount("overlay", outer, "overlay", 0,
+                    absl::StrCat("lowerdir=", lower, ",upperdir=", upper,
+                                 ",workdir=", work),
+                    MNT_DETACH),
+              PosixErrorIs(EINVAL));
 }
 
 // Linux resolves relative pathnames in overlayfs mount options against the
@@ -1435,15 +1501,17 @@ TEST_F(OverlayRenameTest, FileReplaceDirWhiteout) {
 }
 
 // A directory on the lower layer is recursively copied up and renamed in
-// gVisor.
+// gVisor. Nesting two directories below the renamed one makes copy-up lock a
+// child and a grandchild directory at the same time.
 TEST_F(OverlayRenameTest, DirCopyUp) {
   // Linux overlayfs returns EXDEV when renaming a lower or merged directory
   // unless redirect_dir=on is enabled; gVisor copies up the directory subtree.
   SKIP_IF(!IsRunningOnGvisor());
 
   ASSERT_NO_ERRNO(Mkdir(LowerPath("src_dir")));
-  ASSERT_NO_ERRNO(Mkdir(LowerPath("src_dir/subdir")));
-  const std::string src_file_lower = LowerPath("src_dir/subdir/file");
+  ASSERT_NO_ERRNO(Mkdir(LowerPath("src_dir/a")));
+  ASSERT_NO_ERRNO(Mkdir(LowerPath("src_dir/a/b")));
+  const std::string src_file_lower = LowerPath("src_dir/a/b/file");
   ASSERT_NO_ERRNO(CreateWithContents(src_file_lower, "hello"));
   ASSERT_NO_ERRNO(MountOverlay());
 
@@ -1451,10 +1519,31 @@ TEST_F(OverlayRenameTest, DirCopyUp) {
   const std::string dst_dir_path = MergedPath("dst_dir");
   ASSERT_THAT(rename(src_dir_path.c_str(), dst_dir_path.c_str()),
               SyscallSucceeds());
-  EXPECT_THAT(Exists(JoinPath(dst_dir_path, "subdir/file")),
-              IsPosixErrorOkAndHolds(true));
+  EXPECT_THAT(GetContents(JoinPath(dst_dir_path, "a/b/file")),
+              IsPosixErrorOkAndHolds("hello"));
   EXPECT_THAT(Exists(src_file_lower), IsPosixErrorOkAndHolds(true));
   EXPECT_THAT(Exists(src_dir_path), IsPosixErrorOkAndHolds(false));
+}
+
+// Exchanging two lower directories copies up both subtrees in gVisor.
+TEST_F(OverlayRenameTest, DirExchangeCopyUp) {
+  // As in DirCopyUp, Linux returns EXDEV here without redirect_dir=on.
+  SKIP_IF(!IsRunningOnGvisor());
+
+  for (const char* dir : {"x", "x/a", "x/a/b", "y", "y/c", "y/c/d"}) {
+    ASSERT_NO_ERRNO(Mkdir(LowerPath(dir)));
+  }
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("x/a/b/file"), "from x"));
+  ASSERT_NO_ERRNO(CreateWithContents(LowerPath("y/c/d/file"), "from y"));
+  ASSERT_NO_ERRNO(MountOverlay());
+
+  ASSERT_THAT(renameat2(AT_FDCWD, MergedPath("x").c_str(), AT_FDCWD,
+                        MergedPath("y").c_str(), RENAME_EXCHANGE),
+              SyscallSucceeds());
+  EXPECT_THAT(GetContents(MergedPath("x/c/d/file")),
+              IsPosixErrorOkAndHolds("from y"));
+  EXPECT_THAT(GetContents(MergedPath("y/a/b/file")),
+              IsPosixErrorOkAndHolds("from x"));
 }
 
 // An upper directory may replace an empty directory on the lower layer.

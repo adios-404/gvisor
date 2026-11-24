@@ -6,6 +6,8 @@
 # by --mode=fetch, so you can hand-edit the file for these.
 # license_source selects an immutable upstream notice for a pinned binary artifact;
 # changing its artifact URL/hash requires renewing that explicit source audit.
+# A local LicenseRef records terms reviewed from the artifact itself.
+# Re-audit these terms when the artifact URL or SHA256 changes.
 - dependency: abseil-cpp
   version: https://github.com/abseil/abseil-cpp/releases/download/20260817.0/abseil-cpp-20260817.0.tar.gz
   retrieved: "2026-10-06"
@@ -90,6 +92,12 @@
   commit: 3de43ed45e1c7923d53c4db56ca3de3e46601580
   sha256: 37cdfbc6faefea94f7b37760a305c98c08981116c2bc9e821e3b423221fad8c8
   license: Apache-2.0
+- dependency: buildifier_prebuilt
+  version: https://github.com/keith/buildifier-prebuilt/releases/download/8.5.1.4/buildifier-prebuilt.8.5.1.4.tar.gz
+  retrieved: "2026-11-20"
+  commit: 2d23069a6f2111875011df0e776942b2ca3c1a8d
+  sha256: bc0a95ad65808ce60dda3bf9e30865568021842fbef95191599fb0325347f90b
+  license: MIT
 - dependency: buildkite_pipeline_schema
   version: https://raw.githubusercontent.com/buildkite/pipeline-schema/3413455899dadd5f721f481ca247bc55e78bf5b9/schema.json
   retrieved: "2026-10-26"
@@ -783,10 +791,10 @@
   sha256: 55c8ce068257aa0d263aad7470113dafcd50f955ee754fc853c2fdcd31ad096f
   license: Apache-2.0
 - dependency: github_workflow_schema
-  version: https://raw.githubusercontent.com/SchemaStore/schemastore/166136b96a14f103a948053903e9339e63ad9170/src/schemas/json/github-workflow.json
-  retrieved: "2026-08-27"
-  commit: 166136b96a14f103a948053903e9339e63ad9170
-  sha256: 7499ccb3e75975504ea1ee7c70291e0c9f6c1f684678091d013061fe263e3ddb
+  version: https://raw.githubusercontent.com/SchemaStore/schemastore/498a42a4f41f467d8cdc36a5b5c546605a8935c3/src/schemas/json/github-workflow.json
+  retrieved: "2026-11-19"
+  commit: 498a42a4f41f467d8cdc36a5b5c546605a8935c3
+  sha256: 0528a890c1a6f4209444c421dbb752888a934a540f2a677146d78ed7f2321cbf
   license: Apache-2.0
 - dependency: go.opencensus.io
   version: v0.24.0

@@ -19,7 +19,6 @@ go_binary(
     visibility = ["//:__subpackages__"],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
-        "//runsc/cgoextras",
         "//runsc/cli/maincli",
         "//runsc/coretagprime",
         "//runsc/version",
@@ -40,7 +39,6 @@ go_binary(
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
         "//pkg/sentry/socket/plugin/cgo",
-        "//runsc/cgoextras",
         "//runsc/cli/maincli",
         "//runsc/coretagprime",
         "//runsc/sandbox",
@@ -72,7 +70,6 @@ go_binary(
     ],
     x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
     deps = [
-        "//runsc/cgoextras",
         "//runsc/cli/maincli",
         "//runsc/coretagprime",
         "//runsc/version",
@@ -167,7 +164,7 @@ go_cov(
         "//:go.sum",
         "//:gopath",
         "//tools:build_cover.sh",
-        "//tools:go-allow-internal.patch",
+        "//tools:go_cover_toolchain",
     ],
     outs = ["runsc_cov"],
     cmd =
@@ -177,8 +174,9 @@ go_cov(
         "\"$(location //:go.mod)\" " +
         "\"$(location //:go.sum)\" " +
         "\"$(location main.go)\" " +
-        "\"$(location //tools:go-allow-internal.patch)\" " +
+        "\"$(location //tools:go_cover_toolchain)\" " +
         "\"false\" ",
+    tags = ["manual"],
     visibility = ["//debian:__pkg__"],
 )
 
@@ -190,7 +188,7 @@ go_cov(
         "//:go.sum",
         "//:gopath",
         "//tools:build_cover.sh",
-        "//tools:go-allow-internal.patch",
+        "//tools:go_cover_toolchain",
     ],
     outs = ["runsc_race_cov"],
     cmd =
@@ -200,7 +198,8 @@ go_cov(
         "\"$(location //:go.mod)\" " +
         "\"$(location //:go.sum)\" " +
         "\"$(location main.go)\" " +
-        "\"$(location //tools:go-allow-internal.patch)\" " +
+        "\"$(location //tools:go_cover_toolchain)\" " +
         "\"true\" ",
+    tags = ["manual"],
     visibility = ["//debian:__pkg__"],
 )

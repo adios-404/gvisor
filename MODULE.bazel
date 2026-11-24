@@ -7,6 +7,7 @@ bazel_dep(name = "rules_go", version = "0.65.0", repo_name = "io_bazel_rules_go"
 bazel_dep(name = "gazelle", version = "0.51.3", repo_name = "bazel_gazelle")
 bazel_dep(name = "rules_license", version = "1.0.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "buildifier_prebuilt", version = "8.5.1.4")
 bazel_dep(name = "bazel_lib", version = "3.4.0")
 bazel_dep(name = "yq.bzl", version = "0.4.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
@@ -224,8 +225,8 @@ http_archive(
 
 http_file(
     name = "github_workflow_schema",
-    sha256 = "7499ccb3e75975504ea1ee7c70291e0c9f6c1f684678091d013061fe263e3ddb",
-    urls = ["https://raw.githubusercontent.com/SchemaStore/schemastore/166136b96a14f103a948053903e9339e63ad9170/src/schemas/json/github-workflow.json"],
+    sha256 = "0528a890c1a6f4209444c421dbb752888a934a540f2a677146d78ed7f2321cbf",
+    urls = ["https://raw.githubusercontent.com/SchemaStore/schemastore/498a42a4f41f467d8cdc36a5b5c546605a8935c3/src/schemas/json/github-workflow.json"],
 )
 
 # Statically-linked QEMU user-mode emulators.
@@ -354,6 +355,32 @@ img_pull(
 )
 
 img_pull(
+    name = "test_httpd",
+    digest = "sha256:cd88fee4eab37f0d8cd04b06ef97285ca981c27b4d685f0321e65c5d4fd49357",
+    layer_handling = "eager",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64",
+    ],
+    registries = DOCKER_HUB_REGISTRIES,
+    repository = "library/httpd",
+    tag = "2.4.43",
+)
+
+img_pull(
+    name = "benchmark_httpd",
+    digest = "sha256:a30cd4cd57f3f3c3be9b2d16384d2488839996bb14c67df2b51f1ecbb3e584a1",
+    layer_handling = "eager",
+    platforms = [
+        "linux/amd64",
+        "linux/arm64",
+    ],
+    registries = DOCKER_HUB_REGISTRIES,
+    repository = "library/httpd",
+    tag = "2.4.69-trixie",
+)
+
+img_pull(
     name = "test_nginx",
     digest = "sha256:bc4cad49969aaf95eb4eecec5572846f86e59f1e8332aba36ed64b91aff8b724",
     layer_handling = "eager",
@@ -400,10 +427,12 @@ register_toolchains("//:cc_toolchain_aarch64")
 ### Go
 go_sdk = use_extension("@io_bazel_rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.from_file(
+    name = "go_sdk",
     go_mod = "//:go.mod",
     patch_strip = 1,
     patches = ["//tools:go_types_memoize.patch"],
 )
+use_repo(go_sdk, "go_sdk")
 
 go_deps = use_extension("@bazel_gazelle//:extensions.bzl", "go_deps")
 go_deps.from_file(go_mod = "//:go.mod")
