@@ -788,12 +788,8 @@ func verifySpuriousRecoveryMetric(t *testing.T, c *context.Context, numSpuriousR
 	}
 }
 
-// verifyRecoveryUndo verifies that on exit from a loss recovery that was
-// detected spurious (RFC3522), the RFC4015 response restored the congestion
-// control state instead of leaving the loss-based reduction in place:
-// Ssthresh back at wantSsthresh, the pre-recovery pipe estimate, and SndCwnd
-// at FlightSize + min(bytes_acked, IW), which is wantCwnd when the exit ACK
-// leaves nothing in flight.
+// verifyRecoveryUndo verifies the congestion control state after a spurious
+// recovery ends.
 func verifyRecoveryUndo(t *testing.T, c *context.Context, wantSsthresh, wantCwnd int) {
 	t.Helper()
 
@@ -805,9 +801,12 @@ func verifyRecoveryUndo(t *testing.T, c *context.Context, wantSsthresh, wantCwnd
 		if got, want := info.CcState, tcpip.Open; got != want {
 			return fmt.Errorf("got info.CcState = %v, want = %v", got, want)
 		}
+		// The RFC 4015 Eifel response restores Ssthresh to the pipe
+		// estimate from before the recovery.
 		if got, want := info.SndSsthresh, uint32(wantSsthresh); got != want {
 			return fmt.Errorf("Ssthresh was not restored on spurious recovery exit: got info.SndSsthresh = %d, want = %d", got, want)
 		}
+		// SndCwnd is FlightSize + min(bytes_acked, IW).
 		if got, want := info.SndCwnd, uint32(wantCwnd); got != want {
 			return fmt.Errorf("SndCwnd was not reset on spurious recovery exit: got info.SndCwnd = %d, want = %d", got, want)
 		}
@@ -965,10 +964,9 @@ func testSpuriousRecoveryWithRTO(t *testing.T, timestamps bool, ackOptions func(
 	}
 
 	// Acknowledge all outstanding data to exit RTO recovery and verify
-	// that the RFC4015 response restored the congestion control state.
+	// that the RFC 4015 Eifel response restored the congestion control
+	// state. Ssthresh was never reduced, so it stays unlimited.
 	c.SendAck(seqnum.Value(context.TestInitialSequenceNumber).Add(1), numPackets*maxPayload)
-	// No loss had reduced ssthresh before the timeout, so RFC4015's
-	// max(FlightSize, ssthresh) keeps it unlimited.
 	verifyRecoveryUndo(t, c, tcp.InitialSsthresh, numPackets-1)
 }
 
@@ -1062,8 +1060,7 @@ func TestSACKDetectSpuriousRecoveryWithDupACK(t *testing.T) {
 	probe := func(s *tcp.TCPEndpointState) {
 		select {
 		case <-probeDone:
-			// The ACK that exits recovery arrives after detection
-			// has already been verified.
+			// Ignore the ACK that ends recovery.
 			return
 		default:
 		}
@@ -1158,8 +1155,8 @@ func TestSACKDetectSpuriousRecoveryWithDupACK(t *testing.T) {
 	verifySpuriousRecoveryMetric(t, c, 1 /* numSpuriousRecovery */, 0 /* numSpuriousRTO */)
 
 	// Acknowledge all outstanding data to exit SACK recovery and verify
-	// that the RFC4015 response restored the congestion control state.
-	// Two of the covered packets were already SACKed and out of flight.
+	// that the RFC 4015 Eifel response restored the congestion control
+	// state. Two of the acknowledged packets were already SACKed.
 	c.SendAck(seq, numPackets*maxPayload)
 	verifyRecoveryUndo(t, c, tcp.InitialCwnd, numPackets-1-2)
 }
@@ -1277,11 +1274,11 @@ func TestMain(m *testing.M) {
 }
 
 // TestEifelFiniteApplicationFlight times out an application-limited flight
-// of two packets, after an earlier genuine timeout set a finite ssthresh of 2
-// and cwnd grew back to 10. If an ACK for an original transmission shows that
-// the timeout was spurious, RFC 4015 restores ssthresh to
-// max(FlightSize, ssthresh) = 2, not to cwnd. In the repair_ack control the
-// ACKs echo the retransmissions, so the timeout stays genuine.
+// of two packets, after a genuine timeout set ssthresh to 2 and cwnd grew
+// back to 10. When the ACK echoes the original transmission, the RFC 4015
+// Eifel response restores ssthresh to max(FlightSize, ssthresh) = 2, not to
+// cwnd. In repair_ack the ACKs echo the retransmissions, so the timeout is
+// genuine.
 func TestEifelFiniteApplicationFlight(t *testing.T) {
 	for _, scenario := range []string{"original_ack", "repair_ack"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -1380,16 +1377,14 @@ func TestEifelFiniteApplicationFlight(t *testing.T) {
 				return repair
 			}
 
-			// Lose one original and acknowledge its repair. This creates a real,
-			// finite ssthresh; the initial sentinel is never the measured case.
+			// A genuine timeout sets a finite ssthresh.
 			original := send(1)
 			repair := rto(0, original, 1)
 			state := ack(sent, repair)
 			if state.Ssthresh != 2 || state.SpuriousRecovery || info().CcState != tcpip.Open {
 				t.Fatalf("genuine recovery: threshold=%d spurious=%t state=%v", state.Ssthresh, state.SpuriousRecovery, info().CcState)
 			}
-			// Grow through ordinary Reno congestion avoidance, without assigning
-			// sender fields or invoking recovery helpers from the test.
+			// Grow cwnd back to 10 through Reno congestion avoidance.
 			for round := 0; state.SndCwnd < tcp.InitialCwnd && round < 16; round++ {
 				clock.Advance(time.Millisecond)
 				ts := send(state.SndCwnd)
@@ -1406,9 +1401,9 @@ func TestEifelFiniteApplicationFlight(t *testing.T) {
 			if got := info().SndCwnd; got != uint32(before.SndCwnd) {
 				t.Fatalf("window changed before RTO: %d", got)
 			}
-			// The preceding ACK drained every byte. These two packets form
-			// an application-limited flight, equal to the finite threshold.
-			// ACK only the first to meet RFC 3522 step 5 without prior DSACK.
+			// Nothing else is in flight, so these two packets are an
+			// application-limited flight. ACK only the first, to meet
+			// RFC 3522 step 5 without a prior DSACK.
 			repair = rto(offset, original, 2)
 			echo, wantSpurious := original, uint64(1)
 			if scenario == "repair_ack" {
@@ -1419,11 +1414,10 @@ func TestEifelFiniteApplicationFlight(t *testing.T) {
 			if stats.SpuriousRecovery.Value() != wantSpurious || stats.SpuriousRTORecovery.Value() != wantSpurious || info().CcState != tcpip.RTORecovery {
 				t.Fatalf("wrong partial recovery path: spurious=%d RTOspurious=%d state=%v", stats.SpuriousRecovery.Value(), stats.SpuriousRTORecovery.Value(), info().CcState)
 			}
-			// The first advancing ACK lets go-back-N send the second packet
-			// again, and the repair_ack control echoes that repair. In
-			// original_ack the timeout was spurious, and a sender that
-			// implements RFC 4015 step (8) does not resend, so only check
-			// the resend if there is one.
+			// Go-back-N resends the second packet, and repair_ack echoes
+			// that resend. In original_ack, a sender that implements
+			// RFC 4015 step (8) does not resend, so check a resend only if
+			// there is one.
 			if scenario == "repair_ack" {
 				tailRepair := packet(offset + maxPayload)
 				if tailRepair < repair {
@@ -1446,14 +1440,10 @@ func TestEifelFiniteApplicationFlight(t *testing.T) {
 	}
 }
 
-// TestEifelGenuineLossAfterSpuriousDetection times out a flight, and an ACK
-// that echoes the first packet's original transmission shows that the timeout
-// was spurious (RFC 3522). Another packet is really lost, and the sender
-// responds to that loss before recovery ends: in "timeout" a second timeout
-// resends it, and in "rack" RACK detects it from a SACK. Eifel cannot judge
-// that loss, so its reduction must survive the end of recovery instead of
-// ssthresh returning to the value captured at the first timeout, which here is
-// still unlimited.
+// TestEifelGenuineLossAfterSpuriousDetection finds a timeout spurious, and
+// then another packet is lost before recovery ends: in "timeout" a second
+// timeout resends it, and in "rack" RACK detects it from a SACK. The response
+// to that genuine loss must stand when recovery ends.
 func TestEifelGenuineLossAfterSpuriousDetection(t *testing.T) {
 	for _, scenario := range []string{"timeout", "rack"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -1497,8 +1487,7 @@ func TestEifelGenuineLossAfterSpuriousDetection(t *testing.T) {
 				}
 				return h.ParsedOptions().TSVal
 			}
-			// expire advances the clock past the RTO, so that the pending
-			// timer sends the packet at offset.
+			// expire fires the retransmission timer.
 			expire := func(offset int) uint32 {
 				t.Helper()
 				clock.Advance(info().RTO + time.Millisecond)
@@ -1595,11 +1584,8 @@ func TestEifelGenuineLossAfterSpuriousDetection(t *testing.T) {
 }
 
 // TestTailLossProbeResponseIsKept repairs a lost tail packet with a tail loss
-// probe, after the peer has sent a DSACK. RFC 8985 section 7.4.2 calls for a
-// response equivalent to fast recovery, and the RFC 4015 response must not
-// reverse it. If that response enters recovery, it records RetransmitTS when
-// the ACK arrives, so the ACK's echo of the probe is older than RetransmitTS
-// and, with the DSACK, Eifel finds the recovery spurious.
+// probe, after the peer has sent a DSACK. The RFC 4015 Eifel response must not
+// reverse the probe's loss response (RFC 8985 section 7.4.2).
 func TestTailLossProbeResponseIsKept(t *testing.T) {
 	clock := faketime.NewManualClock()
 	observed := make(chan tcp.TCPSenderState, 32)
