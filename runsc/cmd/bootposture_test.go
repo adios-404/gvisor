@@ -114,6 +114,8 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		conf.FDLimit = tc.fdLimit
 	}
 	conf.EnableCoreTags = tc.coreTags
+	// The Sentry must not hold the error log after it starts the container.
+	conf.LogFilename = filepath.Join(t.TempDir(), "error.log")
 	// testutil.TestConfig sets this so that tests can run without privileges.
 	// Undo it here since we do want to test the non-test case.
 	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = false
@@ -198,6 +200,17 @@ func testBootPosture(t *testing.T, tc postureCase) {
 	}
 
 	pid := c.Sandbox.Getpid()
+	// Wait for the control server to be responsive.
+	if _, err := c.Sandbox.Stacks(); err != nil {
+		t.Fatalf("Error getting the stacks of the created sandbox: %v", err)
+	}
+	created, err := sandboxposture.Collect(sandboxposture.Opts{PID: pid, RefPID: os.Getpid()})
+	if err != nil {
+		t.Fatalf("Error collecting posture of created sandbox %d: %v", pid, err)
+	}
+	if created.FDs.Counts[sandboxposture.FDErrorLog] == 0 {
+		t.Errorf("Created sandbox %d does not hold the error log %q", pid, conf.LogFilename)
+	}
 	if err := c.Start(conf); err != nil {
 		t.Fatalf("Error starting container: %v", err)
 	}
@@ -224,6 +237,17 @@ func testBootPosture(t *testing.T, tc postureCase) {
 
 func checkGoferPosture(t *testing.T, pid int) {
 	t.Helper()
+	var statfs unix.Statfs_t
+	path := fmt.Sprintf("/proc/%d/root/..", pid)
+	if err := unix.Statfs(path, &statfs); err != nil {
+		t.Fatalf("Statfs(%q): %v", path, err)
+	}
+	if statfs.Type != unix.TMPFS_MAGIC {
+		t.Errorf("Parent of gofer root: filesystem type = %#x, want %#x (tmpfs)", statfs.Type, unix.TMPFS_MAGIC)
+	}
+	if want := int64(unix.ST_RDONLY | unix.ST_NOSUID | unix.ST_NODEV | unix.ST_NOEXEC); statfs.Flags&want != want {
+		t.Errorf("Parent of gofer root: mount flags = %#x, want all of %#x", statfs.Flags, want)
+	}
 	rawEnv, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
 	if err != nil {
 		t.Fatalf("Reading gofer environ: %v", err)

@@ -22,6 +22,8 @@
 #   tools/lint.sh                        # run every check
 #   tools/lint.sh goimports clang-format  # run only the named checks
 #   tools/lint.sh --fix                  # rewrite files in place where a check can
+#   tools/lint.sh --bazel="bazel --foo" --bazel-options="--config=bar"
+#                                        # run Bazel as `bazel --foo <command> --config=bar`
 #
 # Environment:
 #   LINT_CACHE_DIR   where to cache downloaded linters
@@ -53,8 +55,6 @@ declare -r CODESPELL_VERSION="2.3.0"
 declare -r CPPLINT_VERSION="1.4.0"
 declare -r CLANG_FORMAT_VERSION="23.1.1"
 declare -r CLANG_TIDY_VERSION="22.1.8"
-# Keep in sync with images/default/Dockerfile.
-declare -r BUILDIFIER_VERSION="8.5.1"
 
 # The codespell and cpplint wheels are architecture-independent.
 declare -r CODESPELL_URL="https://files.pythonhosted.org/packages/0e/20/b6019add11e84f821184234cea0ad91442373489ef7ccfa3d73a71b908fa/codespell-${CODESPELL_VERSION}-py3-none-any.whl"
@@ -64,16 +64,12 @@ declare -r CPPLINT_SHA256="5031cb9671cd5bb3dbb4d3243eebd0d42cdf76388ab49c0d276f8
 
 case "$(uname -m)" in
   x86_64|amd64)
-    declare -r BUILDIFIER_ARCH="amd64"
-    declare -r BUILDIFIER_SHA256="887377fc64d23a850f4d18a077b5db05b19913f4b99b270d193f3c7334b5a9a7"
     declare -r CLANG_FORMAT_URL="https://files.pythonhosted.org/packages/42/ef/3f8e215916e79ecd435b5bc20810443f80fce3fb8bbfe6d2783ceb775c1b/clang_format-${CLANG_FORMAT_VERSION}-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
     declare -r CLANG_FORMAT_SHA256="64900462c1203cee2fec364536c2dda708baf0619e15b52ceda926648cc82f56"
     declare -r CLANG_TIDY_URL="https://files.pythonhosted.org/packages/82/19/0f2668f8f5e2452b096a2b898f2b6bcecbceb6dd0c7f75d1755ce1f18d8b/clang_tidy-${CLANG_TIDY_VERSION}-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl"
     declare -r CLANG_TIDY_SHA256="1a3de07ba82d4403d8b692ae63a5520d4db5c606014c92c24bbcef9259057bf1"
     ;;
   aarch64|arm64)
-    declare -r BUILDIFIER_ARCH="arm64"
-    declare -r BUILDIFIER_SHA256="947bf6700d708026b2057b09bea09abbc3cafc15d9ecea35bb3885c4b09ccd04"
     declare -r CLANG_FORMAT_URL="https://files.pythonhosted.org/packages/0e/b6/1a162e427d912b88653a66e99a22414d798eb885b761ffddb74dbc13963f/clang_format-${CLANG_FORMAT_VERSION}-py2.py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
     declare -r CLANG_FORMAT_SHA256="09af54d2ef51680b34e36ed71b9f510bd399fb7b10b29a2a40843cd0e0344228"
     declare -r CLANG_TIDY_URL="https://files.pythonhosted.org/packages/ac/b7/61ed8c319f2d9ddb9762a550a6fee434bdef7bdc46d5a4b50929f1c90ec0/clang_tidy-${CLANG_TIDY_VERSION}-py2.py3-none-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
@@ -87,6 +83,28 @@ esac
 
 # FIX is set by --fix; checks that can rewrite files consult it.
 declare FIX=0
+
+# BAZEL is set by --bazel and BAZEL_OPTIONS by --bazel-options.
+declare -a BAZEL=(bazel)
+declare -a BAZEL_OPTIONS=()
+
+# run_bazel <command> [args...] runs a Bazel command with BAZEL_OPTIONS.
+run_bazel() {
+  "${BAZEL[@]}" "$1" "${BAZEL_OPTIONS[@]+"${BAZEL_OPTIONS[@]}"}" "${@:2}"
+}
+
+# bazel_binary <target> builds an executable target and prints its path.
+bazel_binary() {
+  local -r target="$1"
+  # Like the Makefile's build_paths, so the binary is materialized locally.
+  run_bazel build --remote_download_outputs=toplevel "${target}" >&2
+  local execroot path
+  execroot="$(run_bazel info execution_root)"
+  # show_paths.bzl prints "<path relative to the execroot> <basename>".
+  path="$(run_bazel cquery --output=starlark \
+    --starlark:file=tools/show_paths.bzl "${target}")"
+  echo "${execroot}/${path%% *}"
+}
 
 # fetch <url> <sha256> <output> downloads a file and verifies its checksum,
 # leaving <output> in place only if the checksum matches.
@@ -110,16 +128,6 @@ fetch() {
     return 1
   fi
   mv "${tmp}" "${out}"
-}
-
-install_buildifier() {
-  local -r bin="${CACHE_DIR}/buildifier-${BUILDIFIER_VERSION}"
-  if [[ ! -x "${bin}" ]]; then
-    fetch "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-${BUILDIFIER_ARCH}" \
-      "${BUILDIFIER_SHA256}" "${bin}"
-    chmod +x "${bin}"
-  fi
-  echo "${bin}"
 }
 
 install_codespell() {
@@ -206,9 +214,9 @@ report() {
 # Formatting-only mode does not add or remove imports: generated packages may
 # not exist until Bazel builds them.
 check_goimports() {
-  local -ra goimports=(
-    bazel run --run_in_cwd @org_golang_x_tools//cmd/goimports -- -format-only
-  )
+  local binary
+  binary="$(bazel_binary @org_golang_x_tools//cmd/goimports)"
+  local -ra goimports=("${binary}" -format-only)
   # This golden output tests comment positions across merged import declarations.
   # goimports would merge the declarations and move their comments.
   local -r golden_outputs=':(exclude)tools/go_generics/tests/simple/output.go'
@@ -269,12 +277,13 @@ check_clang_tidy() {
   fi
   local -r database="${REPO_DIR}/compile_commands.json"
   if [[ ! -f "${database}" ]]; then
-    if ! command -v bazel > /dev/null 2>&1; then
-      echo "lint: ${database} is missing and bazel is not on PATH" >&2
+    if ! command -v "${BAZEL[0]}" > /dev/null 2>&1; then
+      echo "lint: ${database} is missing and ${BAZEL[0]} is not on PATH" >&2
       echo "lint: run tools/gen_compile_commands.py to create it" >&2
       return 1
     fi
-    python3 "${REPO_DIR}/tools/gen_compile_commands.py" >&2
+    python3 "${REPO_DIR}/tools/gen_compile_commands.py" --bazel="${BAZEL[*]}" \
+      --bazel-options="${BAZEL_OPTIONS[*]+"${BAZEL_OPTIONS[*]}"}" >&2
   fi
   local clang_tidy
   clang_tidy="$(install_clang_tidy)"
@@ -289,7 +298,7 @@ check_clang_tidy() {
 # excluded because rules_shell / proto_library.bzl loads are not used here.
 check_buildifier() {
   local buildifier
-  buildifier="$(install_buildifier)"
+  buildifier="$(bazel_binary @buildifier_prebuilt//:buildifier)"
   local -r warnings="-duplicated-name,-list-append,-native-py,-native-sh-binary,-native-sh-library,-native-sh-test,-native-proto"
   if [[ "${FIX}" -eq 1 ]]; then
     bazel_files | xargs -0 "${buildifier}" --mode=fix --lint=fix --warnings="${warnings}"
@@ -325,11 +334,11 @@ check_buildifier() {
 }
 
 check_actions() {
-  if ! command -v bazel > /dev/null 2>&1; then
-    echo "lint: bazel is not on PATH; the actions check runs //:github_actions_test" >&2
+  if ! command -v "${BAZEL[0]}" > /dev/null 2>&1; then
+    echo "lint: ${BAZEL[0]} is not on PATH; the actions check runs //:github_actions_test" >&2
     return 1
   fi
-  bazel test --enable_runfiles --test_output=errors //:github_actions_test
+  run_bazel test --enable_runfiles --test_output=errors //:github_actions_test
 }
 
 check_spelling() {
@@ -387,12 +396,20 @@ main() {
 
   local -a args=()
   local arg
-  for arg in "$@"; do
+  while [[ "$#" -gt 0 ]]; do
+    arg="$1"
+    shift
     case "${arg}" in
-      --fix) FIX=1 ;;
-      *)     args+=("${arg}") ;;
+      --fix)             FIX=1 ;;
+      --bazel=*)         read -r -a BAZEL <<< "${arg#--bazel=}" ;;
+      --bazel-options=*) read -r -a BAZEL_OPTIONS <<< "${arg#--bazel-options=}" ;;
+      *)                 args+=("${arg}") ;;
     esac
   done
+  if [[ "${#BAZEL[@]}" -eq 0 ]]; then
+    echo "lint: --bazel must not be empty" >&2
+    exit 1
+  fi
 
   local -a checks=("${args[@]+"${args[@]}"}")
   if [[ "${#checks[@]}" -eq 0 ]]; then

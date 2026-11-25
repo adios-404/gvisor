@@ -22,6 +22,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/subcommands"
@@ -37,6 +38,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 	"gvisor.dev/gvisor/runsc/cmd/sandboxsetup"
 	"gvisor.dev/gvisor/runsc/cmd/util"
@@ -57,6 +59,8 @@ const (
 	keepAlivePeriod = 30 * time.Second
 
 	defaultDialTimeout                = 30 * time.Second
+	defaultUDPIdleTimeout             = 30 * time.Second
+	maxUDPDatagramSize                = 65535
 	defaultMaxActiveConns             = 4096
 	defaultNICID          tcpip.NICID = 1
 	maxInFlightConns                  = 10000
@@ -70,23 +74,33 @@ var netgoferCaps = &specs.LinuxCapabilities{}
 // to proxy network traffic over a unix domain socket (UDS) connection. It
 // should not be called directly.
 //
-// It runs a user-space netstack to proxy outbound TCP traffic and intercepts
-// TCP traffic from sandbox and forwards it to the host network via host
-// sockets (translating source IP to host/pod IP).
+// It runs a user-space netstack to proxy outbound TCP and UDP traffic and
+// intercepts traffic from the sandbox and forwards it to the host network via
+// host sockets (translating source IP to host/pod IP).
+//
+// If --passt-fd is set, netgofer runs in passt mode instead: it copies packets
+// between the sandbox and a passt process, which opens the host sockets. See
+// passt.go.
 //
 // Limitations:
-//   - Only outbound TCP traffic is supported. UDP (including standard UDP-based DNS
-//     queries), ICMP, and inbound connections are not supported.
+//   - Only outbound TCP and UDP traffic is supported. ICMP and inbound
+//     connections are not supported.
+//   - Link-local destinations (169.254.0.0/16 and fe80::/10, including GCE
+//     metadata DNS 169.254.169.254 and NodeLocal DNSCache 169.254.20.10) are
+//     blocked by the egress filter.
 //   - Network connection preservation across save/restore is not supported, existing
 //     connections will be reset upon restore.
 type Netgofer struct {
 	util.InternalSubCommand
 
 	udsFD          int
+	passtFD        int
 	mtu            int
 	applyCaps      bool
+	allowLoopback  bool
 	disableSeccomp bool
 	maxActiveConns int
+	udpIdleTimeout time.Duration
 	activeConns    chan struct{}
 	egressFilter   *egressfilter.Filter
 	ready          chan struct{}
@@ -113,22 +127,25 @@ func (*Netgofer) Usage() string {
 // SetFlags implements subcommands.Command.
 func (n *Netgofer) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&n.udsFD, "uds-fd", -1, "FD of the host side UDS")
+	f.IntVar(&n.passtFD, "passt-fd", -1, "FD of a connected SOCK_STREAM socket to passt. If set, netgofer runs in passt mode")
 	f.IntVar(&n.mtu, "mtu", DefaultMTU, "MTU for the network interface")
 	f.BoolVar(&n.applyCaps, "apply-caps", true, "if true, apply capabilities to restrict what the netgofer process can do")
 	f.IntVar(&n.maxActiveConns, "max-active-conns", defaultMaxActiveConns, "maximum number of concurrent active connections")
 	n.profileFDs.SetFromFlags(f)
+	f.BoolVar(&n.allowLoopback, "allow-loopback", false, "if true, allow forwarding traffic destined to loopback addresses in the netgofer network namespace")
 }
 
 // Execute implements subcommands.Command.
 func (n *Netgofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if n.udsFD < 0 {
+		n.closeFDs()
 		if f.Usage != nil {
 			f.Usage()
 		}
 		return subcommands.ExitUsageError
 	}
 	if f.NArg() != 1 {
-		_ = unix.Close(n.udsFD)
+		n.closeFDs()
 		if f.Usage != nil {
 			f.Usage()
 		}
@@ -137,12 +154,12 @@ func (n *Netgofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subc
 	sandboxID := f.Arg(0)
 
 	if len(args) == 0 {
-		_ = unix.Close(n.udsFD)
+		n.closeFDs()
 		return util.Errorf("missing config")
 	}
 	conf, ok := args[0].(*config.Config)
 	if !ok {
-		_ = unix.Close(n.udsFD)
+		n.closeFDs()
 		return util.Errorf("first argument must be *config.Config, got %T", args[0])
 	}
 
@@ -154,17 +171,23 @@ func (n *Netgofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subc
 	if n.applyCaps {
 		if config.CgoEnabled {
 			log.Warningf("Need to re-exec in order to drop capabilities, due to cgo build. Use a pure-Go gVisor build to avoid this.")
-			// Clear FD_CLOEXEC so udsFD survives re-exec.
+			// Clear FD_CLOEXEC so udsFD and passtFD survive re-exec.
 			if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(n.udsFD), unix.F_SETFD, 0); errno != 0 {
-				_ = unix.Close(n.udsFD)
+				n.closeFDs()
 				return util.Errorf("error clearing CLOEXEC on udsFD: %v", errno)
+			}
+			if n.passtFD >= 0 {
+				if _, _, errno := unix.RawSyscall(unix.SYS_FCNTL, uintptr(n.passtFD), unix.F_SETFD, 0); errno != 0 {
+					n.closeFDs()
+					return util.Errorf("error clearing CLOEXEC on passtFD: %v", errno)
+				}
 			}
 			reexecArgs := sandboxsetup.PrepareArgs(n.Name(), f, map[string]string{"apply-caps": "false"})
 			util.Fatalf("setCapsAndCallSelf(%v, %v): %v", reexecArgs, netgoferCaps, sandboxsetup.SetCapsAndCallSelf(reexecArgs, netgoferCaps))
 			panic("unreachable")
 		}
 		if err := sandboxsetup.ApplyCapsAllThreads(netgoferCaps, nil); err != nil {
-			_ = unix.Close(n.udsFD)
+			n.closeFDs()
 			return util.Errorf("dropping capabilities: %v", err)
 		}
 	}
@@ -174,12 +197,28 @@ func (n *Netgofer) Execute(_ context.Context, f *flag.FlagSet, args ...any) subc
 	stopProfiling := profile.Start(profileOpts)
 	defer stopProfiling()
 
-	// TODO(b/518947343): Add support for rootless mode.
+	if n.passtFD >= 0 {
+		return n.runPasstMode(conf)
+	}
 	return n.runProxyMode(conf)
 }
 
+// closeFDs closes the FDs that netgofer received from runsc. Execute calls it
+// on error paths before the FDs are handed to a run mode.
+func (n *Netgofer) closeFDs() {
+	if n.udsFD >= 0 {
+		_ = unix.Close(n.udsFD)
+	}
+	if n.passtFD >= 0 {
+		_ = unix.Close(n.passtFD)
+	}
+}
+
 func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
-	log.Infof("Running in proxy mode")
+	if conf.Netgofer.AllowLoopback() {
+		n.allowLoopback = true
+	}
+	log.Infof("Running in proxy mode (allowLoopback=%v)", n.allowLoopback)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var (
@@ -189,9 +228,20 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 		linkEP     stack.LinkEndpoint
 		linkEPDone bool
 	)
+	allowLoopback := n.allowLoopback
 	st := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{
+				AllowExternalLoopbackTraffic: allowLoopback,
+			}),
+			ipv6.NewProtocolWithOptions(ipv6.Options{
+				AllowExternalLoopbackTraffic: allowLoopback,
+			}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{
+			tcp.NewProtocol,
+			udp.NewProtocol,
+		},
 	})
 	defer func() {
 		if linkEP != nil && !linkEPDone {
@@ -230,7 +280,9 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 	// proxyOutboundRequest can reject connections targeting netgofer's own
 	// network namespace IPs.
 	if n.egressFilter == nil {
-		f, err := egressfilter.New(egressfilter.Options{})
+		f, err := egressfilter.New(egressfilter.Options{
+			AllowLoopback: n.allowLoopback,
+		})
 		if err != nil {
 			log.Warningf("Failed to initialize egress filter: %v", err)
 			return subcommands.ExitFailure
@@ -238,9 +290,9 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 		n.egressFilter = f
 	}
 
-	// Add default routes and register the TCP forwarder before creating/attaching
-	// the NIC so that packets arriving immediately upon NIC attachment are routed
-	// to the forwarder.
+	// Add default routes and register the TCP and UDP forwarders before
+	// creating/attaching the NIC so that packets arriving immediately upon NIC
+	// attachment are routed to the forwarders.
 	st.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet,
@@ -258,7 +310,7 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 	}
 	n.activeConns = make(chan struct{}, maxActive)
 
-	forwarder := tcp.NewForwarder(st, 0, maxInFlightConns, func(r *tcp.ForwarderRequest) {
+	tcpForwarder := tcp.NewForwarder(st, 0, maxInFlightConns, func(r *tcp.ForwarderRequest) {
 		wgMu.Lock()
 		if stopping {
 			wgMu.Unlock()
@@ -270,7 +322,13 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 		defer wg.Done()
 		n.proxyOutboundRequest(ctx, r)
 	})
-	st.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
+	st.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+
+	udpRejectLog := log.BasicRateLimitedLogger(time.Minute)
+	udpForwarder := udp.NewForwarder(st, func(r *udp.ForwarderRequest) bool {
+		return n.handleOutboundUDPRequest(ctx, &wg, &wgMu, &stopping, udpRejectLog, r)
+	})
+	st.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
 
 	var (
 		closeErrMu sync.Mutex
@@ -334,7 +392,7 @@ func (n *Netgofer) runProxyMode(conf *config.Config) subcommands.ExitStatus {
 		return subcommands.ExitFailure
 	}
 
-	log.Infof("TCP forwarder registered")
+	log.Infof("TCP and UDP forwarders registered")
 	if n.ready != nil {
 		close(n.ready)
 	}
@@ -431,6 +489,155 @@ func (n *Netgofer) proxyOutboundRequest(ctx context.Context, r *tcp.ForwarderReq
 	log.Debugf("Dynamically forwarding TCP stream to: %q", originalDst)
 	splice(c, hostConn)
 	log.Debugf("Dynamic forwarding stream completed")
+}
+
+func (n *Netgofer) handleOutboundUDPRequest(ctx context.Context, wg *sync.WaitGroup, wgMu *sync.Mutex, stopping *bool, rejectLog log.Logger, r *udp.ForwarderRequest) bool {
+	id := r.ID()
+	originalDst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+	if log.IsLogging(log.Debug) {
+		log.Debugf("UDP target: %q", originalDst)
+	}
+
+	if !n.egressFilter.Allows(id.LocalAddress, id.LocalPort) {
+		rejectLog.Warningf("Rejecting UDP datagram to disallowed destination %q", originalDst)
+		return false
+	}
+
+	wgMu.Lock()
+	if *stopping {
+		wgMu.Unlock()
+		return false
+	}
+	select {
+	case n.activeConns <- struct{}{}:
+	default:
+		wgMu.Unlock()
+		rejectLog.Warningf("Rejecting UDP flow to %q: max active connections (%d) reached", originalDst, cap(n.activeConns))
+		return false
+	}
+	var wq waiter.Queue
+	ep, eperr := r.CreateEndpoint(&wq)
+	if eperr != nil {
+		<-n.activeConns
+		wgMu.Unlock()
+		rejectLog.Warningf("Failed to create UDP endpoint for target %q: %v", originalDst, eperr)
+		return false
+	}
+	wg.Add(1)
+	wgMu.Unlock()
+
+	c := gonet.NewUDPConn(&wq, ep)
+	go func() {
+		defer wg.Done()
+		defer func() { <-n.activeConns }()
+		defer c.Close()
+		n.proxyOutboundUDP(ctx, c, originalDst)
+	}()
+	return true
+}
+
+func disableUDPBroadcastControl(_, _ string, c syscall.RawConn) error {
+	var sockoptErr error
+	if err := c.Control(func(fd uintptr) {
+		sockoptErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 0)
+	}); err != nil {
+		return err
+	}
+	return sockoptErr
+}
+
+func newOutboundUDPDialer() net.Dialer {
+	return net.Dialer{
+		Timeout: defaultDialTimeout,
+		Control: disableUDPBroadcastControl,
+	}
+}
+
+func (n *Netgofer) proxyOutboundUDP(ctx context.Context, c *gonet.UDPConn, originalDst string) {
+	dial := n.dialContext
+	if dial == nil {
+		dialer := newOutboundUDPDialer()
+		dial = dialer.DialContext
+	}
+	hostConn, err := dial(ctx, "udp", originalDst)
+	if err != nil {
+		log.Warningf("Failed to dial UDP target %q: %v", originalDst, err)
+		return
+	}
+	defer hostConn.Close()
+
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = c.Close()
+		_ = hostConn.Close()
+	})
+	defer stopCancel()
+
+	idleTimeout := n.udpIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultUDPIdleTimeout
+	}
+
+	log.Debugf("Dynamically forwarding UDP datagrams to: %q", originalDst)
+	spliceUDP(c, hostConn, idleTimeout)
+	log.Debugf("Dynamic UDP forwarding completed for: %q", originalDst)
+}
+
+var udpBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, maxUDPDatagramSize)
+		return &buf
+	},
+}
+
+func spliceUDP(c1, c2 net.Conn, idleTimeout time.Duration) {
+	var (
+		mu           sync.Mutex
+		lastDeadline time.Time
+	)
+	refreshDeadlines := func(force bool) {
+		now := time.Now()
+		mu.Lock()
+		if !force && lastDeadline.Sub(now) >= idleTimeout/2 {
+			mu.Unlock()
+			return
+		}
+		deadline := now.Add(idleTimeout)
+		lastDeadline = deadline
+		mu.Unlock()
+		_ = c1.SetReadDeadline(deadline)
+		_ = c2.SetReadDeadline(deadline)
+	}
+	refreshDeadlines(true)
+
+	copyDatagrams := func(dst, src net.Conn) {
+		bufPtr := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufPtr)
+		buf := *bufPtr
+		for {
+			nr, err := src.Read(buf)
+			if nr > 0 || err == nil {
+				refreshDeadlines(false)
+				if _, werr := dst.Write(buf[:nr]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		_ = dst.Close()
+		_ = src.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		copyDatagrams(c2, c1)
+		close(done)
+	}()
+	copyDatagrams(c1, c2)
+	<-done
+	_ = c1.SetReadDeadline(time.Time{})
+	_ = c2.SetReadDeadline(time.Time{})
 }
 
 type closeWriter interface {

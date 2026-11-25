@@ -388,10 +388,6 @@ type Kernel struct {
 	// described in shm.Shm.InodeID().
 	sysVShmDevID uint32
 
-	// If set to true, report address space activation waits as if the task is in
-	// external wait so that the watchdog doesn't report the task stuck.
-	SleepForAddressSpaceActivation bool
-
 	// Exceptions to YAMA ptrace restrictions. Each key-value pair represents a
 	// tracee-tracer relationship. The key is a process (technically, the thread
 	// group leader) that can be traced by any thread that is a descendant of the
@@ -1238,8 +1234,10 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 		}
 		log.Infof("Memory files load took [%s].", time.Since(mfStart))
 	} else {
-		if err := asyncMFLoader.WaitMainMFStart(); err != nil {
-			return fmt.Errorf("main MF start failed: %w", err)
+		// The upper layer may store its data in a private MemoryFile, which
+		// must be loaded before TarUpperLayer reads it.
+		if err := asyncMFLoader.WaitMetadata(); err != nil {
+			return fmt.Errorf("failed to load MemoryFile metadata: %w", err)
 		}
 	}
 

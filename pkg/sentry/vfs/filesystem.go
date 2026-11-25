@@ -128,6 +128,11 @@ type FilesystemImpl interface {
 	// file data to be written to the underlying [filesystem]", as by syncfs(2).
 	Sync(ctx context.Context) error
 
+	// DrainDentryCache evicts unused cached dentries without changing cache
+	// policy. Live references are preserved, and concurrent operations may
+	// refill the cache. Unsupported filesystems return EOPNOTSUPP.
+	DrainDentryCache(ctx context.Context) error
+
 	// AccessAt checks whether a user with creds can access the file at rp.
 	AccessAt(ctx context.Context, rp *ResolvingPath, creds *auth.Credentials, ats AccessTypes) error
 
@@ -600,6 +605,12 @@ func (PrependPathSyntheticError) Error() string {
 // HostFDProvider is implemented by VFS objects backed by a host FD.
 type HostFDProvider interface {
 	HostFD() int
+}
+
+// DMABufProvider is implemented by file descriptions that wrap a host dma-buf
+// FD.
+type DMABufProvider interface {
+	DMABufHostFD() int
 }
 
 // MountRootPathProvider is an interface for filesystems that customize the

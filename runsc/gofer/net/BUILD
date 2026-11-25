@@ -9,8 +9,10 @@ go_library(
     name = "net",
     srcs = [
         "netgofer.go",
+        "passt.go",
     ],
     visibility = [
+        "//:__pkg__",
         "//runsc:__subpackages__",
     ],
     deps = [
@@ -23,6 +25,7 @@ go_library(
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/udp",
         "//pkg/waiter",
         "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/util",
@@ -42,8 +45,11 @@ go_test(
     size = "small",
     srcs = [
         "netgofer_test.go",
+        "passt_test.go",
     ],
     embed = [":net"],
+    pure = True,
+    tags = ["nogotsan"],
     deps = [
         "//pkg/log",
         "//pkg/tcpip",
@@ -54,6 +60,7 @@ go_test(
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/tcp",
+        "//pkg/tcpip/transport/udp",
         "//runsc/config",
         "//runsc/flag",
         "//runsc/gofer/net/egressfilter",

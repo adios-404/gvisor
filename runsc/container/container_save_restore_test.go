@@ -223,7 +223,7 @@ func TestSignalUnkillablePolicyRestore(t *testing.T) {
 // recorded. Then, it is restored in two new containers and the first number
 // printed from these containers is checked. Both should be the next consecutive
 // number after the last number from the checkpointed container.
-func testCheckpointRestore(t *testing.T, conf *config.Config, compression statefile.CompressionLevel, newSpecWithScript func(string) *specs.Spec) {
+func testCheckpointRestore(t *testing.T, conf *config.Config, compression statefile.CompressionLevel, newSpecWithScript func(string) *specs.Spec, afterRestore ...func(*Container)) {
 	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp failed: %v", err)
@@ -327,6 +327,9 @@ func testCheckpointRestore(t *testing.T, conf *config.Config, compression statef
 	// picks up from where it left off.
 	if lastNum+1 != firstNum {
 		t.Errorf("error numbers not in order, previous: %d, next: %d", lastNum, firstNum)
+	}
+	for _, f := range afterRestore {
+		f(cont2)
 	}
 	cont2.Destroy()
 	cont2 = nil
@@ -506,6 +509,85 @@ func TestCheckpointRestoreClocks(t *testing.T) {
 				t.Errorf("CLOCK_BOOTTIME advanced by %v, want within 1s of CLOCK_REALTIME's %v", boottime, realtime)
 			}
 		})
+	}
+}
+
+func TestBackgroundRestorePageLoadFailureDoesNotWaitForPostRestore(t *testing.T) {
+	baseDir := makeTempDir(t, "background-restore-page-load-failure")
+	tmpfsPath := filepath.Join(baseDir, "tmpfs")
+	if err := os.Mkdir(tmpfsPath, 0777); err != nil {
+		t.Fatalf("creating tmpfs mount directory: %v", err)
+	}
+	blockPath := filepath.Join(baseDir, "block-restore-hook")
+	if err := unix.Mkfifo(blockPath, 0666); err != nil {
+		t.Fatalf("creating restore hook FIFO: %v", err)
+	}
+	hookPath := filepath.Join(baseDir, "hook.sh")
+	hook := fmt.Sprintf("#!/bin/sh\nif [ \"${GVISOR_SAVE_RESTORE_AUTO_EXEC_MODE}\" = restore ]; then\n  read value < %q\nfi\n", blockPath)
+	if err := os.WriteFile(hookPath, []byte(hook), 0777); err != nil {
+		t.Fatalf("writing restore hook: %v", err)
+	}
+	imagePath := filepath.Join(baseDir, "image")
+	if err := os.Mkdir(imagePath, 0777); err != nil {
+		t.Fatalf("creating checkpoint directory: %v", err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.HostFifo = config.HostFifoOpen
+	addTmpfsMount(spec, "page-load-failure", tmpfsPath, tmpfsPath)
+	cont := startContainer(t, conf, spec, setupBundle(t, conf, spec), nil)
+	privateFile := filepath.Join(tmpfsPath, "private-pages")
+	if ws, err := execute(conf, cont, "/bin/cp", "/bin/sh", privateFile); err != nil || ws.ExitStatus() != 0 {
+		t.Fatalf("populating private tmpfs: status %v, error %v", ws, err)
+	}
+	containerID := cont.ID
+	checkpointOpts := sandbox.CheckpointOpts{
+		Compression:                statefile.CompressionLevelNone,
+		Resume:                     true,
+		SaveRestoreExecArgv:        hookPath,
+		SaveRestoreExecTimeout:     controlapi.DefaultSaveRestoreExecTimeout,
+		SaveRestoreExecContainerID: containerID,
+	}
+	if err := cont.Checkpoint(conf, imagePath, checkpointOpts); err != nil {
+		t.Fatalf("checkpointing container: %v", err)
+	}
+	if err := cont.Destroy(); err != nil {
+		t.Fatalf("destroying checkpointed container: %v", err)
+	}
+
+	pagesPath := filepath.Join(imagePath, checkpointfiles.PagesFileName)
+	pagesInfo, err := os.Stat(pagesPath)
+	if err != nil {
+		t.Fatalf("stating pages file: %v", err)
+	}
+	truncatedSize := pagesInfo.Size() - int64(os.Getpagesize())
+	if truncatedSize <= 0 {
+		t.Fatalf("pages file is too small to truncate: %d bytes", pagesInfo.Size())
+	}
+	if err := os.Truncate(pagesPath, truncatedSize); err != nil {
+		t.Fatalf("truncating pages file: %v", err)
+	}
+
+	restoreSpec, _ := sleepSpecConf(t)
+	addTmpfsMount(restoreSpec, "page-load-failure", tmpfsPath, tmpfsPath)
+	restored := newContainer(t, conf, restoreSpec, setupBundle(t, conf, restoreSpec), func(args *Args) {
+		args.ID = containerID
+	})
+	if err := restored.Restore(conf, imagePath, sandbox.DirectIOOff, true /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("starting background restore: %v", err)
+	}
+
+	restoreResult := make(chan error, 1)
+	go func() {
+		restoreResult <- restored.WaitRestore()
+	}()
+	select {
+	case err := <-restoreResult:
+		if err == nil {
+			t.Fatal("waiting for restore succeeded after a page load failure")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("page load failure was not reported while the post-restore hook was blocked")
 	}
 }
 
@@ -1258,6 +1340,99 @@ func TestCheckpointRestoreInodeNumbers(t *testing.T) {
 	}
 }
 
+// TestCheckpointRestoreFileTypeChanged checks that restore fails if a file that
+// the checkpointed container was using is replaced by a file of a different
+// type on the host between checkpoint and restore.
+func TestCheckpointRestoreFileTypeChanged(t *testing.T) {
+	for _, fileAccess := range []config.FileAccessType{config.FileAccessShared, config.FileAccessExclusive} {
+		for _, directfs := range []bool{false, true} {
+			t.Run(fmt.Sprintf("file-access-mounts=%s,directfs=%t", fileAccess, directfs), func(t *testing.T) {
+				testCheckpointRestoreFileTypeChanged(t, fileAccess, directfs)
+			})
+		}
+	}
+}
+
+func testCheckpointRestoreFileTypeChanged(t *testing.T, fileAccess config.FileAccessType, directfs bool) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "checkpoint-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding file: %q, %v", dir, err)
+	}
+	imageDir := filepath.Join(dir, "image")
+	if err := os.Mkdir(imageDir, 0777); err != nil {
+		t.Fatalf("os.Mkdir(%q) failed: %v", imageDir, err)
+	}
+	// The container's working directory remains in use across checkpoint, so
+	// it must be restored.
+	workDir := filepath.Join(dir, "work")
+	if err := os.Mkdir(workDir, 0777); err != nil {
+		t.Fatalf("os.Mkdir(%q) failed: %v", workDir, err)
+	}
+
+	spec, conf := sleepSpecConf(t)
+	conf.DirectFS = directfs
+	conf.FileAccessMounts = fileAccess
+	spec.Process.Cwd = workDir
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	// Create and start the container.
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer func() {
+		if cont != nil {
+			cont.Destroy()
+		}
+	}()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	if err := waitForProcessCount(cont, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cont.Checkpoint(conf, imageDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelFlateBestSpeed}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont.Destroy()
+	cont = nil
+
+	// Replace the working directory with a regular file.
+	if err := os.Remove(workDir); err != nil {
+		t.Fatalf("os.Remove(%q) failed: %v", workDir, err)
+	}
+	if err := os.WriteFile(workDir, nil, 0666); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", workDir, err)
+	}
+
+	cont2, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont2.Destroy()
+	err = cont2.Restore(conf, imageDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */)
+	if err == nil {
+		t.Fatalf("restore after replacing directory %q with a regular file succeeded, want error", workDir)
+	}
+	if !strings.Contains(err.Error(), "file type validation failed") {
+		t.Errorf("restore failed with %v, want file type validation error", err)
+	}
+}
+
 // TestCheckpointRestoreEROFS does the checkpoint/restore test on each platform using
 // an EROFS image as the rootfs.
 func TestCheckpointRestoreEROFS(t *testing.T) {
@@ -1265,7 +1440,8 @@ func TestCheckpointRestoreEROFS(t *testing.T) {
 	skipIfNotAvailable(t, "mkfs.erofs", "busybox")
 
 	for _, tc := range []struct{ name, options string }{
-		{name: "flat"},
+		{name: "flat", options: "-E noinline_data"},
+		{name: "inline"},
 		{name: "chunk-blockmap", options: "--chunksize=8192 -E force-inode-blockmap"},
 		{name: "chunk-indexes", options: "--chunksize=8192 -E force-chunk-indexes"},
 	} {
@@ -1302,6 +1478,10 @@ func TestCheckpointRestoreEROFS(t *testing.T) {
 						// shared between host and test container.
 						spec.Annotations[sentryapi.RootfsPrefix+"overlay"] = config.MemoryOverlay.String()
 						return spec
+					}, func(c *Container) {
+						if out, err := executeCombinedOutput(conf, c, nil, "/busybox", "true"); err != nil {
+							t.Errorf("exec /busybox true after restore: %v, out: %s", err, out)
+						}
 					})
 				})
 			}

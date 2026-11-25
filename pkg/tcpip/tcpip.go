@@ -513,8 +513,8 @@ const (
 	// PacketHost indicates a packet addressed to the local host.
 	PacketHost PacketType = iota
 
-	// PacketOtherHost indicates an outgoing packet addressed to
-	// another host caught by a NIC in promiscuous mode.
+	// PacketOtherHost indicates an incoming frame addressed to another
+	// host's link address.
 	PacketOtherHost
 
 	// PacketOutgoing for a packet originating from the local host
@@ -1171,6 +1171,17 @@ type TCPAvailableCongestionControlOption string
 func (*TCPAvailableCongestionControlOption) isGettableTransportProtocolOption() {}
 
 func (*TCPAvailableCongestionControlOption) isSettableTransportProtocolOption() {}
+
+// TCPDelayedACKEnabled enables delayed ACKs for TCP. It is enabled by
+// default.
+//
+// TODO: Remove this option and TCPStats.DelayedACKs once delayed ACKs have
+// run in production without issues.
+type TCPDelayedACKEnabled bool
+
+func (*TCPDelayedACKEnabled) isGettableTransportProtocolOption() {}
+
+func (*TCPDelayedACKEnabled) isSettableTransportProtocolOption() {}
 
 // TCPModerateReceiveBufferOption enables/disables receive buffer moderation
 // for TCP.
@@ -2312,6 +2323,9 @@ type TCPStats struct {
 
 	// SpuriousRTORecovery is the number of spurious RTOs.
 	SpuriousRTORecovery *StatCounter
+
+	// DelayedACKs is the number of ACKs sent by the delayed ACK timer.
+	DelayedACKs *StatCounter
 
 	// ForwardMaxInFlightDrop is the number of connection requests that are
 	// dropped due to exceeding the maximum number of in-flight connection

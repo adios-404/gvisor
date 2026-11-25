@@ -53,6 +53,7 @@ const (
 	flagQDiscTBFBurst           = "qdisc-tbf-burst"
 	flagInSandboxCgroup         = "in-sandbox-cgroup"
 	flagNetworkProxyPath        = "network-proxy-path"
+	flagNetgofer                = "netgofer"
 
 	maxQDiscTBFBurst     = uint64(1<<32 - 1)
 	defaultQDiscTBFRate  = uint64(0)
@@ -116,6 +117,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.String("profile-cpu", "", "collects a CPU profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.Duration("profile-gc-interval", 0, "forces a garbage collection cycle every this duration while another type of time-based profiling is enabled. Requires -profile=true.")
 	flagSet.String("profile-heap", "", "collects a heap profile to this file path for the duration of the container execution. Requires -profile=true.")
+	flagSet.Int("profile-heap-rate", 0, "sets the Sentry heap sampling interval in bytes; 0 keeps the Go runtime default, 1 records every allocation. Requires -profile=true.")
 	flagSet.String("profile-mutex", "", "collects a mutex profile to this file path for the duration of the container execution. Requires -profile=true.")
 	flagSet.String("trace", "", "collects a Go runtime execution trace to this file path for the duration of the container execution.")
 	flagSet.Bool("rootless", false, "it allows the sandbox to be started with a user that is not root. Sandbox and Gofer processes may run with same privileges as current user.")
@@ -172,6 +174,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	// Flags that control sandbox runtime behavior: network related.
 	flagSet.Var(networkTypePtr(NetworkSandbox), "network", "specifies which network to use: sandbox (default), host, none. Using network inside the sandbox is more secure because it's isolated from the host network.")
 	flagSet.String(flagNetworkProxyPath, "", "EXPERIMENTAL. Path of an external SOCK_SEQPACKET Unix domain socket to attach the sandbox's primary network interface to, instead of an AF_PACKET socket.")
+	flagSet.Var(NetgoferModeOff.Ptr(), flagNetgofer, "EXPERIMENTAL. Mode for using netgofer (off|proxy|proxy-loopback, default: off).")
 	flagSet.Var(goferNetworkNamespacePtr(GoferNetworkNamespaceNull), "gofer-network-namespace", "network namespace for gofers: null (default; an empty namespace shared by all gofers using the same --shared-root, which defaults to --root), new (a new empty namespace per gofer), host (the current namespace), or an absolute path to an existing namespace.")
 	flagSet.Bool("net-raw", false, "enable raw sockets. When false, raw sockets are disabled by removing CAP_NET_RAW from containers (`runsc exec` will still be able to utilize raw sockets). Raw sockets allow malicious containers to craft packets and potentially attack the network.")
 	flagSet.Bool("allow-packet-socket-write", false, "allow writes on AF_PACKET sockets. When false, writes on AF_PACKET sockets will fail. When turned on, untrusted workloads may potentially attack the network because of the ability to craft arbitrary packets.")
@@ -179,6 +182,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("gso", true, "enable host segmentation offload if it is supported by a network device.")
 	flagSet.Bool("software-gso", true, "enable gVisor segmentation offload when host offload can't be enabled.")
 	flagSet.Bool("gvisor-gro", false, "enable gVisor generic receive offload")
+	flagSet.Var(tcpDelayedACKPtr(TCPDelayedACKEnabled), "tcp-delayed-ack", "controls whether netstack TCP delays ACKs so that responses can carry them, like Linux. Values: enabled|disabled, default: enabled")
 	flagSet.Bool("tx-checksum-offload", false, "enable TX checksum offload.")
 	flagSet.Bool("rx-checksum-offload", true, "enable RX checksum offload.")
 	flagSet.Var(queueingDisciplinePtr(QDiscFIFO), flagQDisc, "specifies which queueing discipline to apply by default to the non loopback nics used by the sandbox.")
@@ -481,6 +485,8 @@ func (c *Config) isOverrideAllowed(name string, value string) error {
 // It returns an error if a bundle doesn't exist, or if the given
 // bundles have conflicting flag values.
 // Config values which are already specified prior to calling ApplyBundles are overridden.
+// Like Override, it does not validate the resulting Config. Callers must call
+// Validate after applying all bundles and individual flag overrides.
 func (c *Config) ApplyBundles(flagSet *flag.FlagSet, bundleNames ...BundleName) error {
 	// Populate a map from flag name to flag value to bundle name.
 	flagToValueToBundleName := make(map[string]map[string]BundleName)
@@ -545,7 +551,7 @@ func (c *Config) ApplyBundles(flagSet *flag.FlagSet, bundleNames ...BundleName) 
 		}
 	}
 
-	return c.Validate()
+	return nil
 }
 
 func getVal(field reflect.Value) string {

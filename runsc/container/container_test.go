@@ -17,6 +17,7 @@ package container
 import (
 	"bufio"
 	"bytes"
+	"debug/elf"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -39,6 +40,7 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/hostos"
@@ -931,6 +933,48 @@ func TestSandboxExitBeforeStart(t *testing.T) {
 	}
 	if err := c.Destroy(); err != nil {
 		t.Errorf("error destroying container: %v", err)
+	}
+}
+
+// TestProductName checks that the product name annotation replaces the host's
+// value in /sys/devices/virtual/dmi/id/product_name.
+func TestProductName(t *testing.T) {
+	const want = "gVisor test product"
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "product-name")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "product_name")
+
+	spec := testutil.NewSpecWithArgs("/bin/sh", "-c", "cat /sys/devices/virtual/dmi/id/product_name > "+out)
+	spec.Annotations = map[string]string{specutils.AnnotationProductName: want}
+	conf := testutil.TestConfig(t)
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+		Attached:  true,
+	}
+	ws, err := Run(conf, args)
+	if err != nil {
+		t.Fatalf("running container: %v", err)
+	}
+	if !ws.Exited() || ws.ExitStatus() != 0 {
+		t.Fatalf("container failed, waitStatus: %v", ws)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) failed: %v", out, err)
+	}
+	if string(got) != want+"\n" {
+		t.Errorf("product_name = %q, want %q", got, want+"\n")
 	}
 }
 
@@ -2488,6 +2532,75 @@ func TestInodeNumbers(t *testing.T) {
 	}
 }
 
+// TestHostOverlayfsWhiteouts checks that a directory that Linux overlayfs on
+// the host does not merge can be listed when it contains whiteouts. The
+// overlay omits them; without it, the listing is the host's.
+func TestHostOverlayfsWhiteouts(t *testing.T) {
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "whiteout-test")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	top := path.Join(dir, "top")
+	bottom := path.Join(dir, "bottom")
+	merged := path.Join(dir, "merged")
+	for _, d := range []string{top, path.Join(bottom, "d"), merged} {
+		if err := os.MkdirAll(d, 0777); err != nil {
+			t.Fatalf("os.MkdirAll() failed: %v", err)
+		}
+	}
+	if err := os.WriteFile(path.Join(bottom, "d", "file"), nil, 0666); err != nil {
+		t.Fatalf("os.WriteFile() failed: %v", err)
+	}
+	if err := unix.Mknod(path.Join(bottom, "d", "whiteout"), unix.S_IFCHR, 0); err != nil {
+		t.Skipf("cannot create a whiteout: %v", err)
+	}
+	if err := unix.Mount("overlay", merged, "overlay", unix.MS_RDONLY, "lowerdir="+top+":"+bottom); err != nil {
+		t.Skipf("cannot mount overlayfs: %v", err)
+	}
+	defer unix.Unmount(merged, unix.MNT_DETACH)
+
+	for name, conf := range configs(t, false /* noOverlay */) {
+		for _, directfs := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/directfs=%t", name, directfs), func(t *testing.T) {
+				conf.DirectFS = directfs
+				spec, _ := sleepSpecConf(t)
+				// The bind mount of the test tmpdir must be recursive to
+				// include the overlayfs mount.
+				for i := range spec.Mounts {
+					if spec.Mounts[i].Destination == testutil.TmpDir() {
+						spec.Mounts[i].Options = append(spec.Mounts[i].Options, "rbind")
+					}
+				}
+				_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+				if err != nil {
+					t.Fatalf("error setting up container: %v", err)
+				}
+				defer cleanup()
+				cont, err := New(conf, Args{ID: testutil.RandomContainerID(), Spec: spec, BundleDir: bundleDir})
+				if err != nil {
+					t.Fatalf("error creating container: %v", err)
+				}
+				defer cont.Destroy()
+				if err := cont.Start(conf); err != nil {
+					t.Fatalf("error starting container: %v", err)
+				}
+				out, err := executeCombinedOutput(conf, cont, nil, "/bin/ls", path.Join(merged, "d"))
+				if err != nil {
+					t.Fatalf("ls failed: %v, output: %s", err, out)
+				}
+				want := "file\nwhiteout"
+				if conf.Overlay2.Enabled() {
+					want = "file"
+				}
+				if got := strings.TrimSpace(string(out)); got != want {
+					t.Errorf("ls got %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 const (
 	unimplementedCharDevSrc  = "/dev/port"
 	unimplementedCharDevRdev = "1:4"
@@ -2574,6 +2687,23 @@ func checkBindMountCharDevices(t *testing.T, conf *config.Config, app string) {
 		if err := run(spec, conf); err != nil {
 			t.Fatalf("chardev-check of %s failed: %v", check.src, err)
 		}
+	}
+}
+
+// TestNvidiaDevicesWithoutNVProxy checks that a container starts when its spec
+// has NVIDIA device files and nvproxy is disabled.
+func TestNvidiaDevicesWithoutNVProxy(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("/bin/true")
+	spec.Linux = &specs.Linux{}
+	for _, path := range []string{
+		"/dev/nvidia-uvm",
+		"/dev/nvidia-caps/nvidia-cap1",
+		"/dev/nvidia-caps-imex-channels/channel0",
+	} {
+		spec.Linux.Devices = append(spec.Linux.Devices, specs.LinuxDevice{Path: path, Type: "c", Major: 511})
+	}
+	if err := run(spec, testutil.TestConfig(t)); err != nil {
+		t.Fatalf("run() failed: %v", err)
 	}
 }
 
@@ -3607,6 +3737,13 @@ func TestOCISeccompErrnoRet(t *testing.T) {
 					Names:  []string{"getpgid"},
 					Action: specs.ActErrno,
 				},
+				{
+					// The action depends on the first argument.
+					Names:    []string{"getpriority"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &enosys,
+					Args:     []specs.LinuxSeccompArg{{Index: 0, Value: unix.PRIO_PGRP, Op: specs.OpEqualTo}},
+				},
 			},
 		},
 	}
@@ -3634,23 +3771,153 @@ func TestOCISeccompErrnoRet(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		sysno int
-		want  error
+		args  []string
+		want  string
 	}{
-		{name: "errno_ret_honored", sysno: unix.SYS_GETSID, want: unix.ENOSYS},
-		{name: "no_errno_ret_defaults_to_eperm", sysno: unix.SYS_GETPGID, want: unix.EPERM},
+		{name: "errno_ret_honored", sysno: unix.SYS_GETSID, want: fmt.Sprintf("failed: %v", unix.ENOSYS)},
+		{name: "no_errno_ret_defaults_to_eperm", sysno: unix.SYS_GETPGID, want: fmt.Sprintf("failed: %v", unix.EPERM)},
+		{name: "args_match", sysno: unix.SYS_GETPRIORITY, args: []string{strconv.Itoa(unix.PRIO_PGRP), "0", "0"}, want: fmt.Sprintf("failed: %v", unix.ENOSYS)},
+		{name: "args_no_match", sysno: unix.SYS_GETPRIORITY, args: []string{strconv.Itoa(unix.PRIO_PROCESS), "0", "0"}, want: "success"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// test_app's "syscall" subcommand always exits 0; it prints the
-			// errno it observed, which is what we assert on.
-			out, err := executeCombinedOutput(conf, cont, nil, app, "syscall", "--syscall="+strconv.Itoa(tc.sysno))
+			// result it observed, which is what we assert on.
+			args := append([]string{"syscall", "--syscall=" + strconv.Itoa(tc.sysno)}, tc.args...)
+			out, err := executeCombinedOutput(conf, cont, nil, app, args...)
 			if err != nil {
 				t.Fatalf("error executing test_app: %v", err)
 			}
-			if want := fmt.Sprintf("failed: %v", tc.want); !strings.Contains(string(out), want) {
-				t.Errorf("syscall(%d) output %q does not contain %q", tc.sysno, out, want)
+			if !strings.Contains(string(out), tc.want) {
+				t.Errorf("syscall(%d) output %q does not contain %q", tc.sysno, out, tc.want)
 			}
 		})
 	}
+}
+
+// TestOCISeccompRestore checks that the OCI seccomp profile still
+// applies post-restore.
+func TestOCISeccompRestore(t *testing.T) {
+	app, err := testutil.FindFile("test/cmd/test_app/test_app")
+	if err != nil {
+		t.Fatal("error finding test_app:", err)
+	}
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "seccomp-restore")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatalf("error chmoding dir: %v", err)
+	}
+	imageDir := filepath.Join(dir, "image")
+	if err := os.Mkdir(imageDir, 0777); err != nil {
+		t.Fatalf("error creating image dir: %v", err)
+	}
+	outDir := filepath.Join(dir, "out")
+	if err := os.Mkdir(outDir, 0777); err != nil {
+		t.Fatalf("error creating output dir: %v", err)
+	}
+	script := fmt.Sprintf(`probe() {
+	{ %[1]s syscall --syscall=%[2]d; %[1]s syscall --syscall=%[3]d %[4]d 0 0; %[1]s syscall --syscall=%[3]d %[5]d 0 0; } > "$1.tmp"
+	mv "$1.tmp" "$1"
+}
+probe %[6]s/before
+while [ ! -e %[6]s/restored ]; do sleep 0.1; done
+probe %[6]s/after`, app, unix.SYS_GETSID, unix.SYS_GETPRIORITY, unix.PRIO_PGRP, unix.PRIO_PROCESS, outDir)
+	spec := testutil.NewSpecWithArgs("/bin/sh", "-c", script)
+	spec.Mounts = []specs.Mount{{
+		Type:        "bind",
+		Destination: outDir,
+		Source:      outDir,
+	}}
+	enosys := uint(unix.ENOSYS)
+	spec.Linux = &specs.Linux{
+		Seccomp: &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{
+				{
+					Names:    []string{"getsid"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &enosys,
+				},
+				{
+					Names:    []string{"getpriority"},
+					Action:   specs.ActErrno,
+					ErrnoRet: &enosys,
+					Args:     []specs.LinuxSeccompArg{{Index: 0, Value: unix.PRIO_PGRP, Op: specs.OpEqualTo}},
+				},
+			},
+		},
+	}
+	conf := testutil.TestConfig(t)
+	conf.OCISeccomp = true
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	want := []string{
+		fmt.Sprintf("failed: %v", unix.ENOSYS),
+		fmt.Sprintf("failed: %v", unix.ENOSYS),
+		"success",
+	}
+	checkOutput := func(name string) {
+		t.Helper()
+		if err := testutil.Poll(func() error {
+			got, err := os.ReadFile(filepath.Join(outDir, name))
+			if err != nil {
+				return err
+			}
+			lines := strings.Split(strings.TrimSuffix(string(got), "\n"), "\n")
+			if len(lines) != len(want) {
+				return &backoff.PermanentError{Err: fmt.Errorf("%s: got %q, want %d lines", name, got, len(want))}
+			}
+			for i, line := range lines {
+				if !strings.HasSuffix(line, want[i]) {
+					return &backoff.PermanentError{Err: fmt.Errorf("%s line %d: got %q, want suffix %q", name, i, line, want[i])}
+				}
+			}
+			return nil
+		}, 30*time.Second); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cont, err := New(conf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer cont.Destroy()
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("error starting container: %v", err)
+	}
+	checkOutput("before")
+	if err := cont.Checkpoint(conf, imageDir, sandbox.CheckpointOpts{Compression: statefile.CompressionLevelDefault}); err != nil {
+		t.Fatalf("error checkpointing container: %v", err)
+	}
+	cont.Destroy()
+
+	contRestore, err := New(conf, Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	})
+	if err != nil {
+		t.Fatalf("error creating container: %v", err)
+	}
+	defer contRestore.Destroy()
+	if err := contRestore.Restore(conf, imageDir, sandbox.DirectIOOff, false /* background */, nil /* networkArgs */); err != nil {
+		t.Fatalf("error restoring container: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "restored"), nil, 0666); err != nil {
+		t.Fatalf("error creating restore marker: %v", err)
+	}
+	checkOutput("after")
 }
 
 func TestWaitOnExitedSandbox(t *testing.T) {
@@ -3865,21 +4132,69 @@ func TestDestroyStarting(t *testing.T) {
 }
 
 func TestCreateWorkingDir(t *testing.T) {
-	for name, conf := range configs(t, false /* noOverlay */) {
-		t.Run(name, func(t *testing.T) {
-			tmpDir, err := os.MkdirTemp(testutil.TmpDir(), "cwd-create")
-			if err != nil {
-				t.Fatalf("os.MkdirTemp() failed: %v", err)
-			}
-			dir := path.Join(tmpDir, "new/working/dir")
+	for _, tc := range []struct {
+		name    string
+		cwd     string
+		wantCwd string
+		pathLen int
+		wantErr string
+	}{
+		{name: "MissingDirectory", cwd: "new/working/dir", wantCwd: "new/working/dir"},
+		{name: "TrailingSlash", cwd: "new/working/dir/", wantCwd: "new/working/dir"},
+		{name: "RepeatedSeparators", cwd: "new//working///dir///", wantCwd: "new/working/dir"},
+		{name: "TrailingDot", cwd: "new/working/dir/.", wantCwd: "new/working/dir"},
+		{name: "DotDotAfterMissingComponent", cwd: "new/../wanted", wantCwd: "wanted"},
+		{name: "SymlinkDotDotExistingTarget", cwd: "link/../existing", wantCwd: "target/existing"},
+		{name: "SymlinkDotDotMissingTarget", cwd: "link/../missing/child", wantCwd: "target/missing/child"},
+		{name: "FileBeforeDotDot", cwd: "file/../wanted", wantErr: "not a directory"},
+		{name: "FileAfterDotDot", cwd: "new/../file", wantErr: "file exists"},
+		{name: "DanglingSymlink", cwd: "dangling", wantErr: "file exists"},
+		{name: "PathAtLimit", cwd: "new", wantCwd: "new", pathLen: linux.PATH_MAX - 1},
+		{name: "PathBeyondLimit", cwd: "new", pathLen: linux.PATH_MAX, wantErr: "file name too long"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, conf := range configs(t, false /* noOverlay */) {
+				t.Run(name, func(t *testing.T) {
+					tmpDir, err := os.MkdirTemp(testutil.TmpDir(), "cwd-create")
+					if err != nil {
+						t.Fatalf("os.MkdirTemp() failed: %v", err)
+					}
+					t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+					for _, dir := range []string{"target/child", "target/existing"} {
+						if err := os.MkdirAll(filepath.Join(tmpDir, dir), 0755); err != nil {
+							t.Fatal(err)
+						}
+					}
+					// Files at the lexical targets make incorrect path cleaning fail.
+					for _, file := range []string{"file", "existing", "missing"} {
+						if err := os.WriteFile(filepath.Join(tmpDir, file), nil, 0644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					for link, target := range map[string]string{"link": "target/child", "dangling": "absent"} {
+						if err := os.Symlink(target, filepath.Join(tmpDir, link)); err != nil {
+							t.Fatal(err)
+						}
+					}
 
-			// touch will fail if the directory doesn't exist.
-			spec := testutil.NewSpecWithArgs("/bin/touch", path.Join(dir, "file"))
-			spec.Process.Cwd = dir
-			spec.Root.Readonly = true
-
-			if err := run(spec, conf); err != nil {
-				t.Fatalf("Error running container: %v", err)
+					spec := testutil.NewSpecWithArgs("/bin/sh", "-c", `test "$(pwd -P)" = "$1"`, "sh", filepath.Join(tmpDir, tc.wantCwd))
+					spec.Process.Cwd = tmpDir + "/" + tc.cwd
+					if tc.pathLen != 0 {
+						spec.Process.Cwd += strings.Repeat("/.", (tc.pathLen-len(spec.Process.Cwd))/2)
+						if len(spec.Process.Cwd) < tc.pathLen {
+							spec.Process.Cwd += "/"
+						}
+					}
+					spec.Root.Readonly = true
+					err = run(spec, conf)
+					if tc.wantErr != "" {
+						if err == nil || !strings.Contains(err.Error(), "failed to create process working directory") || !strings.Contains(err.Error(), tc.wantErr) {
+							t.Fatalf("run() = %v, want working-directory creation error containing %q", err, tc.wantErr)
+						}
+					} else if err != nil {
+						t.Fatalf("run() failed: %v", err)
+					}
+				})
 			}
 		})
 	}
@@ -5281,7 +5596,7 @@ func createRootfsEROFS(dir string, options ...string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("busybox is not available: %v", err)
 	}
-	if err := testutil.Copy(busybox, filepath.Join(rootfsDir, "busybox")); err != nil {
+	if err := copyLoadedELF(busybox, filepath.Join(rootfsDir, "busybox")); err != nil {
 		return "", "", fmt.Errorf("failed to copy busybox: %v", err)
 	}
 
@@ -5296,11 +5611,31 @@ func createRootfsEROFS(dir string, options ...string) (string, string, error) {
 
 	// Build the EROFS rootfs image.
 	rootfsImage := filepath.Join(dir, "rootfs.img")
-	if err := createImageEROFS(rootfsImage, rootfsDir, append([]string{"-E noinline_data"}, options...)...); err != nil {
+	if err := createImageEROFS(rootfsImage, rootfsDir, options...); err != nil {
 		return "", "", fmt.Errorf("error creating EROFS image: %v", err)
 	}
 
 	return rootfsDir, rootfsImage, nil
+}
+
+// copyLoadedELF copies src to dst up to the end of its last loaded segment.
+func copyLoadedELF(src, dst string) error {
+	f, err := elf.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	var end uint64
+	for _, prog := range f.Progs {
+		if prog.Type == elf.PT_LOAD {
+			end = max(end, prog.Off+prog.Filesz)
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data[:end], 0755)
 }
 
 // TestRootfsEROFS starts a container using an EROFS image as the rootfs and checks that
@@ -5671,6 +6006,14 @@ func TestSpecValidation(t *testing.T) {
 			mutate: func(spec, restoreSpec *specs.Spec, _, _ string) {
 				spec.Annotations = make(map[string]string)
 				spec.Annotations["dev.gvisor.flag.net-disconnect-ok"] = strconv.FormatBool(true)
+			},
+			wantErr: "\"Annotations\" does not match across checkpoint restore",
+		},
+		{
+			name: "ProductNameAnnotationFail",
+			mutate: func(spec, restoreSpec *specs.Spec, _, _ string) {
+				spec.Annotations = map[string]string{specutils.AnnotationProductName: "checkpoint product"}
+				restoreSpec.Annotations = map[string]string{specutils.AnnotationProductName: "restore product"}
 			},
 			wantErr: "\"Annotations\" does not match across checkpoint restore",
 		},

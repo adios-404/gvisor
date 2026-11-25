@@ -1001,8 +1001,13 @@ func TestDisabledNICsNICInfoAndCheckNIC(t *testing.T) {
 		nicInfo, ok := allNICInfo[nicID]
 		if !ok {
 			t.Errorf("entry for %d missing from allNICInfo = %+v", nicID, allNICInfo)
-		} else if nicInfo.Flags.Running != enabled {
-			t.Errorf("got nicInfo.Flags.Running = %t, want = %t", nicInfo.Flags.Running, enabled)
+		} else {
+			if nicInfo.Flags.Up != enabled {
+				t.Errorf("got nicInfo.Flags.Up = %t, want = %t", nicInfo.Flags.Up, enabled)
+			}
+			if nicInfo.Flags.Running != enabled {
+				t.Errorf("got nicInfo.Flags.Running = %t, want = %t", nicInfo.Flags.Running, enabled)
+			}
 		}
 
 		if got := s.CheckNIC(nicID); got != enabled {
@@ -1028,6 +1033,83 @@ func TestDisabledNICsNICInfoAndCheckNIC(t *testing.T) {
 		t.Fatalf("s.DisableNIC(%d): %s", nicID, err)
 	}
 	checkNIC(false)
+}
+
+// TestAdminStateWithPausedExternalNetworking tests that pausing external
+// networking and the administrative state of a NIC don't override each other.
+func TestAdminStateWithPausedExternalNetworking(t *testing.T) {
+	const (
+		loopbackNICID = 1
+		externalNICID = 2
+	)
+
+	s := stack.New(stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{fakeNetFactory},
+	})
+	if err := s.CreateNIC(loopbackNICID, loopback.New()); err != nil {
+		t.Fatalf("s.CreateNIC(%d, _): %s", loopbackNICID, err)
+	}
+	if err := s.CreateNIC(externalNICID, channel.New(0, defaultMTU, "")); err != nil {
+		t.Fatalf("s.CreateNIC(%d, _): %s", externalNICID, err)
+	}
+
+	checkNIC := func(nicID tcpip.NICID, wantUp, wantRunning bool) {
+		t.Helper()
+
+		allNICInfo := s.NICInfo()
+		nicInfo, ok := allNICInfo[nicID]
+		if !ok {
+			t.Fatalf("entry for %d missing from allNICInfo = %+v", nicID, allNICInfo)
+		}
+		if nicInfo.Flags.Up != wantUp {
+			t.Errorf("NIC %d: got nicInfo.Flags.Up = %t, want = %t", nicID, nicInfo.Flags.Up, wantUp)
+		}
+		if nicInfo.Flags.Running != wantRunning {
+			t.Errorf("NIC %d: got nicInfo.Flags.Running = %t, want = %t", nicID, nicInfo.Flags.Running, wantRunning)
+		}
+		if got := s.CheckNIC(nicID); got != wantRunning {
+			t.Errorf("got s.CheckNIC(%d) = %t, want = %t", nicID, got, wantRunning)
+		}
+	}
+
+	// Pausing disables the external NIC but leaves it administratively up.
+	s.DisableAllNonLoopbackNICs()
+	checkNIC(loopbackNICID, true, true)
+	checkNIC(externalNICID, true, false)
+
+	// Bringing the external NIC up while paused does not enable it.
+	if err := s.EnableNIC(externalNICID); err != nil {
+		t.Fatalf("s.EnableNIC(%d): %s", externalNICID, err)
+	}
+	checkNIC(externalNICID, true, false)
+
+	// The pause does not apply to loopback.
+	if err := s.DisableNIC(loopbackNICID); err != nil {
+		t.Fatalf("s.DisableNIC(%d): %s", loopbackNICID, err)
+	}
+	checkNIC(loopbackNICID, false, false)
+	if err := s.EnableNIC(loopbackNICID); err != nil {
+		t.Fatalf("s.EnableNIC(%d): %s", loopbackNICID, err)
+	}
+	checkNIC(loopbackNICID, true, true)
+
+	// Resuming enables the external NIC because it is administratively up.
+	s.EnableAllNonLoopbackNICs()
+	checkNIC(externalNICID, true, true)
+
+	// An administratively down NIC stays down across a pause and resume.
+	if err := s.DisableNIC(externalNICID); err != nil {
+		t.Fatalf("s.DisableNIC(%d): %s", externalNICID, err)
+	}
+	s.DisableAllNonLoopbackNICs()
+	s.EnableAllNonLoopbackNICs()
+	checkNIC(externalNICID, false, false)
+
+	// Bringing it up again enables it.
+	if err := s.EnableNIC(externalNICID); err != nil {
+		t.Fatalf("s.EnableNIC(%d): %s", externalNICID, err)
+	}
+	checkNIC(externalNICID, true, true)
 }
 
 func TestRemoveUnknownNIC(t *testing.T) {
@@ -2737,6 +2819,36 @@ func TestNICContextPreservation(t *testing.T) {
 			}
 			if got, want := nicinfo.Context == test.want, true; got != want {
 				t.Fatalf("got nicinfo.Context == ctx = %t, want %t; nicinfo.Context = %p, ctx = %p", got, want, nicinfo.Context, test.want)
+			}
+		})
+	}
+}
+
+func TestNICMulticastPreservation(t *testing.T) {
+	for _, multicast := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multicast=%t", multicast), func(t *testing.T) {
+			s := stack.New(stack.Options{})
+			t.Cleanup(s.Destroy)
+			peer := stack.New(stack.Options{})
+			t.Cleanup(peer.Destroy)
+			const id = tcpip.NICID(1)
+			ep := channel.New(0, 1500, linkAddr1)
+			if err := s.CreateNICWithOptions(id, ep, stack.NICOptions{Multicast: multicast}); err != nil {
+				t.Fatalf("CreateNICWithOptions: %s", err)
+			}
+			if got := s.NICInfo()[id].Flags.Multicast; got != multicast {
+				t.Errorf("NICInfo().Flags.Multicast = %t, want %t", got, multicast)
+			}
+			newID, err := s.SetNICStack(id, peer)
+			if err != nil {
+				t.Fatalf("SetNICStack: %s", err)
+			}
+			info, ok := peer.SingleNICInfo(newID)
+			if !ok {
+				t.Fatalf("moved NIC %d missing from destination stack", newID)
+			}
+			if got := info.Flags.Multicast; got != multicast {
+				t.Errorf("moved NIC Flags.Multicast = %t, want %t", got, multicast)
 			}
 		})
 	}
@@ -5049,6 +5161,87 @@ func TestFindRoutePrefersLocalAddrOnlyForLocallyGeneratedTraffic(t *testing.T) {
 
 			if t.Failed() {
 				t.FailNow()
+			}
+		})
+	}
+}
+
+// TestCheckLocalAddressIgnoresLoopbackTemporaryAddress tests that the temporary
+// address added to loopback by a local route doesn't hide the NIC that owns it.
+func TestCheckLocalAddressIgnoresLoopbackTemporaryAddress(t *testing.T) {
+	const (
+		loopbackNICID = 1
+		externalNICID = 2
+	)
+
+	tests := []struct {
+		name         string
+		netProto     tcpip.NetworkProtocolNumber
+		localAddr    tcpip.AddressWithPrefix
+		remoteAddr   tcpip.Address
+		defaultRoute tcpip.Subnet
+		properties   stack.AddressProperties
+	}{
+		{
+			name:         "IPv4",
+			netProto:     ipv4.ProtocolNumber,
+			localAddr:    tcpip.AddressWithPrefix{Address: testutil.MustParse4("10.0.0.2"), PrefixLen: 24},
+			remoteAddr:   testutil.MustParse4("8.8.8.8"),
+			defaultRoute: header.IPv4EmptySubnet,
+		},
+		{
+			// Privacy addresses have the Temporary property but are owned by the NIC.
+			name:         "IPv6 privacy address",
+			netProto:     ipv6.ProtocolNumber,
+			localAddr:    tcpip.AddressWithPrefix{Address: testutil.MustParse6("2001:db8::2"), PrefixLen: 64},
+			remoteAddr:   testutil.MustParse6("2001:4860:4860::8888"),
+			defaultRoute: header.IPv6EmptySubnet,
+			properties:   stack.AddressProperties{Temporary: true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := stack.New(stack.Options{
+				NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+				HandleLocal:      true,
+			})
+			defer s.Destroy()
+			if err := s.CreateNIC(loopbackNICID, loopback.New()); err != nil {
+				t.Fatalf("s.CreateNIC(%d, _): %s", loopbackNICID, err)
+			}
+			if err := s.CreateNIC(externalNICID, channel.New(0, defaultMTU, "")); err != nil {
+				t.Fatalf("s.CreateNIC(%d, _): %s", externalNICID, err)
+			}
+			protocolAddr := tcpip.ProtocolAddress{Protocol: test.netProto, AddressWithPrefix: test.localAddr}
+			if err := s.AddProtocolAddress(externalNICID, protocolAddr, test.properties); err != nil {
+				t.Fatalf("s.AddProtocolAddress(%d, %+v, %+v): %s", externalNICID, protocolAddr, test.properties, err)
+			}
+			s.SetRouteTable([]tcpip.Route{{Destination: test.defaultRoute, NIC: externalNICID}})
+			localAddr := test.localAddr.Address
+
+			// Holding a route to a local address keeps a temporary copy on loopback.
+			r, err := s.FindRoute(0, tcpip.Address{}, localAddr, test.netProto, false /* multicastLoop */)
+			if err != nil {
+				t.Fatalf("s.FindRoute(0, '', %s, %d, false): %s", localAddr, test.netProto, err)
+			}
+			defer r.Release()
+			if got := r.OutgoingNIC(); got != loopbackNICID {
+				t.Fatalf("got r.OutgoingNIC() = %d, want = %d", got, loopbackNICID)
+			}
+
+			// NIC iteration order is random.
+			for i := 0; i < 100; i++ {
+				nicID := s.CheckLocalAddress(0, test.netProto, localAddr)
+				if nicID != externalNICID {
+					t.Fatalf("got s.CheckLocalAddress(0, %d, %s) = %d, want = %d", test.netProto, localAddr, nicID, externalNICID)
+				}
+				// As sendto() on a bound, unconnected UDP endpoint does.
+				r, err := s.FindRoute(nicID, localAddr, test.remoteAddr, test.netProto, false /* multicastLoop */)
+				if err != nil {
+					t.Fatalf("s.FindRoute(%d, %s, %s, %d, false): %s", nicID, localAddr, test.remoteAddr, test.netProto, err)
+				}
+				r.Release()
 			}
 		})
 	}

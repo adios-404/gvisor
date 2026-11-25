@@ -166,6 +166,10 @@ type PacketBuffer struct {
 	// safely skipped.
 	RXChecksumValidated bool
 
+	// GROSegmentSize is the payload size of the TCP segments that GRO
+	// coalesced into an incoming packet, or zero.
+	GROSegmentSize uint16
+
 	// NetworkPacketInfo holds an incoming packet's network-layer information.
 	NetworkPacketInfo NetworkPacketInfo
 
@@ -403,6 +407,7 @@ func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk.NICID = pk.NICID
 	newPk.InputNICID = pk.InputNICID
 	newPk.RXChecksumValidated = pk.RXChecksumValidated
+	newPk.GROSegmentSize = pk.GROSegmentSize
 	newPk.NetworkPacketInfo = pk.NetworkPacketInfo
 	newPk.tuple = pk.tuple
 	newPk.InitRefs()
@@ -546,12 +551,13 @@ func (pk *PacketBuffer) ConfigureNAT(portsOrIdents PortOrIdentRange, natAddress 
 	return pk.tuple.conn.ConfigureNAT(portsOrIdents, natAddress, natType, changePort, changeAddress)
 }
 
-// ConfigureMasquerade configures NAT masquerade for the packet.
-func (pk *PacketBuffer) ConfigureMasquerade(portsOrIdents PortOrIdentRange, route *Route, stk *Stack, changePort bool) bool {
+// ConfigureMasquerade configures NAT masquerade for the packet to the primary
+// address of the output interface outNICID. route may be nil.
+func (pk *PacketBuffer) ConfigureMasquerade(portsOrIdents PortOrIdentRange, route *Route, outNICID tcpip.NICID, stk *Stack, changePort bool) bool {
 	if !pk.IsConnTrackConfigured() {
 		return false
 	}
-	return pk.tuple.conn.configureMasquerade(pk, route, stk, portsOrIdents, changePort)
+	return pk.tuple.conn.configureMasquerade(pk, route, outNICID, stk, portsOrIdents, changePort)
 }
 
 // FinalizeConnTrack finalizes the connection tracking state for the packet.
@@ -662,8 +668,8 @@ func (d PacketData) ReadTo(dst io.Writer, peek bool) (int, error) {
 			panic(fmt.Sprintf("io.Writer.Write succeeded with incomplete write: %d != %d", n, v.Size()))
 		}
 	})
-	if !peek {
-		d.pk.buf.TrimFront(int64(done))
+	if !peek && done != 0 {
+		d.TrimFront(done)
 	}
 	return done, err
 }
@@ -733,13 +739,25 @@ func (d PacketData) Merge(oth PacketData) {
 
 // TrimFront removes up to count bytes from the front of d's payload.
 func (d PacketData) TrimFront(count int) {
-	if count > d.Size() {
-		count = d.Size()
+	offset := d.pk.dataOffset()
+	if offset == 0 {
+		d.pk.buf.TrimFront(int64(count))
+		return
 	}
-	buf := d.pk.Data().ToBuffer()
-	buf.TrimFront(int64(count))
-	d.pk.buf.Truncate(int64(d.pk.dataOffset()))
-	d.pk.buf.Merge(&buf)
+	if count <= 0 {
+		return
+	}
+	if count >= d.Size() {
+		d.pk.buf.Truncate(int64(offset))
+		return
+	}
+	var headers buffer.Buffer
+	d.pk.buf.SubApply(0, offset, func(v *buffer.View) {
+		headers.Append(v.Clone())
+	})
+	d.pk.buf.TrimFront(int64(offset + count))
+	headers.Merge(&d.pk.buf)
+	d.pk.buf = headers
 }
 
 // Size returns the number of bytes in the data payload of the packet.

@@ -336,6 +336,7 @@ var Metrics = tcpip.Stats{
 		SegmentsAckedWithDSACK:             mustCreateMetric("/netstack/tcp/segments_acked_with_dsack", "Number of segments for which DSACK was received."),
 		SpuriousRecovery:                   mustCreateMetric("/netstack/tcp/spurious_recovery", "Number of times the connection entered loss recovery spuriously."),
 		SpuriousRTORecovery:                mustCreateMetric("/netstack/tcp/spurious_rto_recovery", "Number of times the connection entered RTO spuriously."),
+		DelayedACKs:                        mustCreateMetric("/netstack/tcp/delayed_acks", "Number of ACKs sent by the delayed ACK timer."),
 		ForwardMaxInFlightDrop:             mustCreateMetric("/netstack/tcp/forward_max_in_flight_drop", "Number of connection requests dropped due to exceeding in-flight limit."),
 	},
 	UDP: tcpip.UDPStats{
@@ -3359,9 +3360,8 @@ func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDe
 	// Don't overwrite any data we received.
 	dst = dst.DropFirst(n)
 
-	// We'll have to block. Register for notifications and keep trying to
-	// send all the data.
-	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	// A connected UDP socket can receive an ICMP error without receiving data.
+	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventErr)
 	s.EventRegister(&e)
 	defer s.EventUnregister(&e)
 
@@ -3545,6 +3545,21 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
 
+	case linux.SIOCSIFFLAGS:
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		// The capability is checked before the device is looked up, and the
+		// ifreq is not copied back.
+		if !t.HasCapabilityIn(linux.CAP_NET_ADMIN, t.NetworkNamespace().UserNamespace()) {
+			return 0, linuxerr.EPERM
+		}
+		if err := interfaceIoctl(ctx, io, arg, &ifr); err != nil {
+			return 0, err.ToError()
+		}
+		return 0, nil
+
 	case linux.SIOCGIFCONF:
 		// Return a list of interface addresses or the buffer size
 		// necessary to hold the list.
@@ -3664,6 +3679,14 @@ func interfaceIoctl(ctx context.Context, _ usermem.IO, arg int, ifr *linux.IFReq
 		// Drop the flags that don't fit in the size that we need to return. This
 		// matches Linux behavior.
 		hostarch.ByteOrder.PutUint16(ifr.Data[:2], uint16(f))
+
+	case linux.SIOCSIFFLAGS:
+		epstack, ok := stk.(*Stack)
+		if !ok {
+			return errStackType
+		}
+		flags := uint32(hostarch.ByteOrder.Uint16(ifr.Data[:2]))
+		return epstack.SetInterfaceFlags(ctx, tcpip.NICID(index), flags)
 
 	case linux.SIOCGIFADDR:
 		// Copy the IPv4 address out.
@@ -3803,16 +3826,21 @@ func interfaceStatusFlags(stack inet.Stack, name string) (uint32, *syserr.Error)
 func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	var rv uint32
 	if f.Up {
-		rv |= linux.IFF_UP | linux.IFF_LOWER_UP
+		rv |= linux.IFF_UP
 	}
+	// A NIC that is administratively up but disabled, such as while external
+	// networking is paused, is reported like a device without carrier.
 	if f.Running {
-		rv |= linux.IFF_RUNNING
+		rv |= linux.IFF_RUNNING | linux.IFF_LOWER_UP
 	}
 	if f.Promiscuous {
 		rv |= linux.IFF_PROMISC
 	}
 	if f.Loopback {
 		rv |= linux.IFF_LOOPBACK
+	}
+	if f.Multicast {
+		rv |= linux.IFF_MULTICAST
 	}
 	return rv
 }

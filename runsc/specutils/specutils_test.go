@@ -16,13 +16,17 @@ package specutils
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -30,7 +34,14 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/sentry/devices/nvproxy/nvconf"
 	"gvisor.dev/gvisor/runsc/config"
+	"gvisor.dev/gvisor/runsc/flag"
 )
+
+func init() {
+	// Pin main to the initial thread so tests that lock an OS thread run on
+	// non-leader threads.
+	runtime.LockOSThread()
+}
 
 const testProcessEnv = "SPECUTILS_TEST_PROCESS"
 
@@ -55,6 +66,65 @@ func testProcess(mode string) *exec.Cmd {
 	cmd.Env = append(os.Environ(), testProcessEnv+"="+mode)
 	cmd.Stderr = os.Stderr
 	return cmd
+}
+
+func TestFixConfigBundleValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		wantErr     string
+	}{
+		{
+			name: "flag annotation overrides incompatible bundle",
+			annotations: map[string]string{
+				"dev.gvisor.bundle.experimental-high-performance": "true",
+				"dev.gvisor.flag.overlay2":                        "none",
+			},
+		},
+		{
+			name: "incompatible bundle without override",
+			annotations: map[string]string{
+				"dev.gvisor.bundle.experimental-high-performance": "true",
+			},
+			wantErr: "overlay flag is incompatible with shared file access for rootfs",
+		},
+		{
+			name: "flag annotation leaves configuration invalid",
+			annotations: map[string]string{
+				"dev.gvisor.bundle.experimental-high-performance": "true",
+				"dev.gvisor.flag.overlay2":                        "root:memory",
+			},
+			wantErr: "overlay flag is incompatible with shared file access for rootfs",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flagSet := flag.NewFlagSet(t.Name(), flag.ContinueOnError)
+			config.RegisterFlags(flagSet)
+			if err := flagSet.Parse([]string{"--file-access=shared", "--overlay2=none"}); err != nil {
+				t.Fatal(err)
+			}
+			conf, err := config.NewFromFlags(flagSet)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldFlags := flag.CommandLine
+			flag.CommandLine = flagSet
+			t.Cleanup(func() { flag.CommandLine = oldFlags })
+
+			if err := FixConfig(conf, &specs.Spec{Annotations: tc.annotations}); tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("FixConfig() got error %v, want %q", err, tc.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("FixConfig() failed: %v", err)
+				}
+				if got := conf.Overlay2.String(); got != "none" {
+					t.Errorf("overlay2 = %q, want none", got)
+				}
+			}
+		})
+	}
 }
 
 func TestIsProcessRunning(t *testing.T) {
@@ -450,6 +520,19 @@ func TestSpecInvalid(t *testing.T) {
 				AllowRootfsTarAnnotation: true,
 			},
 			error: "rootfs tar upper path is set but rootfs is readonly",
+		},
+		{
+			name: "empty product name",
+			spec: specs.Spec{
+				Root: &specs.Root{Path: "/"},
+				Process: &specs.Process{
+					Args: []string{"/bin/true"},
+				},
+				Annotations: map[string]string{
+					AnnotationProductName: "",
+				},
+			},
+			error: "annotation dev.gvisor.dmi.product-name must not be empty",
 		},
 		{
 			name: "sandbox spec",
@@ -870,6 +953,57 @@ func TestRootfsUpperTarPath(t *testing.T) {
 	}
 }
 
+func TestProductName(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		annotations map[string]string
+		want        string
+		wantErr     bool
+	}{
+		{
+			name: "unset",
+		},
+		{
+			name:        "set",
+			annotations: map[string]string{AnnotationProductName: "Test Product"},
+			want:        "Test Product",
+		},
+		{
+			name:        "surrounding spaces kept",
+			annotations: map[string]string{AnnotationProductName: " Test Product "},
+			want:        " Test Product ",
+		},
+		{
+			name:        "empty",
+			annotations: map[string]string{AnnotationProductName: ""},
+			wantErr:     true,
+		},
+		{
+			name:        "only spaces",
+			annotations: map[string]string{AnnotationProductName: "   "},
+			wantErr:     true,
+		},
+		{
+			name:        "NUL",
+			annotations: map[string]string{AnnotationProductName: "Test\x00Product"},
+			wantErr:     true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ProductName(&specs.Spec{Annotations: tc.annotations})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("ProductName() error = %v, wantErr = %t", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Errorf("ProductName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got, err := ProductName(nil); got != "" || err != nil {
+		t.Errorf("ProductName(nil) = %q, %v, want \"\", nil", got, err)
+	}
+}
+
 func TestIsProcFDPath(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -1277,5 +1411,317 @@ func TestValidateSpecForContainerMountAnnotationOptionsSize(t *testing.T) {
 				t.Errorf("validateSpecForContainer(%v, %v) = %v, wantErr %t", tc.old.Annotations, tc.new.Annotations, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestNSPath(t *testing.T) {
+	for _, ns := range KnownNamespaces() {
+		p := nsPath(specs.LinuxNamespaceType(ns))
+		if !strings.HasPrefix(p, "/proc/thread-self/ns/") {
+			t.Errorf("nsPath(%q) = %q, want prefix /proc/thread-self/ns/", ns, p)
+		}
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("os.Stat(%q) failed: %v", p, err)
+		}
+	}
+}
+
+func TestApplyNSRestoresThreadNamespace(t *testing.T) {
+	if os.Getuid() != 0 {
+		cmd := exec.Command("/proc/self/exe", "-test.run=^TestApplyNSRestoresThreadNamespace$", "-test.v")
+		for _, env := range os.Environ() {
+			if strings.HasPrefix(env, "TEST_PREMATURE_EXIT_FILE=") ||
+				strings.HasPrefix(env, "XML_OUTPUT_FILE=") ||
+				strings.HasPrefix(env, "GUNIT_OUTPUT=") {
+				continue
+			}
+			cmd.Env = append(cmd.Env, env)
+		}
+		cmd.SysProcAttr = &unix.SysProcAttr{
+			Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNET,
+			UidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+			},
+			GidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+			},
+			GidMappingsEnableSetgroups: false,
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.ENOSYS) {
+				t.Skipf("user namespace unsupported: %v", err)
+			}
+			t.Fatalf("subtest in userns failed (%v):\n%s", err, out)
+		}
+		return
+	}
+
+	runtime.LockOSThread()
+	restoreFailed := false
+	defer func() {
+		if !restoreFailed {
+			runtime.UnlockOSThread()
+		}
+	}()
+	if unix.Gettid() == os.Getpid() {
+		t.Fatalf("test goroutine ran on thread group leader (tid=%d)", unix.Gettid())
+	}
+
+	origNS, err := unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("opening original netns: %v", err)
+	}
+	defer unix.Close(origNS)
+	defer func() {
+		if err := unix.Setns(origNS, unix.CLONE_NEWNET); err != nil {
+			restoreFailed = true
+			t.Errorf("restoring original netns: %v", err)
+		}
+	}()
+
+	// Put this thread into its own network namespace, distinct from the
+	// thread group leader's namespace at /proc/self/ns/net.
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.ENOSYS) {
+			t.Skipf("unshare(CLONE_NEWNET): %v", err)
+		}
+		t.Fatalf("unshare(CLONE_NEWNET): %v", err)
+	}
+
+	leaderNS, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		t.Fatalf("readlink(/proc/self/ns/net): %v", err)
+	}
+	threadNS, err := os.Readlink("/proc/thread-self/ns/net")
+	if err != nil {
+		t.Fatalf("readlink(/proc/thread-self/ns/net): %v", err)
+	}
+	if threadNS == leaderNS {
+		t.Fatalf("thread netns %q equals leader netns %q after unshare", threadNS, leaderNS)
+	}
+
+	// Join the leader's network namespace via ApplyNS, then restore.
+	restore, err := ApplyNS(specs.LinuxNamespace{
+		Type: specs.NetworkNamespace,
+		Path: "/proc/self/ns/net",
+	})
+	if err != nil {
+		t.Fatalf("ApplyNS: %v", err)
+	}
+	joinedNS, err := os.Readlink("/proc/thread-self/ns/net")
+	if err != nil {
+		t.Fatalf("readlink(/proc/thread-self/ns/net): %v", err)
+	}
+	if joinedNS != leaderNS {
+		t.Errorf("after ApplyNS, thread netns = %q, want %q", joinedNS, leaderNS)
+	}
+
+	if err := restore(); err != nil {
+		restoreFailed = true
+		t.Fatalf("restore: %v", err)
+	}
+	restoredNS, err := os.Readlink("/proc/thread-self/ns/net")
+	if err != nil {
+		t.Fatalf("readlink(/proc/thread-self/ns/net): %v", err)
+	}
+	if restoredNS != threadNS {
+		t.Errorf("after restore, thread netns = %q, want %q (leader netns is %q)", restoredNS, threadNS, leaderNS)
+	}
+}
+
+func realTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("filepath.EvalSymlinks(t.TempDir()) failed: %v", err)
+	}
+	return dir
+}
+
+func TestCreateMountPointFile(t *testing.T) {
+	dir := realTempDir(t)
+
+	t.Run("missing file is created with mode 0644", func(t *testing.T) {
+		oldUmask := unix.Umask(0)
+		defer unix.Umask(oldUmask)
+
+		dst := filepath.Join(dir, "new")
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil {
+			t.Fatalf("os.Lstat(%q) failed: %v", dst, err)
+		}
+		if !fi.Mode().IsRegular() || fi.Size() != 0 || fi.Mode().Perm() != 0644 {
+			t.Errorf("lstat = (mode=%v, size=%d), want regular empty file with mode 0644", fi.Mode(), fi.Size())
+		}
+	})
+
+	t.Run("existing file is unchanged", func(t *testing.T) {
+		dst := filepath.Join(dir, "existing")
+		if err := os.WriteFile(dst, []byte("data"), 0444); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		if got, err := os.ReadFile(dst); err != nil || string(got) != "data" {
+			t.Errorf("os.ReadFile(%q) = %q, %v, want \"data\"", dst, got, err)
+		}
+	})
+
+	t.Run("existing unreadable file is unchanged", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0000 file mode")
+		}
+		dst := filepath.Join(dir, "unreadable")
+		if err := os.WriteFile(dst, nil, 0000); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil {
+			t.Fatalf("os.Lstat(%q) failed: %v", dst, err)
+		}
+		if !fi.Mode().IsRegular() || fi.Mode().Perm() != 0 {
+			t.Errorf("mode = %v, want regular file with mode 0000", fi.Mode())
+		}
+	})
+
+	t.Run("existing directory is unchanged", func(t *testing.T) {
+		dst := filepath.Join(dir, "existing-dir")
+		if err := os.Mkdir(dst, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", dst, err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		fi, err := os.Lstat(dst)
+		if err != nil || !fi.IsDir() {
+			t.Errorf("os.Lstat(%q) = (%v, %v), want directory", dst, fi, err)
+		}
+	})
+
+	t.Run("existing file in read-only directory succeeds", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0555 directory mode")
+		}
+		roDir := filepath.Join(dir, "ro-dir-existing")
+		if err := os.Mkdir(roDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", roDir, err)
+		}
+		existing := filepath.Join(roDir, "existing")
+		if err := os.WriteFile(existing, nil, 0644); err != nil {
+			t.Fatalf("os.WriteFile(%q) failed: %v", existing, err)
+		}
+		if err := os.Chmod(roDir, 0555); err != nil {
+			t.Fatalf("os.Chmod(%q, 0555) failed: %v", roDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0755) })
+
+		if err := CreateMountPointFile(existing); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", existing, err)
+		}
+	})
+
+	t.Run("missing file in read-only directory returns permission error", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses 0555 directory mode")
+		}
+		roDir := filepath.Join(dir, "ro-dir-missing")
+		if err := os.Mkdir(roDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", roDir, err)
+		}
+		if err := os.Chmod(roDir, 0555); err != nil {
+			t.Fatalf("os.Chmod(%q, 0555) failed: %v", roDir, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(roDir, 0755) })
+
+		missing := filepath.Join(roDir, "missing")
+		if err := CreateMountPointFile(missing); !errors.Is(err, os.ErrPermission) {
+			t.Errorf("CreateMountPointFile(%q) err = %v, want %v", missing, err, os.ErrPermission)
+		}
+	})
+
+	t.Run("missing parent returns error", func(t *testing.T) {
+		dst := filepath.Join(dir, "missing-parent", "dst")
+		if err := CreateMountPointFile(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("CreateMountPointFile(%q) err = %v, want %v", dst, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("dangling symlink target is not created", func(t *testing.T) {
+		target := filepath.Join(dir, "dangling-target")
+		dst := filepath.Join(dir, "dangling")
+		if err := os.Symlink(target, dst); err != nil {
+			t.Fatalf("os.Symlink() failed: %v", err)
+		}
+		if err := CreateMountPointFile(dst); err != nil {
+			t.Fatalf("CreateMountPointFile(%q) failed: %v", dst, err)
+		}
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Lstat(%q) err = %v, want %v", target, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("intermediate symlink is rejected", func(t *testing.T) {
+		realDir := filepath.Join(dir, "real-dir")
+		if err := os.Mkdir(realDir, 0755); err != nil {
+			t.Fatalf("os.Mkdir(%q) failed: %v", realDir, err)
+		}
+		linkDir := filepath.Join(dir, "link-dir")
+		if err := os.Symlink(realDir, linkDir); err != nil {
+			t.Fatalf("os.Symlink() failed: %v", err)
+		}
+		dst := filepath.Join(linkDir, "dst")
+		if err := CreateMountPointFile(dst); !errors.Is(err, unix.ELOOP) {
+			t.Fatalf("CreateMountPointFile(%q) err = %v, want %v", dst, err, unix.ELOOP)
+		}
+		target := filepath.Join(realDir, "dst")
+		if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("os.Lstat(%q) err = %v, want %v", target, err, os.ErrNotExist)
+		}
+	})
+
+	t.Run("existing FIFO does not block", func(t *testing.T) {
+		dst := filepath.Join(dir, "fifo")
+		if err := unix.Mkfifo(dst, 0600); err != nil {
+			t.Fatalf("unix.Mkfifo(%q) failed: %v", dst, err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- CreateMountPointFile(dst) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("CreateMountPointFile(%q) failed: %v", dst, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("CreateMountPointFile(%q) blocked on a FIFO", dst)
+		}
+	})
+}
+
+func TestSafeSetupAndMountDanglingSymlink(t *testing.T) {
+	dir := realTempDir(t)
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, nil, 0644); err != nil {
+		t.Fatalf("os.WriteFile(%q) failed: %v", src, err)
+	}
+	missing := filepath.Join(dir, "missing")
+	dst := filepath.Join(dir, "dst-dangling")
+	if err := os.Symlink(missing, dst); err != nil {
+		t.Fatalf("os.Symlink() failed: %v", err)
+	}
+	if err := SafeSetupAndMount(src, dst, "bind", unix.MS_BIND, ""); err == nil {
+		t.Errorf("SafeSetupAndMount(%q -> %q) unexpectedly succeeded", dst, missing)
+	} else if errors.Is(err, unix.ENOSYS) {
+		t.Fatalf("SafeSetupAndMount(%q -> %q) failed with ENOSYS: %v", dst, missing, err)
+	}
+	if _, err := os.Lstat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Lstat(%q) err = %v, want %v", missing, err, os.ErrNotExist)
 	}
 }

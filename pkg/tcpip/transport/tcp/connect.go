@@ -914,6 +914,9 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso sta
 
 	size := pkt.Data().Size()
 	hdrSize := header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen
+	if r.NetProto() == header.IPv6ProtocolNumber && tf.expOptVal != 0 {
+		hdrSize += header.IPv6ExperimentHdrLength
+	}
 	for i := 0; i < n; i++ {
 		packetSize := mss
 		if packetSize > size {
@@ -926,10 +929,6 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso sta
 		// packet already has the truncated data.
 		shouldSplitPacket := i != n-1
 		if shouldSplitPacket {
-			if r.NetProto() == header.IPv6ProtocolNumber && tf.expOptVal != 0 {
-				// Reserve extra bytes for the experiment option.
-				hdrSize += header.IPv6ExperimentHdrLength
-			}
 			splitPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: hdrSize,
 				Mark:               pkt.Mark,
@@ -1315,7 +1314,11 @@ func (e *Endpoint) handleSegmentsLocked() tcpip.Error {
 
 	// Send an ACK for all processed packets if needed.
 	if e.rcv.RcvNxt != e.snd.MaxSentAck {
-		e.snd.sendAck()
+		if !e.rcv.shouldDelayAck() {
+			e.snd.sendAck()
+		} else if !e.snd.ackTimer.enabled() {
+			e.snd.ackTimer.enable(delayedAckTimeout)
+		}
 	}
 
 	e.resetKeepaliveTimer(true /* receivedData */)

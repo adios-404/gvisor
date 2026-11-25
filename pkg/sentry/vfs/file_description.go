@@ -65,6 +65,8 @@ type FileDescription struct {
 	// asyncHandler handles O_ASYNC signal generation. It is set with the
 	// F_SETOWN or F_SETOWN_EX fcntls. For asyncHandler to be used, O_ASYNC must
 	// also be set by fcntl(2).
+	//
+	// +checklocks:flagsMu
 	asyncHandler FileAsync
 
 	epollMu epollMutex `state:"nosave"`
@@ -201,6 +203,10 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 
 		// Detach the set before taking any EpollInstance.interestMu:
 		// registering or deleting an interest takes interestMu before epollMu.
+		//
+		// Linux's eventpoll_release_file likewise drops file->f_lock before
+		// acquiring ep->mtx:
+		// https://github.com/torvalds/linux/blob/adc218676/fs/eventpoll.c#L1095-L1107
 		fd.epollMu.Lock()
 		epolls := fd.epolls
 		fd.epolls = nil
@@ -534,7 +540,13 @@ type FileDescriptionImpl interface {
 	// TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
 	TestPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, r lock.LockRange) (linux.Flock, error)
 
+	// RegisterFileAsyncHandler registers fd's handler for I/O notifications.
+	// The caller holds fd.flagsMu. On error, the implementation must leave
+	// the handler unregistered.
 	RegisterFileAsyncHandler(fd *FileDescription) error
+
+	// UnregisterFileAsyncHandler removes a successful registration.
+	// The caller holds fd.flagsMu.
 	UnregisterFileAsyncHandler(fd *FileDescription)
 }
 
@@ -1056,6 +1068,7 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) (FileAsy
 		fd.asyncHandler = newHandler()
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 {
 			if err := fd.impl.RegisterFileAsyncHandler(fd); err != nil {
+				fd.asyncHandler = nil
 				return nil, err
 			}
 		}
@@ -1111,7 +1124,7 @@ func (fd *FileDescription) GetFilePrivileges(ctx context.Context) (auth.FilePriv
 		}
 	}
 
-	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3})
+	fileCaps, err := fd.GetXattr(ctx, &GetXattrOptions{Name: linux.XATTR_SECURITY_CAPABILITY, Size: linux.XATTR_CAPS_SZ_3, RawCapability: true})
 	switch {
 	case linuxerr.Equals(linuxerr.ENODATA, err), linuxerr.Equals(linuxerr.EOPNOTSUPP, err):
 		return filePrivs, nil

@@ -1059,9 +1059,12 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 	// Find filesystem name and FS specific data field.
 	switch m.mount.Type {
 	case devpts.Name:
-		// /dev/ptmx is a symlink to pts/ptmx, so make ptmx usable by everyone, as
-		// container runtimes do. Linux and devpts default ptmxmode to 0000.
-		data = []string{"ptmxmode=0666"}
+		// Each container gets its own devpts instance, as with container
+		// runtimes, so that ptys and consoles of one container are not
+		// visible in other containers. /dev/ptmx is a symlink to pts/ptmx,
+		// so make ptmx usable by everyone, as container runtimes do. Linux
+		// and devpts default ptmxmode to 0000.
+		data = []string{"newinstance", "ptmxmode=0666"}
 
 	case dev.Name, devtmpfs.Name, cgroup2fs.Name:
 		// Nothing to do.
@@ -1275,9 +1278,10 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("/tmp"),
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse("/tmp"),
+		FollowFinalSymlink: true,
 	}
 	fd, err := c.l.k.VFS().OpenAt(ctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
 	switch {
@@ -1850,6 +1854,9 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 		}
 	}
 	if specutils.GPUFunctionalityRequestedViaHook(info.spec, info.conf) {
+		if info.nvproxyDevInfo == nil {
+			return fmt.Errorf("container requests GPU functionality via the NVIDIA hook, but nvproxy is not enabled in the sandbox")
+		}
 		// When using nvidia-container-runtime-hook, devices are not injected into
 		// spec.Linux.Devices. So manually create appropriate device files.
 		nvidiaDevs := []specs.LinuxDevice{
@@ -1924,19 +1931,18 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			}
 			log.Infof("Switching %v device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
-	} else if devSpec.Path == "/dev/nvidia-uvm" || devSpec.Path == "/dev/nvidia-uvm-tools" {
-		if info.nvproxyDevInfo.UVMDevMajor != 0 && major != info.nvproxyDevInfo.UVMDevMajor {
-			major = info.nvproxyDevInfo.UVMDevMajor
-			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
+	} else if nvInfo := info.nvproxyDevInfo; nvInfo != nil {
+		var nvMajor uint32
+		switch {
+		case devSpec.Path == "/dev/nvidia-uvm" || devSpec.Path == "/dev/nvidia-uvm-tools":
+			nvMajor = nvInfo.UVMDevMajor
+		case strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps/"):
+			nvMajor = nvInfo.CapsDevMajor
+		case strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/"):
+			nvMajor = nvInfo.CapsIMEXChannelsDevMajor
 		}
-	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps/") {
-		if info.nvproxyDevInfo.CapsDevMajor != 0 && major != info.nvproxyDevInfo.CapsDevMajor {
-			major = info.nvproxyDevInfo.CapsDevMajor
-			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
-		}
-	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
-		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
-			major = info.nvproxyDevInfo.CapsIMEXChannelsDevMajor
+		if nvMajor != 0 && major != nvMajor {
+			major = nvMajor
 			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
 	}
