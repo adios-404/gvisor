@@ -26,6 +26,7 @@ import (
 // See linux/magic.h.
 const (
 	ANON_INODE_FS_MAGIC   = 0x09041934
+	BTRFS_SUPER_MAGIC     = 0x9123683e
 	CGROUP_SUPER_MAGIC    = 0x27e0eb
 	CGROUP2_SUPER_MAGIC   = 0x63677270
 	DEVPTS_SUPER_MAGIC    = 0x00001cd1
@@ -41,6 +42,7 @@ const (
 	SYSFS_MAGIC           = 0x62656572
 	TMPFS_MAGIC           = 0x01021994
 	V9FS_MAGIC            = 0x01021997
+	XFS_SUPER_MAGIC       = 0x58465342
 )
 
 // Filesystem path limits, from uapi/linux/limits.h.
@@ -48,6 +50,10 @@ const (
 	NAME_MAX = 255
 	PATH_MAX = 4096
 )
+
+// FILESYSTEM_MAX_STACK_DEPTH is the maximum depth to which stacking
+// filesystems, such as overlayfs, may be stacked, from include/linux/fs.h.
+const FILESYSTEM_MAX_STACK_DEPTH = 2
 
 // The bit mask f_flags in struct statfs, from include/linux/statfs.h
 const (

@@ -27,7 +27,7 @@ import (
 	cgroupsstats "github.com/containerd/cgroups/v3/cgroup1/stats"
 	cgroupsv2stats "github.com/containerd/cgroups/v3/cgroup2/stats"
 	"github.com/containerd/console"
-	task "github.com/containerd/containerd/api/runtime/task/v2"
+	task "github.com/containerd/containerd/api/runtime/task/v3"
 	types "github.com/containerd/containerd/api/types"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -422,7 +422,6 @@ func (c *Container) Restore(ctx context.Context, r *extension.RestoreRequest) (e
 		return nil, err
 	}
 	// TODO: Set the cgroup and oom notifications on restore.
-	// https://github.com/google/gvisor-containerd-shim/issues/58
 	return p, nil
 }
 

@@ -252,6 +252,10 @@ const ContMgrCreateTraceSession = "containerManager.CreateTraceSession"
 type CreateTraceSessionArgs struct {
 	Config seccheck.SessionConfig
 	Force  bool
+	// SinkIndexes holds the index in Config.Sinks of the sink for each endpoint
+	// in FilePayload, in the same order. Sinks that have no endpoint have no
+	// entry.
+	SinkIndexes []int
 	urpc.FilePayload
 }
 
@@ -263,6 +267,15 @@ const ContMgrListTraceSessions = "containerManager.ListTraceSessions"
 
 // ContMgrProcfsDump dumps sandbox procfs state.
 const ContMgrProcfsDump = "containerManager.ProcfsDump"
+
+// ContMgrDrainDentryCache drains unused dentries for a container path.
+const ContMgrDrainDentryCache = "containerManager.DrainDentryCache"
+
+// DrainDentryCacheArgs identifies a filesystem in a container's init process view.
+type DrainDentryCacheArgs struct {
+	ContainerID string
+	Path        string
+}
 
 // ContMgrMount mounts a filesystem in a container.
 const ContMgrMount = "containerManager.Mount"

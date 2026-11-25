@@ -110,8 +110,9 @@ func WriteMounts(mountsFD int, mounts []specs.Mount) error {
 //     /proc/fs/root and prepare the bind-mounts there.
 //  3. With createContainer hooks, we instead prepare spec.Root.Path, execute
 //     the hooks, and then bind-mount the prepared root onto /proc/fs/root.
-//  4. We then pivot_root(2) into /proc/fs. Now host procfs is accessible via
-//     /proc/ and container rootfs is accessible via /root.
+//  4. We remount the tmpfs at /proc/fs as read-only, then pivot_root(2) into
+//     it. Now host procfs is accessible via /proc/ and container rootfs is
+//     accessible via /root.
 //  5. We re-exec the gofer binary and drop extra capabilities.
 //  6. We unmount the /proc bind mount.
 //  7. We chroot(2) into /root (note that the gofer runs with CAP_SYS_CHROOT).
@@ -277,6 +278,9 @@ func SetupRootFS(spec *specs.Spec, conf *config.Config, mountConfs []specutils.G
 	}
 
 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
+		if err := unix.Mount("", "/proc/fs", "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+			util.Fatalf("cannot remount /proc/fs as read-only: %v", err)
+		}
 		if err := PivotRoot("/proc/fs"); err != nil {
 			util.Fatalf("failed to change the root file system: %v", err)
 		}
@@ -332,11 +336,9 @@ func safeSetupAndMoveMount(srcFileFD int, src, dst, procPath string) error {
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := specutils.CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	fd, err := unix.Open(dst, unix.O_PATH|unix.O_CLOEXEC, 0)

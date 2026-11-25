@@ -24,6 +24,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/test/capabilitytest"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
 
@@ -781,10 +782,10 @@ func TestLoadPaths(t *testing.T) {
 			err:       "invalid cgroups file",
 		},
 		{
-			name:      "too-many-fields",
-			cgroups:   "0:ctr:/path:extra\n",
+			name:      "colons-in-path",
+			cgroups:   "0:cpu:/path:extra\n",
 			mountinfo: debianMountinfo,
-			err:       "invalid cgroups file",
+			want:      map[string]string{"cpu": "/path:extra"},
 		},
 		{
 			name: "multiple-malformed",
@@ -943,6 +944,10 @@ func TestOptional(t *testing.T) {
 		{
 			name:  "blkio",
 			ctrlr: &blockIO{},
+			extraValid: []*specs.LinuxResources{
+				{BlockIO: &specs.LinuxBlockIO{}},                     // Docker 29
+				{BlockIO: &specs.LinuxBlockIO{Weight: uint16Ptr(0)}}, // Docker <= 24
+			},
 			invalid: []struct {
 				name string
 				spec *specs.LinuxResources
@@ -1217,6 +1222,7 @@ func TestCreateController(t *testing.T) {
 	}
 	defer os.Chmod(readOnlyCtrlr, 0755)
 
+	capabilitytest.DropEffective(t, unix.CAP_DAC_OVERRIDE)
 	skip, err = createController(c, "readonly")
 	if !skip {
 		t.Errorf("createController() for read-only controller got skip = false, want true")

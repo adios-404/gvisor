@@ -45,6 +45,7 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/bits",
         "//pkg/buffer",
         "//pkg/gomaxprocs",
         "//pkg/rand",
@@ -67,6 +68,7 @@ go_test(
     size = "small",
     srcs = [
         "endpoint_test.go",
+        "mmap_test.go",
         "processors_test.go",
     ],
     embed = [":fdbased"],

@@ -97,6 +97,90 @@ func sendAndReceive(t *testing.T, dut testbench.DUT, conn testbench.TCPIPv4, num
 	return lastSent
 }
 
+// TestRACKTailProbeACK checks when an ACK establishes that a tail loss probe
+// repaired a loss (RFC 8985 section 7.4.2).
+func TestRACKTailProbeACK(t *testing.T) {
+	for _, tc := range []struct {
+		name                                       string
+		sameSequence, repeatAfterByte, dsack, loss bool
+	}{
+		{name: "DuplicateACK", sameSequence: true},
+		{name: "MatchingDSACK", dsack: true, repeatAfterByte: true},
+		{name: "NoDuplicate", loss: true},
+		{name: "UnrelatedDSACK", dsack: true, loss: true},
+		{name: "WindowUpdate", repeatAfterByte: true, loss: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dut, conn, fd, mss := createSACKConnection(t)
+			dut.SetSockOpt(t, fd, unix.IPPROTO_TCP, unix.TCP_CONGESTION, []byte("reno"))
+			sendAndReceive(t, dut, conn, numPktsForRTT, fd, mss, true /* sendACK */)
+
+			// Withhold ACKs for two segments. A retransmission of the second
+			// segment, rather than the first, identifies the tail loss probe.
+			sendAndReceive(t, dut, conn, 2, fd, mss, false /* sendACK */)
+			end := *conn.RemoteSeqNum(t)
+			start := end - seqnum.Value(mss)
+			if _, err := conn.ExpectData(t, &testbench.TCP{SeqNum: testbench.Uint32(uint32(start))}, &testbench.Payload{Bytes: make([]byte, mss)}, time.Second); err != nil {
+				t.Fatalf("did not receive tail probe: %v", err)
+			}
+			before := dut.GetSockOptTCPInfo(t, fd)
+
+			// Reading data carried by the advancing ACK proves the sender has
+			// processed this packet before TCP_INFO is sampled.
+			advance := func(ack seqnum.Value, options []byte) linux.TCPInfo {
+				conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagAck), AckNum: testbench.Uint32(uint32(ack)), Options: options}, &testbench.Payload{Bytes: []byte{'x'}})
+				if got := dut.Recv(t, fd, 1, 0); string(got) != "x" {
+					t.Fatalf("received %q, want byte carried by ACK", got)
+				}
+				return dut.GetSockOptTCPInfo(t, fd)
+			}
+			if tc.sameSequence {
+				// Neither ACK carries data, so their peer sequences, ACKs
+				// and advertised windows are identical.
+				ack := testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagAck), AckNum: testbench.Uint32(uint32(end))}
+				conn.Send(t, ack)
+				conn.Send(t, ack)
+			}
+			atEnd := advance(end, nil)
+			if atEnd.SndSsthresh != before.SndSsthresh {
+				t.Errorf("ACK at probe end cut ssthresh from %d to %d (cwnd %d to %d)", before.SndSsthresh, atEnd.SndSsthresh, before.SndCwnd, atEnd.SndCwnd)
+			}
+
+			var options []byte
+			if tc.dsack {
+				dsackEnd := end
+				if !tc.repeatAfterByte {
+					// A duplicate of the preceding segment says nothing about
+					// whether both copies of the probe segment arrived.
+					dsackEnd = start
+				}
+				opts := make([]byte, 12)
+				n := header.EncodeNOP(opts)
+				n += header.EncodeNOP(opts[n:])
+				n += header.EncodeSACKBlocks([]header.SACKBlock{{Start: dsackEnd - seqnum.Value(mss), End: dsackEnd}}, opts[n:])
+				options = opts[:n]
+			}
+			if tc.repeatAfterByte {
+				// The byte on the preceding ACK advances the peer sequence.
+				// Without a matching DSACK, this is a window update.
+				conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagAck), AckNum: testbench.Uint32(uint32(end)), Options: options})
+				options = nil
+			}
+			// Leave the second segment outstanding when the ACK for the first
+			// confirms or rules out loss of the probe.
+			sendAndReceive(t, dut, conn, 2, fd, mss, false /* sendACK */)
+			after := advance(end.Add(seqnum.Size(mss)), options)
+			t.Logf("probe cwnd/ssthresh: before=%d/%d end=%d/%d beyond=%d/%d", before.SndCwnd, before.SndSsthresh, atEnd.SndCwnd, atEnd.SndSsthresh, after.SndCwnd, after.SndSsthresh)
+			if got, want := after.CaState, uint8(linux.TCP_CA_Open); tc.loss && got != want {
+				t.Errorf("congestion state after probe repaired the loss = %d, want %d", got, want)
+			}
+			if got := after.SndSsthresh < before.SndSsthresh; got != tc.loss {
+				t.Errorf("ACK beyond probe: ssthresh changed from %d to %d, want reduction=%t", before.SndSsthresh, after.SndSsthresh, tc.loss)
+			}
+		})
+	}
+}
+
 // TestRACKTLPAllPacketsLost tests TLP when an entire flight of data is lost.
 func TestRACKTLPAllPacketsLost(t *testing.T) {
 	dut, conn, acceptFd, payloadSize := createSACKConnection(t)
@@ -160,6 +244,74 @@ func TestRACKTLPLost(t *testing.T) {
 	if diff < pto {
 		t.Fatalf("expected payload was received before the probe timeout, got: %v, want: %v", diff, pto)
 	}
+}
+
+func TestRACKFreshTimeoutRetransmission(t *testing.T) {
+	dut, conn, fd, mss := createSACKConnection(t)
+	sendAndReceive(t, dut, conn, numPktsForRTT, fd, mss, true /* sendACK */)
+	first := *conn.RemoteSeqNum(t)
+	sendAndReceive(t, dut, conn, 3, fd, mss, false /* sendACK */)
+	time.Sleep(simulatedRTT / 2)
+	sendAndReceive(t, dut, conn, 4, fd, mss, false /* sendACK */)
+
+	// Withhold all ACKs until the retransmission timeout repairs the first
+	// segment. A tail loss probe may have retransmitted the last one.
+	head := &testbench.TCP{SeqNum: testbench.Uint32(uint32(first))}
+	payload := &testbench.Payload{Bytes: make([]byte, mss)}
+	timeoutRepair, err := conn.ExpectData(t, head, payload, 3*time.Second)
+	if err != nil {
+		t.Fatalf("timeout retransmission: %v", err)
+	}
+	flow := timeoutRepair[2].(*testbench.TCP)
+	info := dut.GetSockOptTCPInfo(t, fd)
+	if info.CaState != linux.TCP_CA_Loss {
+		t.Fatalf("TCP state after head retransmission = %d, want Loss", info.CaState)
+	}
+
+	// Segments 4–6 were sent after segments 2 and 3, but before the repair
+	// of segment 1. They cannot establish that the repair was lost.
+	var opts [40]byte
+	n := header.EncodeSACKBlocks([]header.SACKBlock{{
+		Start: first.Add(seqnum.Size(3 * mss)),
+		End:   first.Add(seqnum.Size(6 * mss)),
+	}}, opts[:])
+	conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagAck), AckNum: testbench.Uint32(uint32(first)), Options: opts[:n]})
+	frames, repeatedHead := conn.ListenForFrame(t, testbench.Layers{nil, nil, head, payload}, time.Duration(info.RTO)*time.Microsecond/2)
+	if repeatedHead {
+		t.Fatal("SACK of later segments retransmitted the freshly repaired head")
+	}
+	// The sender need not repair both holes in this half-RTO window. It must
+	// send some data from segments 2–3 without replaying the rest of the flight.
+	lo := first.Add(seqnum.Size(mss))
+	hi := first.Add(seqnum.Size(3 * mss))
+	var repaired bool
+	for _, frame := range frames {
+		if len(frame) != 4 {
+			continue
+		}
+		tcp, ok := frame[2].(*testbench.TCP)
+		data, hasData := frame[3].(*testbench.Payload)
+		if !ok || !hasData || len(data.Bytes) == 0 || *tcp.SrcPort != *flow.SrcPort || *tcp.DstPort != *flow.DstPort {
+			continue
+		}
+		start := seqnum.Value(*tcp.SeqNum)
+		end := start.Add(seqnum.Size(len(data.Bytes)))
+		t.Logf("post-SACK repair: offset=%d length=%d MSS=%d", start-first, len(data.Bytes), mss)
+		if !start.InRange(lo, hi) || hi.LessThan(end) {
+			t.Fatalf("repair [%d, %d) outside the holes [%d, %d)", start, end, lo, hi)
+		}
+		repaired = true
+	}
+	if !repaired {
+		t.Fatal("no later hole was repaired after the SACK")
+	}
+
+	// We have now received the entire flight. Confirm that the connection
+	// delivers new data after recovery.
+	end := first.Add(seqnum.Size(7 * mss))
+	conn.Send(t, testbench.TCP{Flags: testbench.TCPFlags(header.TCPFlagAck), AckNum: testbench.Uint32(uint32(end))})
+	*conn.RemoteSeqNum(t) = end
+	sendAndReceive(t, dut, conn, 1, fd, mss, true /* sendACK */)
 }
 
 // TestRACKWithSACK tests that RACK marks the packets as lost after receiving

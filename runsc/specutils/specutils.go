@@ -73,6 +73,15 @@ const (
 	//	"dev.gvisor.tar.rootfs.upper.<container-name>": "<path>"
 	AnnotationRootfsUpperTar = "dev.gvisor.tar.rootfs.upper"
 
+	// AnnotationProductName sets the value shown in
+	// /sys/devices/virtual/dmi/id/product_name. It applies to the whole
+	// sandbox and is read from the spec that creates the sandbox. Without it,
+	// the host's value is shown.
+	//
+	// Usage:
+	//	"dev.gvisor.dmi.product-name": "<name>"
+	AnnotationProductName = "dev.gvisor.dmi.product-name"
+
 	// annotationSeccomp indicates what seccomp rules was set to a given container.
 	//
 	// Usage:
@@ -208,6 +217,10 @@ func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) e
 		if spec.Root.Readonly {
 			return fmt.Errorf("rootfs tar upper path is set but rootfs is readonly")
 		}
+	}
+
+	if _, err := ProductName(spec); err != nil {
+		return err
 	}
 
 	// CRI specifies whether a container should start a new sandbox, or run
@@ -379,9 +392,10 @@ func FixConfig(conf *config.Config, spec *specs.Spec) error {
 			}
 		}
 	}
-	// Override does not validate the config. Validate once after all
-	// annotations have been applied: annotations are iterated in random map
-	// order, so interdependent flags (e.g. qdisc=tbf and qdisc-tbf-rate) may
+	// ApplyBundles and Override do not validate the config. Validate once after
+	// all annotations have been applied: individual flag annotations may resolve
+	// conflicts introduced by bundles, and annotations are iterated in random
+	// map order, so interdependent flags (e.g. qdisc=tbf and qdisc-tbf-rate) may
 	// be applied in an order that is only valid once complete.
 	return conf.Validate()
 }
@@ -922,17 +936,49 @@ func SafeSetupAndMount(src, dst, typ string, flags uint32, procPath string) erro
 		if err := os.MkdirAll(parent, 0777); err != nil {
 			return fmt.Errorf("mkdir(%q) failed: %v", parent, err)
 		}
-		// Create the destination file if it does not exist.
-		f, err := os.OpenFile(dst, unix.O_CREAT, 0777)
-		if err != nil {
-			return fmt.Errorf("open(%q) failed: %v", dst, err)
+		if err := CreateMountPointFile(dst); err != nil {
+			return err
 		}
-		f.Close()
 	}
 
 	// Do the mount.
 	if err := SafeMount(src, dst, typ, uintptr(flags), "", procPath); err != nil {
-		return fmt.Errorf("mount(%q, %q, %d) failed: %v", src, dst, flags, err)
+		return fmt.Errorf("mount(%q, %q, %d) failed: %w", src, dst, flags, err)
+	}
+	return nil
+}
+
+// CreateMountPointFile creates an empty regular file at dst for a file mount
+// point. It does nothing if dst already exists, including as a symlink or
+// another file type: the caller must verify dst before it mounts on it. It
+// never follows symlinks in any path component of dst.
+func CreateMountPointFile(dst string) error {
+	how := &unix.OpenHow{
+		// O_CREAT|O_EXCL refuses to follow a symlink at the final path component
+		// and returns EEXIST for any existing path without opening it.
+		// RESOLVE_NO_SYMLINKS also rejects symlinks in parent components.
+		Flags:   unix.O_RDONLY | unix.O_CREAT | unix.O_EXCL | unix.O_NOFOLLOW | unix.O_NOCTTY | unix.O_CLOEXEC,
+		Mode:    0644,
+		Resolve: unix.RESOLVE_NO_SYMLINKS,
+	}
+	var (
+		fd  int
+		err error
+	)
+	for {
+		fd, err = unix.Openat2(unix.AT_FDCWD, dst, how)
+		if err != unix.EINTR {
+			break
+		}
+	}
+	if err != nil {
+		if err == unix.EEXIST {
+			return nil
+		}
+		return fmt.Errorf("creating mount point %q: %w", dst, err)
+	}
+	if err := unix.Close(fd); err != nil {
+		return fmt.Errorf("closing mount point %q: %w", dst, err)
 	}
 	return nil
 }
@@ -1092,6 +1138,29 @@ func RootfsTarUpperPath(spec *specs.Spec) string {
 	return spec.Annotations[AnnotationRootfsUpperTar]
 }
 
+// ProductName returns the value of the AnnotationProductName annotation, or
+// "" if the spec doesn't set it.
+func ProductName(spec *specs.Spec) (string, error) {
+	if spec == nil {
+		return "", nil
+	}
+	name, ok := spec.Annotations[AnnotationProductName]
+	if !ok {
+		return "", nil
+	}
+	// Linux reports an SMBIOS string of only spaces as empty
+	// (dmi_string_nosave), and sysfs has no DMI directory without a product
+	// name, so such a value cannot be shown.
+	if strings.Trim(name, " ") == "" {
+		return "", fmt.Errorf("annotation %s must not be empty", AnnotationProductName)
+	}
+	// SMBIOS strings are NUL-terminated.
+	if strings.ContainsRune(name, 0) {
+		return "", fmt.Errorf("annotation %s must not contain a NUL byte", AnnotationProductName)
+	}
+	return name, nil
+}
+
 // IsProcFDPath returns true if the path is a numeric procfs/devfd magic link
 // (e.g. /proc/self/fd/3, /proc/thread-self/fd/4, /dev/fd/5).
 func IsProcFDPath(path string) bool {
@@ -1184,6 +1253,7 @@ func Features() *features.Features {
 		// LINT.IfChange
 		annotations["dev.gvisor.container-name-remap."] = ""
 		annotations[AnnotationRootfsUpperTar] = ""
+		annotations[AnnotationProductName] = ""
 		annotations["dev.gvisor.internal.seccomp."] = ""
 		annotations["dev.gvisor.internal.seccomp.cont"] = "RuntimeDefault"
 		annotations[AnnotationTPU] = ""

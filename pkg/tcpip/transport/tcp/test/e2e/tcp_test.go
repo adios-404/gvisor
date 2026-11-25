@@ -383,11 +383,11 @@ func TestConnectICMPError(t *testing.T) {
 	defer syn.Release()
 	checker.IPv4(t, syn, checker.TCP(checker.TCPFlags(header.TCPFlagSyn)))
 
-	wep := ep.(interface {
-		LastErrorLocked() tcpip.Error
-	})
-
-	if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, wep.LastErrorLocked()); d != "" {
+	tcpEP := ep.(*tcp.Endpoint)
+	tcpEP.LockUser()
+	softError := tcpEP.LastErrorLocked()
+	tcpEP.UnlockUser()
+	if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, softError); d != "" {
 		t.Errorf("ep.LastErrorLocked() mismatch (-want +got):\n%s", d)
 	}
 
@@ -489,6 +489,30 @@ func TestCloseWithoutConnect(t *testing.T) {
 
 	if got := c.Stack().Stats().TCP.CurrentConnected.Value(); got != 0 {
 		t.Errorf("got stats.TCP.CurrentConnected.Value() = %d, want = 0", got)
+	}
+}
+
+func BenchmarkWildcardBindClose(b *testing.B) {
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	})
+	defer func() {
+		s.Close()
+		s.Wait()
+	}()
+	var wq waiter.Queue
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ep, err := s.NewEndpoint(tcp.ProtocolNumber, ipv6.ProtocolNumber, &wq)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := ep.Bind(tcpip.FullAddress{Port: 1234}); err != nil {
+			b.Fatal(err)
+		}
+		ep.Close()
 	}
 }
 
@@ -3209,20 +3233,38 @@ func TestSimpleSend(t *testing.T) {
 }
 
 func TestZeroWindowSend(t *testing.T) {
-	c := context.New(t, e2e.DefaultMTU)
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: e2e.DefaultMTU, Clock: clock})
 	defer c.Cleanup()
 
 	c.CreateConnected(context.TestInitialSequenceNumber, 0 /* rcvWnd */, -1 /* epRcvBuf */)
 
 	data := []byte{1, 2, 3}
-	var r bytes.Reader
-	r.Reset(data)
-	if _, err := c.EP.Write(&r, tcpip.WriteOptions{}); err != nil {
-		t.Fatalf("Write failed: %s", err)
+	write := func(p []byte) {
+		t.Helper()
+		if _, err := c.EP.Write(bytes.NewReader(p), tcpip.WriteOptions{}); err != nil {
+			t.Fatalf("Write failed: %s", err)
+		}
 	}
+	var info tcpip.TCPInfoOption
+	if err := c.EP.GetSockOpt(&info); err != nil {
+		t.Fatalf("GetSockOpt(TCPInfoOption): %s", err)
+	}
+	write(data[:1])
+	clock.Advance(info.RTO / 2)
+	write(data[1:])
 
-	// Check if we got a zero-window probe.
-	b := c.GetPacket()
+	// The second write must not move the first probe's deadline.
+	clock.Advance(info.RTO - info.RTO/2 - time.Nanosecond)
+	if b := c.GetPacketNonBlocking(); b != nil {
+		b.Release()
+		t.Fatal("zero-window probe before the original deadline")
+	}
+	clock.Advance(time.Nanosecond)
+	b := c.GetPacketNonBlocking()
+	if b == nil {
+		t.Fatal("no zero-window probe at the original deadline")
+	}
 	defer b.Release()
 	iss := seqnum.Value(context.TestInitialSequenceNumber).Add(1)
 	checker.IPv4(t, b,
@@ -7207,6 +7249,12 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 	}
 	checker.IPv4(t, b, checker.TCP(tcpCheckers...))
 
+	// Register for the accept notification before completing the
+	// handshake, so that the notification can't be missed.
+	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	c.WQ.EventRegister(&we)
+	defer c.WQ.EventUnregister(&we)
+
 	// Now complete the previous connection.
 	// Send ACK.
 	c.SendPacket(nil, &context.Headers{
@@ -7219,9 +7267,6 @@ func TestListenSynRcvdQueueFull(t *testing.T) {
 	})
 
 	// Verify if that is delivered to the accept queue.
-	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
-	c.WQ.EventRegister(&we)
-	defer c.WQ.EventUnregister(&we)
 	<-ch
 
 	// Now execute send one more SYN. The stack should not respond as the backlog
@@ -9743,11 +9788,13 @@ func TestTimestampSynCookies(t *testing.T) {
 		AckNum:  c.IRS + 1,
 		TCPOpts: tcpOpts[:],
 	})
-	c.EP, _, err = ep.Accept(nil)
-	// Try to accept the connection.
+	// Register before trying to accept, so that a connection that becomes
+	// ready after the attempt still wakes the wait below.
 	we, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
 	wq.EventRegister(&we)
 	defer wq.EventUnregister(&we)
+	// Try to accept the connection.
+	c.EP, _, err = ep.Accept(nil)
 	if cmp.Equal(&tcpip.ErrWouldBlock{}, err) {
 		// Wait for connection to be established.
 		select {

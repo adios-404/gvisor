@@ -20,10 +20,12 @@ import (
 	"io"
 	"path"
 	"strconv"
+	"strings"
 	gtime "time"
 
 	"golang.org/x/sys/unix"
 
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/fd"
@@ -96,7 +98,6 @@ func (c *controller) registerHandlers() {
 	c.srv.Register(&control.Lifecycle{Kernel: l.k})
 	c.srv.Register(&control.Logging{})
 	c.srv.Register(&control.Proc{Kernel: l.k})
-	c.srv.Register(&control.State{Kernel: l.k})
 	c.srv.Register(&control.Usage{Kernel: l.k})
 	c.srv.Register(&control.Metrics{})
 	c.srv.Register(&debug{})
@@ -776,14 +777,19 @@ func (cm *containerManager) Signal(args *sentryapi.SignalArgs, _ *struct{}) erro
 // CreateTraceSession creates a new trace session.
 func (cm *containerManager) CreateTraceSession(args *sentryapi.CreateTraceSessionArgs, _ *struct{}) error {
 	log.Debugf("containerManager.CreateTraceSession: config: %+v", args.Config)
+	if len(args.SinkIndexes) != len(args.Files) {
+		return fmt.Errorf("got %d sink indexes for %d sink endpoints", len(args.SinkIndexes), len(args.Files))
+	}
 	for i, sinkFile := range args.Files {
-		if sinkFile != nil {
-			fd, err := fd.NewFromFile(sinkFile)
-			if err != nil {
-				return err
-			}
-			args.Config.Sinks[i].FD = fd
+		sinkIdx := args.SinkIndexes[i]
+		if sinkIdx < 0 || sinkIdx >= len(args.Config.Sinks) {
+			return fmt.Errorf("sink index %d of endpoint %d is out of range, session has %d sinks", sinkIdx, i, len(args.Config.Sinks))
 		}
+		fd, err := fd.NewFromFile(sinkFile)
+		if err != nil {
+			return err
+		}
+		args.Config.Sinks[sinkIdx].FD = fd
 	}
 	return seccheck.Create(&args.Config, args.Force)
 }
@@ -822,6 +828,40 @@ func (cm *containerManager) ProcfsDump(_ *struct{}, out *[]procfs.ProcessProcfsD
 		*out = append(*out, procDump)
 	}
 	return nil
+}
+
+// DrainDentryCache drains unused dentries without changing cache policy or
+// pausing guest tasks.
+func (cm *containerManager) DrainDentryCache(args *sentryapi.DrainDentryCacheArgs, _ *struct{}) error {
+	if !path.IsAbs(args.Path) || strings.ContainsRune(args.Path, 0) || len(args.Path) >= linux.PATH_MAX {
+		return fmt.Errorf("a valid absolute path shorter than PATH_MAX must be provided")
+	}
+	cm.l.mu.Lock()
+	defer cm.l.mu.Unlock()
+	ep, ok := cm.l.processes[execID{cid: args.ContainerID}]
+	if !ok {
+		return fmt.Errorf("container %q is deleted", args.ContainerID)
+	}
+	if ep.tg == nil {
+		return fmt.Errorf("container %q isn't started", args.ContainerID)
+	}
+	t := ep.tg.Leader()
+	if t == nil {
+		return fmt.Errorf("container %q has no init process", args.ContainerID)
+	}
+	ctx := t.AsyncContext()
+	root := t.FSContext().RootDirectory()
+	if !root.Ok() {
+		return fmt.Errorf("container %q init process has exited", args.ContainerID)
+	}
+	defer root.DecRef(ctx)
+	pop := vfs.PathOperation{
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse(args.Path),
+		FollowFinalSymlink: true,
+	}
+	return t.Kernel().VFS().DrainDentryCache(ctx, t.Credentials(), &pop)
 }
 
 const initTID kernel.ThreadID = 1
@@ -892,11 +932,12 @@ func (cm *containerManager) Mount(args *sentryapi.MountArgs, _ *struct{}) error 
 		Path:  fspath.Parse(dest),
 	}
 
+	// EROFS consumes the image FD even if mounting fails.
+	cu.Release()
 	if _, err := t.Kernel().VFS().MountAt(ctx, t.Credentials(), source, &pop, fstype, &opts); err != nil {
 		return err
 	}
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q, in container %q", source, dest, fstype, opts.GetFilesystemOptions.Data, args.ContainerID)
-	cu.Release()
 	return nil
 }
 

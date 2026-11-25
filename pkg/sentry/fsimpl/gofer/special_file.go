@@ -92,18 +92,14 @@ type specialFileFD struct {
 func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32, creds *auth.Credentials) (*specialFileFD, error) {
 	ftype := d.inode.fileType()
 	seekable := ftype == linux.S_IFREG || ftype == linux.S_IFCHR || ftype == linux.S_IFBLK
-	haveQueue := (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK || ftype == linux.S_IFCHR) && h.fd >= 0
 	fd := &specialFileFD{
 		handle:        h,
 		isRegularFile: ftype == linux.S_IFREG,
 		seekable:      seekable,
-		haveQueue:     haveQueue,
 	}
 	fd.LockFD.Init(&d.inode.locks)
-	if haveQueue {
-		if err := fdnotifier.AddFD(h.fd, &fd.queue); err != nil {
-			return nil, err
-		}
+	if err := fd.initWaitQueue(ftype); err != nil {
+		return nil, err
 	}
 	if err := fd.vfsfd.Init(fd, flags, creds, mnt, &d.vfsd, &vfs.FileDescriptionOptions{
 		AllowDirectIO: true,
@@ -111,7 +107,7 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32, creds *
 		DenyPWrite:    !seekable,
 		SpecialFile:   linux.FileMode(ftype).IsSpecialFile(),
 	}); err != nil {
-		if haveQueue {
+		if fd.haveQueue {
 			fdnotifier.RemoveFD(h.fd)
 		}
 		return nil, err
@@ -129,6 +125,22 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, flags uint32, creds *
 		fsmetric.GoferOpens9P.Increment()
 	}
 	return fd, nil
+}
+
+// initWaitQueue attaches the file's waiters to its host descriptor on open
+// and on restore. A restored queue may already contain epoll registrations.
+func (fd *specialFileFD) initWaitQueue(ftype uint32) error {
+	if fd.handle.fd < 0 {
+		return nil
+	}
+	switch ftype {
+	case linux.S_IFIFO, linux.S_IFSOCK, linux.S_IFCHR:
+		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
+			return err
+		}
+		fd.haveQueue = true
+	}
+	return nil
 }
 
 // Release implements vfs.FileDescriptionImpl.Release.
@@ -301,6 +313,13 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	// TODO(gvisor.dev/issue/2601): Support select pwritev2 flags.
 	if opts.Flags&^linux.RWF_HIPRI != 0 {
 		return 0, offset, linuxerr.EOPNOTSUPP
+	}
+
+	// As in Linux, a write of no bytes changes nothing, including the file
+	// offset when O_APPEND is set, and the file size. Compare Linux's
+	// fs/read_write.c:generic_write_checks_count().
+	if src.NumBytes() == 0 {
+		return 0, offset, nil
 	}
 
 	d := fd.dentry()

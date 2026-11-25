@@ -90,10 +90,13 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 		return 0, linuxerr.EINVAL
 	}
 
+	// Like Linux, fail unsupported methods and mandatory attributes with
+	// EPROTONOSUPPORT, which rdma-core and its users treat as "not supported
+	// by this kernel" and fall back from; see MethodSchema.WriteFallback.
 	schema := lookupSchema(hdr.ObjectID, hdr.MethodID)
 	if schema == nil {
 		log.Warningf("rdmaproxy: unsupported ioctl object=%d method=%d", hdr.ObjectID, hdr.MethodID)
-		return 0, linuxerr.EINVAL
+		return 0, linuxerr.EPROTONOSUPPORT
 	}
 
 	attrsAddr := argPtr + hostarch.Addr(ib.SizeofUverbsIoctlHdr)
@@ -113,8 +116,11 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	for i := range attrs {
 		a := &attrs[i]
 		typ, ok := schema.Attrs[a.AttrID]
-		if !ok {
+		if !ok || typ == AttrUnsupported {
 			log.Warningf("rdmaproxy: unsupported attr id=%#x on object=%d method=%d", a.AttrID, hdr.ObjectID, hdr.MethodID)
+			if a.Flags&ib.UVERBS_ATTR_F_MANDATORY != 0 && !schema.WriteFallback {
+				return 0, linuxerr.EPROTONOSUPPORT
+			}
 			return 0, linuxerr.EINVAL
 		}
 
@@ -190,7 +196,7 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 			}
 			// data_s64; negative means "no fd", forwarded unchanged.
 			if int64(a.Data) >= 0 {
-				hostFD, file, err := fd.translateHostBackedFD(t, int32(a.Data))
+				hostFD, file, err := fd.translateDMABufFD(t, int32(a.Data))
 				if err != nil {
 					return 0, err
 				}
@@ -198,10 +204,6 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 				xlats = append(xlats, xlat{attr: a, orig: a.Data})
 				a.Data = uint64(uint32(hostFD))
 			}
-
-		case AttrUnsupported:
-			log.Warningf("rdmaproxy: unsupported attr id=%#x on object=%d method=%d", a.AttrID, hdr.ObjectID, hdr.MethodID)
-			return 0, linuxerr.EINVAL
 
 		default:
 			log.Warningf("rdmaproxy: unsupported attr type %d for id=%#x on object=%d method=%d", typ, a.AttrID, hdr.ObjectID, hdr.MethodID)
@@ -231,7 +233,6 @@ func (fd *uverbsFD) handleRDMAVerbsIoctl(t *kernel.Task, argPtr hostarch.Addr) (
 	case DmaMRRegDMABuf:
 		fdRelease, err := fd.prepareDMABufFD(t, attrs, &xlats)
 		if err != nil {
-			log.Warningf("rdmaproxy: REG_DMABUF_MR fd translation: %v", err)
 			return 0, err
 		}
 		defer fdRelease()
@@ -462,7 +463,7 @@ func (fd *uverbsFD) copyInPtr(t *kernel.Task, guestPtr uint64, length uint16) ([
 // is no longer needed.
 func (fd *uverbsFD) translateInputFD(t *kernel.Task, appFD int32) (int, *vfs.FileDescription, error) {
 	if appFD < 0 {
-		return 0, nil, linuxerr.EINVAL
+		return 0, nil, linuxerr.EBADF
 	}
 	file := t.GetFile(appFD)
 	if file == nil {
@@ -477,25 +478,25 @@ func (fd *uverbsFD) translateInputFD(t *kernel.Task, appFD int32) (int, *vfs.Fil
 	return int(afd.hostFD), file, nil
 }
 
-// translateHostBackedFD resolves an app fd backed by a host fd (e.g. an
-// nvproxy dma-buf export) to its host fd via vfs.HostFDProvider. The caller
-// takes a ref on the returned file, which must be released once the host fd is
-// no longer needed.
-func (fd *uverbsFD) translateHostBackedFD(t *kernel.Task, appFD int32) (int, *vfs.FileDescription, error) {
+// translateDMABufFD resolves an app fd wrapping a host dma-buf (e.g. an nvproxy
+// dma-buf export) to its host fd via vfs.DMABufProvider. The caller takes a ref
+// on the returned file, which must be released once the host fd is no longer
+// needed.
+func (fd *uverbsFD) translateDMABufFD(t *kernel.Task, appFD int32) (int, *vfs.FileDescription, error) {
 	if appFD < 0 {
-		return 0, nil, linuxerr.EINVAL
+		return 0, nil, linuxerr.EBADF
 	}
 	file := t.GetFile(appFD)
 	if file == nil {
 		return 0, nil, linuxerr.EBADF
 	}
-	hp, ok := file.Impl().(vfs.HostFDProvider)
+	dp, ok := file.Impl().(vfs.DMABufProvider)
 	if !ok {
-		log.Warningf("rdmaproxy: unsupported fd=%d type %T (not a vfs.HostFDProvider)", appFD, file.Impl())
+		log.Warningf("rdmaproxy: unsupported fd=%d type %T (not a dma-buf)", appFD, file.Impl())
 		file.DecRef(t)
 		return 0, nil, linuxerr.EINVAL
 	}
-	return hp.HostFD(), file, nil
+	return dp.DMABufHostFD(), file, nil
 }
 
 // findAttr returns the attribute with the given id, or nil.
@@ -568,7 +569,7 @@ func (fd *uverbsFD) prepareDMABufFD(t *kernel.Task, attrs []ib.UverbsAttr, xlats
 	if a == nil {
 		return nil, linuxerr.EINVAL
 	}
-	hostFD, file, err := fd.translateHostBackedFD(t, int32(a.Data))
+	hostFD, file, err := fd.translateDMABufFD(t, int32(a.Data))
 	if err != nil {
 		return nil, err
 	}

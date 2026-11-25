@@ -513,8 +513,8 @@ const (
 	// PacketHost indicates a packet addressed to the local host.
 	PacketHost PacketType = iota
 
-	// PacketOtherHost indicates an outgoing packet addressed to
-	// another host caught by a NIC in promiscuous mode.
+	// PacketOtherHost indicates an incoming frame addressed to another
+	// host's link address.
 	PacketOtherHost
 
 	// PacketOutgoing for a packet originating from the local host
@@ -1172,6 +1172,17 @@ func (*TCPAvailableCongestionControlOption) isGettableTransportProtocolOption() 
 
 func (*TCPAvailableCongestionControlOption) isSettableTransportProtocolOption() {}
 
+// TCPDelayedACKEnabled enables delayed ACKs for TCP. It is enabled by
+// default.
+//
+// TODO: Remove this option and TCPStats.DelayedACKs once delayed ACKs have
+// run in production without issues.
+type TCPDelayedACKEnabled bool
+
+func (*TCPDelayedACKEnabled) isGettableTransportProtocolOption() {}
+
+func (*TCPDelayedACKEnabled) isSettableTransportProtocolOption() {}
+
 // TCPModerateReceiveBufferOption enables/disables receive buffer moderation
 // for TCP.
 type TCPModerateReceiveBufferOption bool
@@ -1288,12 +1299,21 @@ type TCPInfoOption struct {
 	// SndMss is the maximum TCP payload size, in bytes.
 	SndMss uint32
 
+	// TotalRetrans is the lifetime number of retransmitted TCP segments.
+	TotalRetrans uint32
+
 	// SndSsthresh is the threshold between slow start and congestion
 	// avoidance.
 	SndSsthresh uint32
 
 	// ReorderSeen indicates if reordering is seen in the endpoint.
 	ReorderSeen bool
+
+	// Timestamps is true if TCP timestamps were negotiated.
+	Timestamps bool
+
+	// SACKPermitted is true if selective acknowledgments were negotiated.
+	SACKPermitted bool
 }
 
 func (*TCPInfoOption) isGettableSocketOption() {}
@@ -2303,6 +2323,9 @@ type TCPStats struct {
 
 	// SpuriousRTORecovery is the number of spurious RTOs.
 	SpuriousRTORecovery *StatCounter
+
+	// DelayedACKs is the number of ACKs sent by the delayed ACK timer.
+	DelayedACKs *StatCounter
 
 	// ForwardMaxInFlightDrop is the number of connection requests that are
 	// dropped due to exceeding the maximum number of in-flight connection

@@ -53,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/genericproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
@@ -234,6 +235,9 @@ type Loader struct {
 	// the sandbox, right before the result is reported to the controller (and
 	// thus before `runsc start` returns).
 	PostStartCallback func()
+
+	// procSelfFD is Args.ProcSelfFD.
+	procSelfFD int
 
 	// restoreDone is used to wait for restore to complete. Note that this may be
 	// much after the sandbox has started because under some configurations, the
@@ -507,6 +511,9 @@ type Args struct {
 	PassFDs []sentryapi.FDMapping
 	// ExecFD is the host file descriptor used for program execution.
 	ExecFD int
+	// ProcSelfFD is a directory FD to procfs' self/fd. Required with directfs,
+	// -1 otherwise. It must stay open for the lifetime of the sandbox.
+	ProcSelfFD int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int
@@ -797,6 +804,13 @@ func New(args Args) (*Loader, error) {
 	if args.ExecFD >= 0 {
 		l.root.execFD = fd.New(args.ExecFD)
 	}
+	if args.Conf.DirectFS {
+		if args.ProcSelfFD < 0 {
+			return nil, fmt.Errorf("directfs requires ProcSelfFD")
+		}
+		gofer.SetProcSelfFD(args.ProcSelfFD)
+	}
+	l.procSelfFD = args.ProcSelfFD
 
 	for _, customFD := range args.PassFDs {
 		l.root.passFDs = append(l.root.passFDs, fdMapping{
@@ -859,7 +873,7 @@ func New(args Args) (*Loader, error) {
 
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
-	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamsFileRange())
 	tk.SetClocks(time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(args.Spec, args.Conf)), params)
 	args.StartupTimer.Reached("timekeeper configured")
 
@@ -1072,6 +1086,14 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 			l.hostinetPortRange = nil
 		}
 		return nil
+	}
+
+	if eps, ok := s.(*netstack.Stack); ok {
+		// A stack restored from a checkpoint has the setting it was saved
+		// with.
+		if err := setTCPDelayedACK(eps.Stack, l.root.conf.TCPDelayedACK); err != nil {
+			return err
+		}
 	}
 
 	if l.networkArgs == nil {
@@ -1344,11 +1366,16 @@ func (l *Loader) installSeccompFilters() error {
 				return fmt.Errorf("NVIDIA capabilities: %w", err)
 			}
 		}
+		hostFS := filter.HostFSNone
+		if l.root.conf.DirectFS {
+			hostFS = filter.HostFSReadWrite
+		}
 		opts := filter.Options{
 			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
-			HostFilesystem:        l.root.conf.DirectFS,
+			HostFS:                hostFS,
+			ProcSelfFD:            uint32(l.procSelfFD),
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,
@@ -1805,6 +1832,14 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
+	if ttyFile != nil {
+		if exposed, err := fdimport.ExposeConsole(ctx, info.procArgs.MountNamespace, info.procArgs.FDTable, ttyFile); err != nil {
+			log.Warningf("Console is not exposed in devpts: %v", err)
+		} else {
+			ttyFile = exposed
+		}
+	}
+
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(info.procArgs)
 	if err != nil {
@@ -1814,14 +1849,14 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	info.procArgs.FDTable.DecRef(ctx)
 
 	// Install seccomp filters with the new task if there are any.
-	program, err := buildOCISeccompProgram(info.conf, info.spec)
+	filter, err := buildOCISeccompFilter(info.conf, info.spec)
 	if err != nil {
 		return nil, nil, err
 	}
-	if program != nil {
+	if filter != nil {
 		task := tg.Leader()
 		// NOTE: It seems Flags are ignored by runc so we ignore them too.
-		if err := task.AppendSyscallFilter(*program, true); err != nil {
+		if err := task.AppendSyscallFilter(*filter, true); err != nil {
 			return nil, nil, fmt.Errorf("appending seccomp filters: %w", err)
 		}
 		info.procArgs.StartupTimeline.Reached("OCI seccomp filters applied")
@@ -1989,11 +2024,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
 
-	seccompProgram, err := buildOCISeccompProgram(l.root.conf, spec)
+	seccompFilter, err := buildOCISeccompFilter(l.root.conf, spec)
 	if err != nil {
 		return 0, err
 	}
-	args.SeccompProgram = seccompProgram
+	args.SeccompFilter = seccompFilter
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
@@ -2182,16 +2217,17 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 		if conf.EnableRaw && !specutils.HasCapabilities(capability.CAP_NET_RAW) {
 			return nil, fmt.Errorf("configuring network=host with raw sockets requires CAP_NET_RAW capability")
 		}
-		// No network namespacing support for hostinet yet, hence creator is nil.
-		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
+		// The root namespace is backed by the host network stack. A child
+		// network namespace (unshare(CLONE_NEWNET)) cannot share it, and with a
+		// nil creator it gets no stack at all: no loopback device and
+		// EAFNOSUPPORT from socket(AF_INET). Give children the same
+		// loopback-only netstack that network=none uses instead: a working
+		// 127.0.0.1, and no device that reaches the host network.
+		creator := newSandboxNetstackCreator(conf, clock, uid)
+		return inet.NewRootNamespace(hostinet.NewStack(), creator, userns), nil
 
 	case config.NetworkNone, config.NetworkSandbox:
-		creator := &sandboxNetstackCreator{
-			clock:                    clock,
-			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
-			allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
-			uid:                      uid,
-		}
+		creator := newSandboxNetstackCreator(conf, clock, uid)
 		s, err := creator.newEmptySandboxNetworkStack()
 		if err != nil {
 			return nil, err
@@ -2259,21 +2295,75 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		}
 	}
 
+	if err := setTCPDelayedACK(s.Stack, c.tcpDelayedACK); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 
-// sandboxNetstackCreator implements kernel.NetworkStackCreator.
+// setTCPDelayedACK sets tcpip.TCPDelayedACKEnabled on s.
+func setTCPDelayedACK(s *stack.Stack, mode config.TCPDelayedACK) error {
+	opt := tcpip.TCPDelayedACKEnabled(mode == config.TCPDelayedACKEnabled)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		return fmt.Errorf("SetTransportProtocolOption(%d, &%T(%t)): %s", tcp.ProtocolNumber, opt, opt, err)
+	}
+	return nil
+}
+
+// sandboxNetstackCreator implements inet.NetworkStackCreator and
+// inet.RestoreNetworkStackCreator.
 //
 // +stateify savable
 type sandboxNetstackCreator struct {
 	clock                    tcpip.Clock
 	allowPacketEndpointWrite bool
 	allowLiveTCPMigration    bool
+	tcpDelayedACK            config.TCPDelayedACK
 	uid                      uniqueid.Provider
 }
 
-// CreateStack implements kernel.NetworkStackCreator.CreateStack.
+var _ inet.RestoreNetworkStackCreator = (*sandboxNetstackCreator)(nil)
+
+func newSandboxNetstackCreator(conf *config.Config, clock tcpip.Clock, uid uniqueid.Provider) *sandboxNetstackCreator {
+	return &sandboxNetstackCreator{
+		clock:                    clock,
+		allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
+		allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
+		tcpDelayedACK:            conf.TCPDelayedACK,
+		uid:                      uid,
+	}
+}
+
+// CreateStack implements inet.NetworkStackCreator.CreateStack.
+//
+// Like Linux, it creates the loopback interface administratively DOWN and with
+// no addresses. The application brings it up with RTM_NEWLINK (IFF_UP), at
+// which point netstack assigns the default loopback addresses, just as the
+// Linux kernel does. The initial network namespace is configured separately in
+// Network.CreateLinksAndRoutes and keeps its addresses and UP state.
+//
+// TODO(gvisor.dev/issue/15559): Support SIOCSIFFLAGS. Until then, applications
+// that bring the loopback interface up with ioctl(2), such as nsjail, fail.
 func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
+	return c.createStack(false /* loopbackUp */)
+}
+
+// CreateStackForRestore implements
+// inet.RestoreNetworkStackCreator.CreateStackForRestore.
+//
+// TODO(gvisor.dev/issue/4595): Restore non-root network namespaces from their
+// saved state. Until then, the loopback interface of a restored namespace is
+// UP and has the default loopback addresses, which is the state that
+// applications usually leave it in.
+func (c *sandboxNetstackCreator) CreateStackForRestore() (inet.Stack, error) {
+	return c.createStack(true /* loopbackUp */)
+}
+
+// createStack creates a network stack with a loopback interface. If loopbackUp
+// is true, the loopback interface is UP and has the default loopback
+// addresses. Otherwise, it is DOWN and has no addresses.
+func (c *sandboxNetstackCreator) createStack(loopbackUp bool) (inet.Stack, error) {
 	s, err := c.newEmptySandboxNetworkStack()
 	if err != nil {
 		return nil, err
@@ -2286,13 +2376,18 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
 	}
 	link := sentryapi.DefaultLoopbackLink
-	linkEP := ethernet.New(loopback.New())
+	linkEP := ethernet.NewWithNetworkMTU(loopback.New())
 	opts := stack.NICOptions{
 		Name:               link.Name,
 		DeliverLinkPackets: true,
+		Disabled:           !loopbackUp,
+	}
+	var addrs []sentryapi.IPWithPrefix
+	if loopbackUp {
+		addrs = link.Addresses
 	}
 
-	if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
+	if err := n.createNICWithAddrs(nicID, linkEP, opts, addrs); err != nil {
 		return nil, err
 	}
 

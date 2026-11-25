@@ -70,6 +70,7 @@ var (
 	addHostUDS       = flag.Bool("add-host-uds", false, "expose a tree of UDS to test communication with the host")
 	addHostConnector = flag.Bool("add-host-connector", false, "create goroutines that connect to bound UDS that will be created by sandbox")
 	addHostFIFO      = flag.Bool("add-host-fifo", false, "expose a tree of FIFO to test communication with the host")
+	addHostRandom    = flag.Bool("add-host-random", false, "bind the host /dev/random at its usual path")
 	addHostTTY       = flag.Bool("add-host-tty", false, "expose the host's TTY at /dev/tty")
 	ioUring          = flag.Bool("iouring", false, "Enables IO_URING API for asynchronous I/O")
 	leakCheck        = flag.Bool("leak-check", false, "check for reference leaks")
@@ -94,9 +95,6 @@ const (
 	// hostPTYHostFD is the FD number on the host that is passed to the sandbox.
 	// FDs passed via ExtraFiles start at 3.
 	hostPTYHostFD = 3
-
-	// uniqueXMLSuffix is the suffix for individual per-testcase XML outputs.
-	uniqueXMLSuffix = ".unique.xml"
 )
 
 // getSetupContainerPath returns the path to the setup_container binary.
@@ -270,8 +268,7 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 	}
 
 	if err := cmd.Run(); err != nil {
-		ws := err.(*exec.ExitError).Sys().(syscall.WaitStatus)
-		t.Errorf("test %q exited with status %d, want 0", tc.FullName(), ws.ExitStatus())
+		t.Errorf("test %q failed: %v", tc.FullName(), err)
 	}
 }
 
@@ -462,6 +459,9 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	}
 	if *addHostFIFO {
 		args = append(args, "-host-fifo=open")
+	}
+	if *addHostRandom {
+		args = append(args, "-character-device-policy=passthrough")
 	}
 	if *leakCheck {
 		args = append(args, "-ref-leak-mode=log-names")
@@ -859,10 +859,6 @@ func isWarning(line string) bool {
 	// Caused by properties of the host that runsc doesn't necessarily control.
 	case strings.Contains(line, "Host limit is lower than recommended"):
 
-	// TODO(gvisor.dev/issue/11649): Systrap needs to roll back created
-	// patches for traced procs.
-	case strings.Contains(line, "LIKELY ERROR: Attached tracer to process with patched syscalls"):
-
 	// TODO(gvisor.dev/issue/13542): Disabling arm64 PAC fails and generates a warning on kernels
 	// before 5.13.
 	case strings.Contains(line, "Unable to disable pointer authentication"):
@@ -1117,6 +1113,14 @@ func runTestCaseRunsc(testBin string, tc *gtest.TestCase, args []string, t *test
 		defer cleanup()
 	}
 
+	if *addHostRandom {
+		spec.Mounts = append(spec.Mounts, specs.Mount{
+			Destination: "/dev/random",
+			Source:      "/dev/random",
+			Type:        "bind",
+		})
+	}
+
 	// Add cgroup mount to enable cgroups for all tests.
 	spec.Mounts = append(spec.Mounts, specs.Mount{
 		Destination: "/sys/fs/cgroup",
@@ -1279,45 +1283,6 @@ func main() {
 	}
 
 	testing.Main(matchString, tests, nil, nil)
-}
-
-func collateXMLs(origXML string) error {
-	matches, err := filepath.Glob(origXML + ".*" + uniqueXMLSuffix)
-	if err != nil {
-		return fmt.Errorf("failed to glob individual XML files: %v", err)
-	}
-	if len(matches) == 0 {
-		return nil
-	}
-
-	f, err := os.Create(origXML)
-	if err != nil {
-		return fmt.Errorf("failed to create collated XML file %s: %v", origXML, err)
-	}
-	defer f.Close()
-	fmt.Fprintln(f, `<?xml version="1.0" encoding="UTF-8"?><testsuites name="AllTests"><testsuite name="Collated">`)
-
-	for _, m := range matches {
-		data, err := os.ReadFile(m)
-		if err != nil {
-			return fmt.Errorf("failed to read unique XML file %s: %v", m, err)
-		}
-		s := string(data)
-		start := strings.Index(s, "<testcase")
-		end := strings.LastIndex(s, "</testcase>")
-
-		if start >= 0 && end >= 0 {
-			fmt.Fprintln(f, s[start:end+len("</testcase>")])
-		} else if start >= 0 {
-			end = strings.Index(s[start:], "/>")
-			if end >= 0 {
-				fmt.Fprintln(f, s[start:start+end+2])
-			}
-		}
-	}
-
-	fmt.Fprintln(f, `</testsuite></testsuites>`)
-	return nil
 }
 
 func enableAllTraces(dir string) (string, error) {

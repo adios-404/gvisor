@@ -67,6 +67,7 @@ go_library(
         "//pkg/unet",
         "//pkg/urpc",
         "//runsc/boot/sentryapi",
+        "//runsc/client",
         "//runsc/cmd/metricserver/metricservercmd",
         "//runsc/cmd/nvproxy",
         "//runsc/cmd/sandboxsetup",
@@ -114,6 +115,7 @@ go_test(
         "read_test.go",
         "sandboxexec_test.go",
         "spec_test.go",
+        "statefile_fixture_test.go",
         "statefile_test.go",
         "tar_test.go",
     ],
@@ -136,6 +138,7 @@ go_test(
         "//pkg/test/sandboxposture",
         "//pkg/test/testutil",
         "//runsc/boot/sentryapi",
+        "//runsc/cgroup",
         "//runsc/cmd/sandboxsetup",
         "//runsc/cmd/sentry/sentrycmd",
         "//runsc/cmd/util",
@@ -155,5 +158,20 @@ go_test(
         "@com_github_opencontainers_runtime_spec//specs-go/features:go_default_library",
         "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
+
+go_test(
+    name = "statefile_output_permissions_test",
+    srcs = [
+        "statefile_fixture_test.go",
+        "statefile_output_permissions_test.go",
+    ],
+    data = ["//:release"],  # keep
+    embed = [":cmd"],
+    deps = [
+        "//pkg/state/statefile",
+        "//pkg/test/testutil",
+        "//runsc/specutils",
     ],
 )

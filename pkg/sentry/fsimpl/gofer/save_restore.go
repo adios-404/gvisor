@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rand"
@@ -53,7 +52,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
 	fs.renameMu.Lock()
-	fs.evictAllCachedDentriesLocked(ctx)
+	fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
 	fs.renameMu.Unlock()
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
 
@@ -361,6 +360,24 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	return nil
 }
 
+// validateRestoredFileType returns an error if the remote file with the given
+// mode and device number cannot be the file that i represented at checkpoint
+// time. The remote filesystem may have changed between checkpoint and restore,
+// so restore must not back i with a file of an unsupported or different type,
+// or with a different device.
+func (i *inode) validateRestoredFileType(mode, rdevMajor, rdevMinor uint32, d *dentry) error {
+	if err := checkSupportedFileType(mode); err != nil {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file type validation failed: unsupported file type %#o", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, mode&linux.S_IFMT)}
+	}
+	if got, want := mode&linux.S_IFMT, i.fileType(); got != want {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file type validation failed: file type changed from %#o to %#o", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, want, got)}
+	}
+	if i.fileType() == linux.S_IFCHR && (rdevMajor != i.rdevMajor || rdevMinor != i.rdevMinor) {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: device number validation failed: device number changed from %d:%d to %d:%d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, i.rdevMajor, i.rdevMinor, rdevMajor, rdevMinor)}
+	}
+	return nil
+}
+
 // Preconditions: d is not synthetic.
 func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	d.childrenMu.Lock()
@@ -499,12 +516,11 @@ func (fd *specialFileFD) completeRestore(ctx context.Context) error {
 	fd.handle = h
 	fd.mmapFile.SetFD(int(h.fd))
 
-	ftype := d.inode.fileType()
-	fd.haveQueue = (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && fd.handle.fd >= 0
-	if fd.haveQueue {
-		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
-			return fmt.Errorf("failed to add FD to fdnotified for %q: %w", genericDebugPathname(d.inode.fs, d), err)
-		}
+	if h.fd < 0 && !fd.queue.IsEmpty() {
+		return fmt.Errorf("cannot restore waiters for %q: gofer did not donate a host file descriptor", genericDebugPathname(d.inode.fs, d))
+	}
+	if err := fd.initWaitQueue(d.inode.fileType()); err != nil {
+		return fmt.Errorf("restoring wait queue for %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
 
 	return nil

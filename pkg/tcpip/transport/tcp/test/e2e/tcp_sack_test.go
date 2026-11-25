@@ -27,6 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
@@ -40,6 +41,58 @@ const (
 	tsOptionSize = 12
 	mtu          = header.TCPMinimumSize + header.IPv4MinimumSize + e2e.MaxTCPOptionSize + maxPayload
 )
+
+func TestReceiverDSACK(t *testing.T) {
+	for _, sackPermitted := range []bool{true, false} {
+		t.Run(fmt.Sprintf("SACK=%t", sackPermitted), func(t *testing.T) {
+			c := context.New(t, e2e.DefaultMTU)
+			defer c.Cleanup()
+			e2e.SetStackSACKPermitted(t, c, true)
+			rep := c.CreateConnectedWithOptionsNoDelay(header.TCPSynOptions{SACKPermitted: sackPermitted})
+			first := rep.NextSeqNum
+			send := func(seq seqnum.Value, payload string, wantAck seqnum.Value, blocks ...header.SACKBlock) {
+				t.Helper()
+				rep.NextSeqNum = seq
+				rep.SendPacket([]byte(payload), nil)
+				rep.NextSeqNum = wantAck
+				if !sackPermitted {
+					blocks = nil
+				}
+				rep.VerifyACKHasSACK(blocks)
+			}
+
+			// An empty keepalive and data beyond the window report no
+			// duplicate payload.
+			send(first-1, "", first)
+			send(first+(1<<30), "x", first)
+			send(first, "abcd", first+4)
+
+			// A queued range remains in the ACK after the duplicate block.
+			queued := header.SACKBlock{Start: first + 7, End: first + 9}
+			send(first+7, "hi", first+4, queued)
+			send(first, "abc", first+4, header.SACKBlock{Start: first, End: first + 3}, queued)
+
+			// Only "cd" is duplicate. The new bytes fill the gap and advance
+			// the cumulative ACK through the queued range.
+			send(first+2, "cdefg", first+9, header.SACKBlock{Start: first + 2, End: first + 4})
+			send(first+9, "j", first+10)
+
+			// Queue the final data and FIN. Filling the gap with an overlapping
+			// segment must report its duplicate byte in the FIN ACK.
+			rep.Flags |= header.TCPFlagFin
+			send(first+12, "mn", first+10, header.SACKBlock{Start: first + 12, End: first + 14})
+			rep.Flags &^= header.TCPFlagFin
+			send(first+9, "jkl", first+15, header.SACKBlock{Start: first + 9, End: first + 10})
+
+			// A retransmission in CLOSE-WAIT includes the FIN sequence number.
+			rep.Flags |= header.TCPFlagFin
+			send(first+12, "mn", first+15, header.SACKBlock{Start: first + 12, End: first + 15})
+			if sackPermitted {
+				send(first+14, "", first+15, header.SACKBlock{Start: first + 14, End: first + 15})
+			}
+		})
+	}
+}
 
 // TestSackPermittedConnect establishes a connection with the SACK option
 // enabled.
@@ -879,6 +932,90 @@ func testSpuriousRecoveryWithRTO(t *testing.T, timestamps bool, ackOptions func(
 	}
 }
 
+func TestEifelRetransmissionTimestamps(t *testing.T) {
+	// The first retransmission wraps the timestamp. Neither transmission uses
+	// zero, which denotes a missing echo.
+	const nearWrap = ^uint32(0) - 5
+
+	// A timestamp above 2^31 precedes zero in TCP serial order. If the
+	// second timeout clears retransmitTS, an ACK echoing the first repair
+	// would incorrectly count the timeout as spurious.
+	const highTimestamp = 3 << 30
+	for _, tc := range []struct {
+		name        string
+		start       uint32
+		timeouts    int
+		ackOriginal bool
+	}{
+		{"wrap/original", nearWrap, 1, true},
+		{"wrap/repair", nearWrap, 1, false},
+		{"two_timeouts/original", highTimestamp, 2, true},
+		{"two_timeouts/repair", highTimestamp, 2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := faketime.NewManualClock()
+			c := context.NewWithOpts(t, context.Options{MTU: mtu, EnableV4: true, Clock: clock})
+			defer c.Cleanup()
+			e2e.SetStackSACKPermitted(t, c, true)
+			e2e.SetStackTCPRecovery(t, c, 0)
+			peer := e2e.CreateConnectedWithSACKAndTS(c)
+			// Account for the connection's random timestamp offset.
+			clock.Advance(time.Duration(tc.start-peer.RecentTS) * time.Millisecond)
+
+			data := make([]byte, 2*maxPayload)
+			if n, err := c.EP.Write(bytes.NewReader(data), tcpip.WriteOptions{}); err != nil || n != int64(len(data)) {
+				t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(data))
+			}
+			readTS := func(offset uint32) uint32 {
+				t.Helper()
+				v := c.GetPacket()
+				defer v.Release()
+				h := header.TCP(header.IPv4(v.AsSlice()).Payload())
+				checkReceivedPacket(t, c, h, offset, v, data)
+				opts := h.ParsedOptions()
+				if !opts.TS || len(h.Payload()) != maxPayload {
+					t.Fatalf("segment at %d: TS = %t, size = %d", offset, opts.TS, len(h.Payload()))
+				}
+				return opts.TSVal
+			}
+			original := readTS(0)
+			readTS(maxPayload)
+			if original != tc.start {
+				t.Fatalf("original TS = %d, want %d", original, tc.start)
+			}
+			var repair uint32
+			for range tc.timeouts {
+				var info tcpip.TCPInfoOption
+				if err := c.EP.GetSockOpt(&info); err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(info.RTO + time.Millisecond)
+				repair = readTS(0)
+			}
+			if (repair < original) != (tc.start == nearWrap) {
+				t.Fatalf("unexpected timestamp order: original %d, repair %d", original, repair)
+			}
+
+			// The first advancing ACK covers only the first segment. Echo the
+			// timestamp of the copy the peer accepted.
+			echo, want := repair, uint64(0)
+			if tc.ackOriginal {
+				echo, want = original, 1
+			}
+			peer.Flags = header.TCPFlagAck
+			peer.AckNum = peer.AckNum.Add(maxPayload)
+			peer.SendPacket(nil, timestampOption(peer.TSVal+1, echo))
+			// Drain the ACK before reading the counter, whether or not TCP sends
+			// another packet in response.
+			c.Stack().Pause()
+			c.Stack().Resume()
+			if got := c.Stack().Stats().TCP.SpuriousRTORecovery.Value(); got != want {
+				t.Errorf("original %d, repair %d, echo %d: spurious RTOs = %d, want %d", original, repair, echo, got, want)
+			}
+		})
+	}
+}
+
 func TestSACKDetectSpuriousRecoveryWithDupACK(t *testing.T) {
 	numAck := 0
 	probeDone := make(chan struct{})
@@ -1004,6 +1141,76 @@ func TestNoSpuriousRecoveryWithDSACK(t *testing.T) {
 	c.SendAckWithSACK(seq, 6*maxPayload, []header.SACKBlock{{start, end}})
 
 	verifySpuriousRecoveryMetric(t, c, 0 /* numSpuriousRecovery */, 0 /* numSpuriousRTO */)
+}
+
+func TestSACKRetransmissionTimer(t *testing.T) {
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{EnableV4: true, MTU: 1500, Clock: clock})
+	defer c.Cleanup()
+	e2e.SetStackSACKPermitted(t, c, true)
+	e2e.SetStackTCPRecovery(t, c, 0) // Use duplicate ACKs, not RACK or TLP.
+	peer := e2e.CreateConnectedWithSACKPermittedOption(c)
+	info := func() tcpip.TCPInfoOption {
+		t.Helper()
+		var v tcpip.TCPInfoOption
+		if err := c.EP.GetSockOpt(&v); err != nil {
+			t.Fatalf("TCP_INFO: %v", err)
+		}
+		return v
+	}
+	mss := int(info().SndMss)
+	data := make([]byte, 9*mss)
+	for i := range data {
+		data[i] = byte(i / mss)
+	}
+	if n, err := c.EP.Write(bytes.NewReader(data), tcpip.WriteOptions{}); err != nil || n != int64(len(data)) {
+		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(data))
+	}
+	for i := 0; i < len(data); i += mss {
+		c.ReceiveAndCheckPacket(data, i, mss)
+	}
+	ack := func(blocks ...header.SACKBlock) {
+		c.SendAckWithSACK(peer.NextSeqNum, mss, blocks)
+		c.Stack().Pause()
+		c.Stack().Resume()
+	}
+	block := func(start, end int) header.SACKBlock {
+		return header.SACKBlock{
+			Start: peer.AckNum.Add(seqnum.Size(start * mss)),
+			End:   peer.AckNum.Add(seqnum.Size(end * mss)),
+		}
+	}
+
+	// Cumulatively ACK packet 1. Half an RTO later, report packets 3–5
+	// to trigger retransmission of packet 2, the oldest outstanding data.
+	clock.Advance(100 * time.Millisecond)
+	ack()
+	rto := info().RTO
+	clock.Advance(rto / 2)
+	for end := 3; end <= 5; end++ {
+		ack(block(2, end))
+	}
+	c.ReceiveAndCheckPacket(data, mss, mss)
+
+	// Report packets 7–9 with the same cumulative ACK. Retransmitting
+	// packet 6 must not postpone the deadline for packet 2.
+	clock.Advance(rto / 4)
+	ack(block(6, 9), block(2, 5))
+	c.ReceiveAndCheckPacket(data, 5*mss, mss)
+	if v := info(); v.RTO != rto || v.CcState != tcpip.SACKRecovery {
+		t.Fatalf("after retransmitting packet 6: RTO=%s, state=%v; want %s, SACKRecovery", v.RTO, v.CcState, rto)
+	}
+
+	timeouts := c.Stack().Stats().TCP.Timeouts
+	clock.Advance(rto - rto/4 - time.Nanosecond)
+	if got := timeouts.Value(); got != 0 {
+		t.Fatalf("before packet 2's retransmission deadline: got %d timeouts, want 0", got)
+	}
+	clock.Advance(time.Nanosecond)
+	if got := timeouts.Value(); got != 1 {
+		t.Fatalf("at packet 2's retransmission deadline: got %d timeouts, want 1", got)
+	}
+	c.ReceiveAndCheckPacket(data, mss, mss)
 }
 
 func TestMain(m *testing.M) {

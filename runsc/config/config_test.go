@@ -125,6 +125,44 @@ func TestFromFlags(t *testing.T) {
 	if want := "/run/netproxy.sock"; c.NetworkProxyPath != want || !c.UseNetworkProxy() {
 		t.Errorf("NetworkProxyPath=%q UseNetworkProxy()=%v, want %q and true", c.NetworkProxyPath, c.UseNetworkProxy(), want)
 	}
+
+	if err := testFlags.Lookup("network-proxy-path").Value.Set(""); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	if err := testFlags.Lookup("netgofer").Value.Set("proxy"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := NetgoferModeProxy; c.Netgofer != want || !c.UseNetworkProxy() || c.Netgofer.AllowLoopback() {
+		t.Errorf("Netgofer=%v UseNetworkProxy()=%v AllowLoopback()=%v, want %v, true, false", c.Netgofer, c.UseNetworkProxy(), c.Netgofer.AllowLoopback(), want)
+	}
+
+	if err := testFlags.Lookup("netgofer").Value.Set("proxy-loopback"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Netgofer != NetgoferModeProxyLoopback || !c.Netgofer.Enabled() || !c.Netgofer.AllowLoopback() {
+		t.Errorf("Netgofer=%v Enabled()=%v AllowLoopback()=%v, want NetgoferModeProxyLoopback, true, true", c.Netgofer, c.Netgofer.Enabled(), c.Netgofer.AllowLoopback())
+	}
+	if err := testFlags.Lookup("netgofer").Value.Set("off"); err != nil {
+		t.Fatal(err)
+	}
+	if err := testFlags.Lookup("rdmaproxy").Value.Set("true"); err != nil {
+		t.Fatal(err)
+	}
+	c, err = NewFromFlags(testFlags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.RDMAProxy || c.UseNetworkProxy() {
+		t.Errorf("RDMAProxy=%v UseNetworkProxy()=%v, want true and false", c.RDMAProxy, c.UseNetworkProxy())
+	}
 }
 
 func TestToFlagsFromFlags(t *testing.T) {
@@ -306,6 +344,11 @@ func TestInvalidFlags(t *testing.T) {
 			value: "LEGACY_DEPRECATED_SLOW_EMBEDDED_FALLBACK",
 			error: "the embedded sidecar fallback has been removed",
 		},
+		{
+			name:  "netgofer",
+			value: "invalid",
+			error: "invalid netgofer mode",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -323,6 +366,16 @@ func TestValidationFail(t *testing.T) {
 		flags map[string]string
 		error string
 	}{
+		{
+			name:  "heap rate without profile",
+			flags: map[string]string{"profile-heap-rate": "1"},
+			error: "profile-heap-rate flag requires enabling profiling",
+		},
+		{
+			name:  "negative heap rate",
+			flags: map[string]string{"profile": "true", "profile-heap-rate": "-1"},
+			error: "profile-heap-rate must be >= 0",
+		},
 		{
 			name: "shared+overlay",
 			flags: map[string]string{
@@ -402,6 +455,22 @@ func TestValidationFail(t *testing.T) {
 			error: "overlay flag has been replaced with overlay2 flag",
 		},
 		{
+			name: "rdmaproxy+network-proxy-path",
+			flags: map[string]string{
+				"rdmaproxy":          "true",
+				"network-proxy-path": "/run/netproxy.sock",
+			},
+			error: "rdmaproxy flag is incompatible with netgofer and network-proxy-path flags",
+		},
+		{
+			name: "rdmaproxy+netgofer",
+			flags: map[string]string{
+				"rdmaproxy": "true",
+				"netgofer":  "proxy",
+			},
+			error: "rdmaproxy flag is incompatible with netgofer and network-proxy-path flags",
+		},
+		{
 			name: "network-proxy-path+network:none",
 			flags: map[string]string{
 				"network-proxy-path": "/run/netproxy.sock",
@@ -460,6 +529,38 @@ func TestValidationFail(t *testing.T) {
 				"platform_device_path": "/dev/kvm2",
 			},
 			error: "--platform=auto accepts only --platform_device_path={platform}={path}",
+		},
+		{
+			name: "netgofer+network:none",
+			flags: map[string]string{
+				"netgofer": "proxy",
+				"network":  "none",
+			},
+			error: "netgofer flag is only supported with sandbox networking",
+		},
+		{
+			name: "netgofer+network:host",
+			flags: map[string]string{
+				"netgofer": "proxy",
+				"network":  "host",
+			},
+			error: "netgofer flag is only supported with sandbox networking",
+		},
+		{
+			name: "netgofer+xdp",
+			flags: map[string]string{
+				"netgofer":         "proxy",
+				"EXPERIMENTAL-xdp": "ns",
+			},
+			error: "netgofer flag is incompatible with XDP",
+		},
+		{
+			name: "netgofer+network-proxy-path",
+			flags: map[string]string{
+				"netgofer":           "proxy",
+				"network-proxy-path": "/run/netproxy.sock",
+			},
+			error: "netgofer and network-proxy-path flags cannot both be set",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1090,7 +1191,7 @@ func TestBundleValidate(t *testing.T) {
 			bundle: Bundle(map[string]string{"debug": "invalid"}),
 			verify: func(err error) error {
 				// Error differs in open-source version, and internally at Google
-				// https://github.com/google/gvisor/pull/11722#issuecomment-2877847616
+				// https://github.com/gvisor/gvisor/pull/11722#issuecomment-2877847616
 				wantOss := "parse error"
 				wantInternal := `parsing "invalid": invalid syntax`
 				if !strings.Contains(err.Error(), wantOss) && !strings.Contains(err.Error(), wantInternal) {

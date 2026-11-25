@@ -157,7 +157,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	cu.Add(func() {
 		userns.DecRef(t)
 	})
-	if args.Flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC|linux.CLONE_NEWCGROUP) != 0 && !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, userns) {
+	if args.Flags&(linux.CLONE_NEWPID|linux.CLONE_NEWNET|linux.CLONE_NEWUTS|linux.CLONE_NEWIPC|linux.CLONE_NEWCGROUP|linux.CLONE_NEWNS) != 0 && !creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, userns) {
 		return 0, nil, linuxerr.EPERM
 	}
 
@@ -426,11 +426,7 @@ func (t *Task) Clone(args *linux.CloneArgs) (ThreadID, *SyscallControl, error) {
 	// "If fork/clone and execve are allowed by @prog, any child processes will
 	// be constrained to the same filters and system call ABI as the parent." -
 	// Documentation/prctl/seccomp_filter.txt
-	if ts := t.seccomp.Load(); ts != nil {
-		nt.seccomp.Store(ts.copy())
-	} else {
-		nt.seccomp.Store(nil)
-	}
+	nt.seccomp.Store(t.seccomp.Load())
 	if args.Flags&linux.CLONE_VFORK != 0 {
 		nt.vforkParent.Store(t)
 	}

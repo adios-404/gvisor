@@ -69,7 +69,7 @@ func (m *machine) initArchState() error {
 	// mechanism).
 	// If we create vCPU dynamically on ARM64, the timer for vCPU would mess
 	// up for a short time.
-	// For more detail, please refer to https://github.com/google/gvisor/issues/5739
+	// For more detail, please refer to https://github.com/gvisor/gvisor/issues/5739
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := 0; i < m.maxVCPUs; i++ {
@@ -328,12 +328,6 @@ func (c *vCPU) loadSegments(tid uint64) {
 	c.tid.Store(tid)
 }
 
-// checkPAC is a quick check to see if the host CPU supports pointer
-// authentication to avoid having to do a host-syscall if it's unnecessary.
-//
-//go:nosplit
-func checkPAC() bool
-
 // addressPACKeys is the bitmask of every ARM64 address pointer
 // authentication key recognised by PR_PAC_SET_ENABLED_KEYS. The generic
 // authentication key (PR_PAC_APGAKEY) is NOT accepted by this prctl on
@@ -342,8 +336,12 @@ func checkPAC() bool
 const addressPACKeys = unix.PR_PAC_APIAKEY | unix.PR_PAC_APIBKEY |
 	unix.PR_PAC_APDAKEY | unix.PR_PAC_APDBKEY
 
-// disableHostPAC disables host pointer authentication for the calling
-// thread. This is necessary on ARM64 because the sentry's Go runtime runs
+// hostAddressAuth is whether the host supports address authentication
+// (HWCAP_PACA). It is set once by updateGlobalOnce, before any vCPU is bound.
+var hostAddressAuth bool
+
+// disableHostPAC disables host pointer authentication for the calling thread.
+// This is necessary on ARM64 because the sentry's Go runtime runs
 // inside the KVM guest at Guest EL1, where PAC instructions
 // (paciasp/autiasp) behave differently than at Host EL0. When the
 // sentry's Go runtime calls a VDSO function such as __kernel_getrandom,
@@ -363,20 +361,22 @@ const addressPACKeys = unix.PR_PAC_APIAKEY | unix.PR_PAC_APIBKEY |
 // mismatch without requiring any guest-side coordination.
 //
 // This is called from loadSegments, which runs every time a vCPU is
-// bound to a (potentially new) host thread. Each thread that ever
-// hosts a vCPU therefore has PAC disabled before it can trigger the
-// bluepill SIGILL path. The prctl is per-thread; calling it again on
-// a thread that already has PAC disabled is harmless and idempotent
-// at the kernel level.
+// bound to a (potentially new) host thread, so every thread that ever
+// hosts a vCPU has PAC disabled before it can enter the guest. Each
+// thread disables its own keys: a thread whose keys change while it is
+// between a paciasp and its autiasp returns through an address that its
+// keys no longer match, and crashes. Other threads, such as sysmon, call
+// the vDSO's clock_gettime (signed with pac-ret) at any time. The prctl is
+// per-thread; calling it again on a thread that already has PAC disabled
+// is harmless and idempotent at the kernel level.
 //
-// The prctl return value is intentionally ignored: it returns EINVAL
-// on kernels older than 5.13 (which lack PR_PAC_SET_ENABLED_KEYS) and
-// on hardware without address authentication, both of which imply the
-// crash cannot occur and there is nothing to fix.
+// The prctl is called only if the host supports address authentication
+// (HWCAP_PACA). Its error is ignored: it is EINVAL only on kernels older
+// than 5.13, which lack PR_PAC_SET_ENABLED_KEYS.
 //
 //go:nosplit
 func disableHostPAC() {
-	if !checkPAC() {
+	if !hostAddressAuth {
 		return
 	}
 	hostsyscall.RawSyscallErrno6(

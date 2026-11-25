@@ -34,6 +34,10 @@ const (
 
 	// selfPIDVarName is the variable name for the current process ID.
 	selfPIDVarName = "self_pid"
+
+	// procSelfFDVarName is the variable name for `Options.ProcSelfFD` used in
+	// the precompiled seccomp filters.
+	procSelfFDVarName = "proc_self_fd"
 )
 
 // allPrecompiledPlatforms returns a list of `platform.SeccompInfo` instances
@@ -85,13 +89,15 @@ func optionsToPrecompile() ([]Options, error) {
 			return []Options{netstack, hostNet, hostNetRaw}, nil
 		},
 
-		// Precompile options with DirectFS enabled & disabled.
+		// Precompile options for each level of host filesystem access.
 		func(opt Options) ([]Options, error) {
-			directfs := opt
-			directfs.HostFilesystem = true
-			noDirectfs := opt
-			noDirectfs.HostFilesystem = false
-			return []Options{directfs, noDirectfs}, nil
+			readWrite := opt
+			readWrite.HostFS = HostFSReadWrite
+			readOnly := opt
+			readOnly.HostFS = HostFSReadOnly
+			none := opt
+			none.HostFS = HostFSNone
+			return []Options{readWrite, readOnly, none}, nil
 		},
 
 		// Expand NVProxy and its possible configurations.
@@ -141,6 +147,15 @@ func optionsToPrecompile() ([]Options, error) {
 				opts = append(opts, optCopy)
 			}
 			return opts, nil
+		},
+
+		// A device proxy opens host device files for writing on a directory
+		// FD. Of the directfs levels, only HostFSReadWrite allows that.
+		func(opt Options) ([]Options, error) {
+			if opt.HostFS == HostFSReadOnly && (opt.NVProxy || opt.TPUProxy || opt.RDMAProxy) {
+				return nil, nil
+			}
+			return []Options{opt}, nil
 		},
 	} {
 		var newOpts []Options

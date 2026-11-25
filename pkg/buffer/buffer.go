@@ -235,7 +235,7 @@ func (b *Buffer) Prepend(src *View) error {
 		}
 		b.size += int64(n)
 		v.write = old
-		src.write = srcStart
+		src.write = src.read + srcStart
 
 		// If there's no more to be written, then we're done.
 		if src.Size() == 0 {
@@ -517,6 +517,7 @@ func (b *Buffer) WriteFromReaderAndLimitedReader(r io.Reader, count int64, lr *i
 		lr.R = r
 		lr.N = vsize
 		n, err := io.Copy(v, lr)
+		lr.R = nil
 		b.Append(v)
 		done += n
 		if err == io.EOF {
