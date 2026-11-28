@@ -81,7 +81,7 @@ func SetParentAndName(fs *Filesystem, d, newParent *Dentry, newName string) {
 	fs.ancestryMu.Lock()
 	defer fs.ancestryMu.Unlock()
 	d.parent.Store(newParent)
-	d.name = newName
+	d.name = newName // +checklocksignore: fs.ancestryMu is locked; caller holds filesystem rename lock.
 }
 
 // IsAncestorDentry returns true if d is an ancestor of d2; that is, d is
@@ -104,6 +104,19 @@ func IsDescendant(fs *Filesystem, vfsroot *vfs.Dentry, d *Dentry) bool {
 	return d != nil
 }
 
+// WalkAncestors is a generic implementation of FilesystemImpl.WalkAncestors().
+// It calls visit on d and then on each of d's ancestors, up to the root of fs,
+// and stops early if visit returns false.
+func WalkAncestors(fs *Filesystem, d *Dentry, visit func(*vfs.Dentry) bool) {
+	fs.ancestryMu.RLock()
+	defer fs.ancestryMu.RUnlock()
+	for ; d != nil; d = d.parent.Load() {
+		if !visit(&d.vfsd) {
+			return
+		}
+	}
+}
+
 // PrependPath is a generic implementation of FilesystemImpl.PrependPath().
 func PrependPath(fs *Filesystem, vfsroot vfs.VirtualDentry, mnt *vfs.Mount, d *Dentry, b *fspath.Builder) error {
 	fs.ancestryMu.RLock()
@@ -119,7 +132,7 @@ func PrependPath(fs *Filesystem, vfsroot vfs.VirtualDentry, mnt *vfs.Mount, d *D
 		if parent == nil {
 			return vfs.PrependPathAtNonMountRootError{}
 		}
-		b.PrependComponent(d.name)
+		b.PrependComponent(d.name) // +checklocksignore: fs.ancestryMu is read-locked.
 		d = parent
 	}
 }

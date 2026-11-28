@@ -9,10 +9,25 @@ load("//tools/bazeldefs:defs.bzl", "select_arch", "select_system")
 
 gazelle = _gazelle
 
-go_path = _go_path
 go_reset_target = _go_reset_target
 go_cov = native.genrule
 cov_available = True
+
+def _go_source_export_config(_settings, _attr):
+    return {"//tools:export_go_sources": True}
+
+def _go_path_impl(ctx):
+    return ctx.super()
+
+go_path = rule(
+    parent = _go_path,
+    implementation = _go_path_impl,
+    cfg = transition(
+        implementation = _go_source_export_config,
+        inputs = [],
+        outputs = ["//tools:export_go_sources"],
+    ),
+)
 
 def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
     if "importpath" in kwargs:
@@ -75,7 +90,6 @@ def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
     })
     base_gotags = kwargs.pop("gotags", [])
     kwargs["gotags"] = select({
-        "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
     }) + select({
@@ -100,6 +114,31 @@ def go_source_files(target):
 def go_has_source(target):
     """Returns whether the target exposes its canonical Go source view."""
     return GoInfo in target
+
+def _go_library_srcs_impl(ctx):
+    by_name = {}
+    ambiguous = {}
+    for f in go_source_files(ctx.attr.library):
+        if f.basename in by_name and by_name[f.basename] != f:
+            ambiguous[f.basename] = True
+        by_name[f.basename] = f
+    files = []
+    for name in ctx.attr.srcs:
+        if name not in by_name:
+            fail("%s has no source file %s" % (ctx.attr.library.label, name))
+        if name in ambiguous:
+            fail("%s has multiple source files named %s" % (ctx.attr.library.label, name))
+        files.append(by_name[name])
+    return [DefaultInfo(files = depset(files))]
+
+go_library_srcs = rule(
+    implementation = _go_library_srcs_impl,
+    doc = "Gives the source files of a Go library that have the names in `srcs`, in the same order.",
+    attrs = {
+        "library": attr.label(mandatory = True, providers = [GoInfo], doc = "The Go library."),
+        "srcs": attr.string_list(mandatory = True, doc = "The file names of the source files."),
+    },
+)
 
 def go_binary_archive(target):
     """Returns compiled Go archive metadata for a binary target."""
@@ -162,7 +201,6 @@ def go_test(name, static = False, pure = False, library = None, **kwargs):
         kwargs["embed"] = [library]
     base_gotags = kwargs.pop("gotags", [])
     kwargs["gotags"] = select({
-        "//tools/bazeldefs:pagesize_64k": base_gotags + ["pagesize_64k"],
         "//tools:debug": base_gotags + ["debug"],
         "//conditions:default": base_gotags,
     }) + select({

@@ -568,6 +568,58 @@ func TestWriteLinkInfoLoopback(t *testing.T) {
 	}
 }
 
+// IFLA_OPERSTATE follows IFF_RUNNING: an interface that is up but has no
+// carrier is operationally down.
+func TestWriteLinkInfoOperState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		flags uint32
+		want  uint8
+	}{
+		{"down", 0, linux.IF_OPER_DOWN},
+		{"up without carrier", linux.IFF_UP, linux.IF_OPER_DOWN},
+		{"up and running", linux.IFF_UP | linux.IFF_RUNNING | linux.IFF_LOWER_UP, linux.IF_OPER_UP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := nlmsg.NewMessageSet(0, 12345)
+			p := &Protocol{}
+			p.AddNewLinkMessage(ms, 2, inet.Interface{
+				DeviceType: linux.ARPHRD_ETHER,
+				Flags:      tc.flags,
+				Name:       "eth0",
+				Addr:       []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+				MTU:        1500,
+			})
+			if len(ms.Messages) != 1 {
+				t.Fatalf("got %d messages, want 1", len(ms.Messages))
+			}
+			var ifi linux.InterfaceInfoMessage
+			attrs, ok := ms.Messages[0].GetData(&ifi)
+			if !ok {
+				t.Fatalf("GetData failed")
+			}
+			found := false
+			for !attrs.Empty() {
+				ahdr, val, rest, ok := attrs.ParseFirst()
+				if !ok {
+					break
+				}
+				attrs = rest
+				if ahdr.Type != linux.IFLA_OPERSTATE {
+					continue
+				}
+				found = true
+				if len(val) != 1 || val[0] != tc.want {
+					t.Errorf("got IFLA_OPERSTATE = %v, want %d", val, tc.want)
+				}
+			}
+			if !found {
+				t.Errorf("IFLA_OPERSTATE not found")
+			}
+		})
+	}
+}
+
 func TestProcessMessageMissingFamily(t *testing.T) {
 	p := &Protocol{}
 	ms := nlmsg.NewMessageSet(0, 12345)
@@ -614,5 +666,70 @@ func TestProcessMessageUnsupported(t *testing.T) {
 	msgUnsuppReq.Put(&family)
 	if err := p.ProcessMessage(nil, nil, msgUnsuppReq, ms); err != syserr.ErrNotSupported {
 		t.Errorf("ProcessMessage on unsupported REQUEST type got err = %v, want ErrNotSupported", err)
+	}
+}
+
+// Dumps are restricted to AF_INET or AF_INET6 when requested; any other
+// family dumps everything, like Linux's fallback to the AF_UNSPEC handler.
+func TestDumpFamily(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload func(*nlmsg.Message)
+		want    uint8
+	}{
+		{
+			name:    "missing family",
+			payload: func(*nlmsg.Message) {},
+			want:    linux.AF_UNSPEC,
+		},
+		{
+			name: "rtgenmsg AF_UNSPEC",
+			payload: func(m *nlmsg.Message) {
+				family := primitive.Uint8(linux.AF_UNSPEC)
+				m.Put(&family)
+			},
+			want: linux.AF_UNSPEC,
+		},
+		{
+			name: "rtgenmsg AF_INET",
+			payload: func(m *nlmsg.Message) {
+				family := primitive.Uint8(linux.AF_INET)
+				m.Put(&family)
+			},
+			want: linux.AF_INET,
+		},
+		{
+			name: "rtmsg AF_INET6",
+			payload: func(m *nlmsg.Message) {
+				m.Put(&linux.RouteMessage{Family: linux.AF_INET6})
+			},
+			want: linux.AF_INET6,
+		},
+		{
+			name: "ifaddrmsg AF_INET",
+			payload: func(m *nlmsg.Message) {
+				m.Put(&linux.InterfaceAddrMessage{Family: linux.AF_INET})
+			},
+			want: linux.AF_INET,
+		},
+		{
+			name: "rtgenmsg AF_PACKET",
+			payload: func(m *nlmsg.Message) {
+				family := primitive.Uint8(linux.AF_PACKET)
+				m.Put(&family)
+			},
+			want: linux.AF_UNSPEC,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := nlmsg.NewMessage(linux.NetlinkMessageHeader{
+				Type:  linux.RTM_GETROUTE,
+				Flags: linux.NLM_F_REQUEST | linux.NLM_F_DUMP,
+			})
+			tc.payload(msg)
+			if got := dumpFamily(msg); got != tc.want {
+				t.Errorf("dumpFamily() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

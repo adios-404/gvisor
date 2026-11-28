@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -39,6 +40,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gmock/gmock.h"
@@ -273,6 +275,33 @@ void ExpectReadable(const FileDescriptor& fd, int expected, char* buf) {
 TEST(BasicPtyTest, OpenMasterReplica) {
   FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR));
   FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master));
+}
+
+// The master only hangs up after its replica has been opened and closed.
+// Before that, it behaves like any master with nothing to read.
+TEST(BasicPtyTest, MasterNotHungUpBeforeReplicaOpen) {
+  FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(
+      Open("/dev/ptmx", O_RDWR | O_NONBLOCK | O_NOCTTY));
+
+  struct pollfd pfd = {};
+  pfd.fd = master.get();
+  pfd.events = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+  EXPECT_THAT(poll(&pfd, 1, 0), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(pfd.revents, POLLOUT | POLLWRNORM);
+
+  char c;
+  EXPECT_THAT(ReadFd(master.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+
+  FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master));
+  ASSERT_THAT(WriteFd(replica.get(), "X", 1), SyscallSucceedsWithValue(1));
+  ExpectReadable(master, 1, &c);
+  EXPECT_EQ(c, 'X');
+
+  replica.reset();
+  pfd.revents = 0;
+  EXPECT_THAT(poll(&pfd, 1, 0), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(pfd.revents, POLLHUP | POLLOUT | POLLWRNORM);
+  EXPECT_THAT(ReadFd(master.get(), &c, 1), SyscallFailsWithErrno(EIO));
 }
 
 TEST(BasicPtyTest, OpenSetsControllingTTY) {
@@ -857,26 +886,15 @@ TEST_F(PtyTest, PacketModeWriteReplicaToMaster) {
   int mode = 1;
   ASSERT_THAT(ioctl(master_.get(), TIOCPKT, &mode), SyscallSucceeds());
 
-  // N.B. by default, the master reads nothing until the replica writes a
-  // newline, and the master gets a carriage return.
-  constexpr char kInput[] = "hello\n";
+  // TIOCPKT(2const) prefixes each data read with a zero byte. One byte of
+  // payload lets us check its header without depending on how the tty splits
+  // a longer write between reads.
+  constexpr char kData = 'x';
+  ASSERT_THAT(WriteFd(replica_.get(), &kData, 1), SyscallSucceedsWithValue(1));
 
-  // This is the interesting case. When in packet mode, the master should expect
-  // the read buffer to have a leading 0 (TIOCPKT_DATA) byte.
-  constexpr char kExpected[] = "\0hello\r\n";
-
-  EXPECT_THAT(WriteFd(replica_.get(), kInput, sizeof(kInput) - 1),
-              SyscallSucceedsWithValue(sizeof(kInput) - 1));
-
-  // Linux moves data from the master to the replica via async work scheduled
-  // via tty_flip_buffer_push. Since it is asynchronous, the data may not be
-  // available for reading immediately. Instead we must poll and assert that it
-  // becomes available "soon".
-
-  char buf[sizeof(kExpected)] = {};
-  ExpectReadable(master_, sizeof(buf) - 1, buf);
-
-  EXPECT_EQ(memcmp(buf, kExpected, sizeof(kExpected)), 0);
+  char packet[2] = {};
+  ExpectReadable(master_, sizeof(packet), packet);
+  EXPECT_THAT(packet, ::testing::ElementsAre(TIOCPKT_DATA, kData));
 }
 
 // Verifies that data enqueued into the replica is still readable by the master
@@ -2177,6 +2195,94 @@ TEST_F(JobControlTest, GetForegroundProcessGroup) {
   ASSERT_NO_ERRNO(res);
 }
 
+// Returns the tty_nr and tpgid fields of /proc/self/stat.
+PosixErrorOr<std::pair<int, int>> ProcSelfStatTTY() {
+  ASSIGN_OR_RETURN_ERRNO(std::string stat, GetContents("/proc/self/stat"));
+  // The command name may contain spaces, so skip past its closing paren.
+  size_t pos = stat.rfind(')');
+  if (pos == std::string::npos) {
+    return PosixError(EINVAL, absl::StrCat("malformed stat: ", stat));
+  }
+  int tty_nr, tpgid;
+  if (sscanf(stat.c_str() + pos + 1, " %*c %*d %*d %*d %d %d", &tty_nr,
+             &tpgid) != 2) {
+    return PosixError(EINVAL, absl::StrCat("malformed stat: ", stat));
+  }
+  return std::make_pair(tty_nr, tpgid);
+}
+
+// Returns dev as encoded by Linux's new_encode_dev().
+int NewEncodeDev(dev_t dev) {
+  unsigned int maj = major(dev);
+  unsigned int min = minor(dev);
+  return (min & 0xff) | (maj << 8) | ((min & ~0xffu) << 12);
+}
+
+TEST_F(JobControlTest, ProcStatControllingTTY) {
+  struct stat st;
+  ASSERT_THAT(fstat(replica_.get(), &st), SyscallSucceeds());
+  const int want_tty_nr = NewEncodeDev(st.st_rdev);
+
+  auto res = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(replica_.get(), TIOCSCTTY, 0));
+    auto fields = ProcSelfStatTTY();
+    TEST_CHECK(fields.ok());
+    TEST_CHECK(fields.ValueOrDie().first == want_tty_nr);
+    TEST_CHECK(fields.ValueOrDie().second == getpgid(0));
+
+    // tpgid is the foreground process group of the terminal, which need not
+    // be the process group of the process.
+    pid_t child = fork();
+    if (!child) {
+      while (true) {
+        pause();
+      }
+    }
+    TEST_PCHECK(child > 0);
+    TEST_PCHECK(!setpgid(child, child));
+    TEST_PCHECK(!tcsetpgrp(replica_.get(), child));
+    fields = ProcSelfStatTTY();
+    TEST_CHECK(fields.ok());
+    TEST_CHECK(fields.ValueOrDie().first == want_tty_nr);
+    TEST_CHECK(fields.ValueOrDie().second == child);
+
+    TEST_PCHECK(!kill(child, SIGKILL));
+    TEST_PCHECK(waitpid(child, nullptr, 0) == child);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
+// Setting the master as the controlling terminal makes the replica the
+// controlling terminal.
+TEST_F(JobControlTest, ProcStatControllingTTYMaster) {
+  struct stat st;
+  ASSERT_THAT(fstat(replica_.get(), &st), SyscallSucceeds());
+  const int want_tty_nr = NewEncodeDev(st.st_rdev);
+
+  auto res = RunInChild([=]() {
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(!ioctl(master_.get(), TIOCSCTTY, 0));
+    auto fields = ProcSelfStatTTY();
+    TEST_CHECK(fields.ok());
+    TEST_CHECK(fields.ValueOrDie().first == want_tty_nr);
+    TEST_CHECK(fields.ValueOrDie().second == getpgid(0));
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
+TEST_F(JobControlTest, ProcStatNoControllingTTY) {
+  auto res = RunInChild([=]() {
+    // A new session has no controlling terminal.
+    TEST_PCHECK(setsid() >= 0);
+    auto fields = ProcSelfStatTTY();
+    TEST_CHECK(fields.ok());
+    TEST_CHECK(fields.ValueOrDie().first == 0);
+    TEST_CHECK(fields.ValueOrDie().second == -1);
+  });
+  ASSERT_NO_ERRNO(res);
+}
+
 TEST_F(JobControlTest, GetForegroundProcessGroupNonControlling) {
   // At this point there's no controlling terminal, so TIOCGPGRP should fail.
   pid_t foreground_pgid;
@@ -2583,7 +2689,7 @@ TEST_F(JobControlTest, OrphanRegression) {
 // Test setting a controlling tty, then exiting, then re-using the same tty in a
 // different process.
 //
-// Regression test for https://github.com/google/gvisor/issues/9642.
+// Regression test for https://github.com/gvisor/gvisor/issues/9642.
 TEST_F(JobControlTest, ReuseControllingTTYAfterExit) {
   auto res = RunInChild([=]() {
     TEST_PCHECK(setsid() >= 0);

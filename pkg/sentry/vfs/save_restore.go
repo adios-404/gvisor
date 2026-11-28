@@ -65,6 +65,10 @@ type FilesystemImplSaveRestoreExtension interface {
 
 // PrepareSave prepares all filesystems for serialization.
 func (vfs *VirtualFilesystem) PrepareSave(ctx context.Context, opts PrepareSaveOptions) error {
+	// Landlock rulesets and domains cannot be saved yet.
+	if n := vfs.landlockLive.Load(); n != 0 {
+		return fmt.Errorf("cannot save %d Landlock rulesets and domains", n)
+	}
 	fss := vfs.GetFilesystems()
 	defer func() {
 		for _, fs := range fss {
@@ -142,7 +146,7 @@ func (vfs *VirtualFilesystem) saveMounts() []*Mount {
 		// vfs.Init() was never called.
 		return nil
 	}
-	var mounts []*Mount
+	mounts := make([]*Mount, 0, vfs.mounts.size.Load()>>mtSizeLenLSB)
 	vfs.mounts.Range(func(mount *Mount) bool {
 		mounts = append(mounts, mount)
 		return true

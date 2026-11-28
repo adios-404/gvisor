@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
@@ -74,6 +75,7 @@
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
@@ -1545,6 +1547,176 @@ TEST(ProcSelfFdInfo, Flags) {
   EXPECT_THAT(fd_info, HasSubstr(absl::StrFormat("flags:\t%#o", flags)));
 }
 
+// A child holds a file open at a known offset so another process can try to
+// read /proc/<pid>/fdinfo/<fd>.
+constexpr int kFdinfoOffset = 7;
+constexpr int kFdinfoOwner = 1000;
+constexpr int kFdinfoOther = 1001;
+
+struct FdinfoTarget {
+  pid_t pid = -1;
+  int fd = -1;
+  int stopfd = -1;
+};
+
+void StopFdinfoTarget(FdinfoTarget* target) {
+  if (target->stopfd >= 0) {
+    char ok = 1;
+    WriteFd(target->stopfd, &ok, sizeof(ok));
+    close(target->stopfd);
+    target->stopfd = -1;
+  }
+  if (target->pid > 0) {
+    RetryEINTR(waitpid)(target->pid, nullptr, 0);
+    target->pid = -1;
+  }
+}
+
+PosixErrorOr<FdinfoTarget> StartFdinfoTarget() {
+  ASSIGN_OR_RETURN_ERRNO(auto file, TempPath::CreateFileWith(
+                                        GetAbsoluteTestTmpdir(),
+                                        std::string(kFdinfoOffset, 'a'), 0644));
+  int ready[2];
+  int stop[2];
+  RETURN_ERROR_IF_SYSCALL_FAIL(pipe(ready));
+  RETURN_ERROR_IF_SYSCALL_FAIL(pipe(stop));
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    int err = errno;
+    close(ready[0]);
+    close(ready[1]);
+    close(stop[0]);
+    close(stop[1]);
+    return PosixError(err, "fork");
+  }
+  if (pid == 0) {
+    close(ready[0]);
+    close(stop[1]);
+    TEST_PCHECK(syscall(SYS_setuid, kFdinfoOwner) == 0);
+    // setuid clears dumpability. Restore it so a peer with the same uid can
+    // pass the ptrace read check.
+    TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
+    int fd = open(file.path().c_str(), O_RDONLY);
+    TEST_PCHECK(fd >= 0);
+    char buf[kFdinfoOffset];
+    TEST_CHECK(ReadFd(fd, buf, sizeof(buf)) == sizeof(buf));
+    TEST_CHECK(WriteFd(ready[1], &fd, sizeof(fd)) == sizeof(fd));
+    close(ready[1]);
+    char ok = 0;
+    TEST_CHECK(ReadFd(stop[0], &ok, sizeof(ok)) == sizeof(ok));
+    _exit(0);
+  }
+
+  close(ready[1]);
+  close(stop[0]);
+  FdinfoTarget target;
+  target.pid = pid;
+  target.stopfd = stop[1];
+  if (ReadFd(ready[0], &target.fd, sizeof(target.fd)) != sizeof(target.fd)) {
+    int err = errno;
+    close(ready[0]);
+    StopFdinfoTarget(&target);
+    return PosixError(err == 0 ? EIO : err, "read child fd");
+  }
+  close(ready[0]);
+  return target;
+}
+
+std::string FdinfoDir(pid_t pid) {
+  return absl::StrCat("/proc/", pid, "/fdinfo");
+}
+
+std::string FdinfoPath(const FdinfoTarget& target) {
+  return absl::StrCat(FdinfoDir(target.pid), "/", target.fd);
+}
+
+// Another uid cannot open /proc/<pid>/fdinfo or a file inside it. The mode
+// stays 0555/0444; the ptrace read check is what refuses the open.
+TEST(ProcPidFdInfo, DifferentUser) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  FdinfoTarget target = ASSERT_NO_ERRNO_AND_VALUE(StartFdinfoTarget());
+  auto cleanup = Cleanup([&] { StopFdinfoTarget(&target); });
+
+  ScopedThread([&] {
+    EXPECT_THAT(syscall(SYS_setuid, kFdinfoOther), SyscallSucceeds());
+    // /proc/self/fdinfo is mode 0555, so W_OK fails for this thread.
+    EXPECT_THAT(access("/proc/self/fdinfo", W_OK),
+                SyscallFailsWithErrno(EACCES));
+    EXPECT_THAT(open(FdinfoDir(target.pid).c_str(), O_RDONLY | O_DIRECTORY),
+                SyscallFailsWithErrno(EACCES));
+    EXPECT_THAT(open(FdinfoPath(target).c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+  });
+}
+
+// A different process with the same uid can read the file offset.
+TEST(ProcPidFdInfo, SameUser) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  FdinfoTarget target = ASSERT_NO_ERRNO_AND_VALUE(StartFdinfoTarget());
+  auto cleanup = Cleanup([&] { StopFdinfoTarget(&target); });
+
+  ScopedThread([&] {
+    EXPECT_THAT(syscall(SYS_setuid, kFdinfoOwner), SyscallSucceeds());
+    auto fd_info = ASSERT_NO_ERRNO_AND_VALUE(GetContents(FdinfoPath(target)));
+    EXPECT_THAT(fd_info,
+                HasSubstr(absl::StrCat("pos:\t", kFdinfoOffset, "\n")));
+  });
+}
+
+// CAP_SYS_PTRACE allows a different uid to read the file offset.
+TEST(ProcPidFdInfo, DifferentUserPtrace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_PTRACE)));
+
+  FdinfoTarget target = ASSERT_NO_ERRNO_AND_VALUE(StartFdinfoTarget());
+  auto cleanup = Cleanup([&] { StopFdinfoTarget(&target); });
+
+  ScopedThread([&] {
+    EXPECT_THAT(prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), SyscallSucceeds());
+    EXPECT_THAT(syscall(SYS_setuid, kFdinfoOther), SyscallSucceeds());
+    EXPECT_NO_ERRNO(SetCapability(CAP_SYS_PTRACE, true));
+    auto fd_info = ASSERT_NO_ERRNO_AND_VALUE(GetContents(FdinfoPath(target)));
+    EXPECT_THAT(fd_info,
+                HasSubstr(absl::StrCat("pos:\t", kFdinfoOffset, "\n")));
+  });
+}
+
+// Reading /proc/self/fdinfo/N must not keep the file open after N is closed.
+TEST(ProcSelfFdInfo, ReadDoesNotDelayClose) {
+  int fds[2];
+  ASSERT_THAT(pipe2(fds, O_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor rfd(fds[0]);
+  FileDescriptor wfd(fds[1]);
+
+  ASSERT_NO_ERRNO_AND_VALUE(
+      GetContents(absl::StrCat("/proc/self/fdinfo/", wfd.get())));
+  ASSERT_THAT(close(wfd.release()), SyscallSucceeds());
+
+  // The write end is closed, so the reader sees EOF rather than EAGAIN.
+  char c;
+  EXPECT_THAT(read(rfd.get(), &c, 1), SyscallSucceedsWithValue(0));
+}
+
+// Following /proc/self/fd/N must not keep the file open after N is closed.
+TEST(ProcSelfFd, FollowDoesNotDelayClose) {
+  int fds[2];
+  ASSERT_THAT(pipe2(fds, O_NONBLOCK), SyscallSucceeds());
+  const FileDescriptor rfd(fds[0]);
+  FileDescriptor wfd(fds[1]);
+
+  struct stat st;
+  ASSERT_THAT(stat(absl::StrCat("/proc/self/fd/", wfd.get()).c_str(), &st),
+              SyscallSucceeds());
+  ASSERT_THAT(close(wfd.release()), SyscallSucceeds());
+
+  // The write end is closed, so the reader sees EOF rather than EAGAIN.
+  char c;
+  EXPECT_THAT(read(rfd.get(), &c, 1), SyscallSucceedsWithValue(0));
+}
+
 TEST(ProcSelfExe, Absolute) {
   auto exe = ASSERT_NO_ERRNO_AND_VALUE(ReadLink("/proc/self/exe"));
   EXPECT_EQ(exe[0], '/');
@@ -1615,6 +1787,49 @@ TEST(ProcCpuinfo, DeniesWriteRoot) {
     EXPECT_THAT(pwrite(fd, "x", 1, 123), SyscallFails());
   }
 }
+
+#if defined(__aarch64__)
+// On arm64, /proc/cpuinfo and AT_HWCAP both come from elf_hwcap, so the
+// Features line must name exactly the HWCAP bits that getauxval(AT_HWCAP)
+// reports. Names are hwcap_str in arch/arm64/kernel/cpuinfo.c, indexed by bit.
+TEST(ProcCpuinfo, FeaturesMatchAtHwcap) {
+  static const char* const kHwcapNames[32] = {
+      "fp",       "asimd", "evtstrm", "aes",    "pmull",   "sha1",
+      "sha2",     "crc32", "atomics", "fphp",   "asimdhp", "cpuid",
+      "asimdrdm", "jscvt", "fcma",    "lrcpc",  "dcpop",   "sha3",
+      "sm3",      "sm4",   "asimddp", "sha512", "sve",     "asimdfhm",
+      "dit",      "uscat", "ilrcpc",  "flagm",  "ssbs",    "sb",
+      "paca",     "pacg",
+  };
+
+  std::string proc_cpuinfo =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/cpuinfo"));
+  absl::flat_hash_set<std::string> features;
+  bool found = false;
+  for (absl::string_view line : absl::StrSplit(proc_cpuinfo, '\n')) {
+    if (!absl::StartsWith(line, "Features")) {
+      continue;
+    }
+    std::pair<absl::string_view, absl::string_view> split =
+        absl::StrSplit(line, absl::MaxSplits(':', 1));
+    for (absl::string_view name :
+         absl::StrSplit(split.second, ' ', absl::SkipWhitespace())) {
+      features.insert(std::string(name));
+    }
+    found = true;
+    break;
+  }
+  ASSERT_TRUE(found) << proc_cpuinfo;
+
+  const unsigned long hwcap = getauxval(AT_HWCAP);  // NOLINT
+  for (int bit = 0; bit < 32; bit++) {
+    EXPECT_EQ(features.contains(kHwcapNames[bit]), (hwcap & (1UL << bit)) != 0)
+        << "feature " << kHwcapNames[bit] << " (HWCAP bit " << bit
+        << "), AT_HWCAP=" << absl::StrFormat("%#x", hwcap) << ", cpuinfo:\n"
+        << proc_cpuinfo;
+  }
+}
+#endif  // defined(__aarch64__)
 
 // Cpuinfo should not change across save/restore.
 TEST(ProcCpuinfo, Stable) {
@@ -2511,6 +2726,78 @@ TEST(ProcPidStatTest, ReapedTaskNeverReportsPIDZero) {
   EXPECT_FALSE(reported_zero.load(std::memory_order_relaxed));
 }
 
+// Returns the value of a "<field>:\t<n> kB" entry in parsed /proc/self/status.
+PosixErrorOr<uint64_t> ParseProcStatusKB(
+    const absl::btree_map<std::string, std::string>& status,
+    absl::string_view field) {
+  const auto it = status.find(field);
+  if (it == status.end()) {
+    return PosixError(ENOENT, absl::StrCat(field, " not found"));
+  }
+  absl::string_view number = it->second;
+  uint64_t kb;
+  if (!absl::ConsumeSuffix(&number, " kB") || !absl::SimpleAtoi(number, &kb)) {
+    return PosixError(EINVAL, absl::StrCat(field, ": ", it->second));
+  }
+  return kb;
+}
+
+PosixErrorOr<uint64_t> ProcSelfStatusKB(absl::string_view field) {
+  ASSIGN_OR_RETURN_ERRNO(std::string contents,
+                         GetContents("/proc/self/status"));
+  absl::btree_map<std::string, std::string> status;
+  ASSIGN_OR_RETURN_ERRNO(status, ParseProcStatus(contents));
+  return ParseProcStatusKB(status, field);
+}
+
+// VmHWM is the peak resident set size: it stays above VmRSS after memory is
+// released.
+TEST(ProcPidStatusTest, VmHWM) {
+  constexpr uint64_t kMappingKB = 64 * 1024;
+  uint64_t rss_mapped = 0;
+  {
+    const Mapping mapping = ASSERT_NO_ERRNO_AND_VALUE(MmapAnon(
+        kMappingKB * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_POPULATE));
+    rss_mapped = ASSERT_NO_ERRNO_AND_VALUE(ProcSelfStatusKB("VmRSS"));
+  }
+  const std::string contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/status"));
+  const auto status = ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatus(contents));
+  const uint64_t hwm =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatusKB(status, "VmHWM"));
+  const uint64_t rss =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcStatusKB(status, "VmRSS"));
+  EXPECT_GT(rss_mapped, rss + kMappingKB / 2);
+  EXPECT_GT(hwm, rss);
+}
+
+// A thread group leader that has exited while other threads run has no mm, so
+// its status has no Vm* lines.
+TEST(ProcPidStatusTest, ExitedLeaderOmitsVmLines) {
+  const auto rest = [] {
+    const std::string path = absl::StrCat("/proc/", getpid(), "/status");
+    ScopedThread reader([&path] {
+      // Poll until the leader is a zombie, then reopen status so the check does
+      // not observe an mm captured before the leader exited.
+      for (int i = 0; i < 1000; ++i) {
+        const PosixErrorOr<std::string> status = GetContents(path);
+        TEST_CHECK(status.ok());
+        if (absl::StrContains(status.ValueOrDie(), "State:\tZ")) {
+          const PosixErrorOr<std::string> fresh = GetContents(path);
+          TEST_CHECK(fresh.ok());
+          TEST_CHECK(absl::StrContains(fresh.ValueOrDie(), "State:\tZ"));
+          TEST_CHECK(!absl::StrContains(fresh.ValueOrDie(), "\nVm"));
+          _exit(0);
+        }
+        absl::SleepFor(absl::Milliseconds(10));
+      }
+      _exit(1);
+    });
+    syscall(SYS_exit, 0);
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
 // Parse an array of NUL-terminated char* arrays, returning a vector of
 // strings.
 std::vector<std::string> ParseNulTerminatedStrings(std::string contents) {
@@ -3199,6 +3486,44 @@ TEST(ProcTask, ProcRootNeverListsZeroTID) {
   reader3.Join();
   reader4.Join();
   EXPECT_FALSE(listed_zero.load(std::memory_order_relaxed));
+}
+
+TEST(ProcTask, ImmutableTaskDirectories) {
+  struct statvfs st;
+  ASSERT_THAT(statvfs("/proc", &st), SyscallSucceeds());
+  SKIP_IF(st.f_flag & ST_RDONLY);  // rename requires a writable mount.
+
+  for (const char* dir : {"/proc/self", "/proc/thread-self"}) {
+    SCOPED_TRACE(dir);
+    EXPECT_THAT(access(dir, R_OK | X_OK), SyscallSucceeds());
+    EXPECT_THAT(access(dir, W_OK), SyscallFailsWithErrno(EPERM));
+  }
+
+  // Immutability takes precedence over the directory's mode bits.
+  AutoCapability cap(CAP_DAC_OVERRIDE, false);
+  EXPECT_THAT(rename("/proc/self/status", "/proc/version"),
+              SyscallFailsWithErrno(EPERM));
+}
+
+TEST(ProcTask, OpenImmutableTaskDirectories) {
+  const bool has_override =
+      ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_DAC_OVERRIDE));
+  for (const bool with_override : {true, false}) {
+    if (with_override && !has_override) {
+      continue;
+    }
+    SCOPED_TRACE(with_override ? "with CAP_DAC_OVERRIDE"
+                               : "without CAP_DAC_OVERRIDE");
+    AutoCapability cap(CAP_DAC_OVERRIDE, with_override);
+    for (const char* dir : {"/proc/self", "/proc/thread-self"}) {
+      SCOPED_TRACE(dir);
+      for (const int flags :
+           {O_WRONLY, O_RDWR, O_RDONLY | O_TRUNC, O_CREAT | O_RDONLY}) {
+        SCOPED_TRACE(flags);
+        EXPECT_THAT(Open(dir, flags, 0600), PosixErrorIs(EISDIR));
+      }
+    }
+  }
 }
 
 TEST(ProcTask, TaskDirCannotBeDeleted) {

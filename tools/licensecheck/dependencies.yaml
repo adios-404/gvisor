@@ -6,6 +6,8 @@
 # by --mode=fetch, so you can hand-edit the file for these.
 # license_source selects an immutable upstream notice for a pinned binary artifact;
 # changing its artifact URL/hash requires renewing that explicit source audit.
+# A local LicenseRef records terms reviewed from the artifact itself.
+# Re-audit these terms when the artifact URL or SHA256 changes.
 - dependency: abseil-cpp
   version: https://github.com/abseil/abseil-cpp/releases/download/20260817.0/abseil-cpp-20260817.0.tar.gz
   retrieved: "2026-10-06"
@@ -79,10 +81,10 @@
   sha256: cadcf7ea4efe3a68728893813643cebe1185e5b1d4be5b96245f65c9a4d5ea41
   license: MIT
 - dependency: bazel_lib
-  version: https://github.com/bazel-contrib/bazel-lib/releases/download/v3.2.2/bazel-lib-v3.2.2.tar.gz
-  retrieved: "2026-10-06"
-  commit: cac2d7855949d1b222fa26888892fbbe1d31015d
-  sha256: 3d62bf30b95b71a566d9ebca50ee78d370b12522d244235b41166f65b142705d
+  version: https://github.com/bazel-contrib/bazel-lib/releases/download/v3.4.0/bazel-lib-v3.4.0.tar.gz
+  retrieved: "2026-10-30"
+  commit: c511ac0a18bc16d98969b92b38fcea4ecbde96e9
+  sha256: 3f4abcf708b83ca040cb6b36fa5f8871d60f136b5f7d3c697b6da3343b9ec1da
   license: Apache-2.0
 - dependency: bazel_skylib
   version: https://github.com/bazelbuild/bazel-skylib/releases/download/1.9.2/bazel-skylib-1.9.2.tar.gz
@@ -90,6 +92,12 @@
   commit: 3de43ed45e1c7923d53c4db56ca3de3e46601580
   sha256: 37cdfbc6faefea94f7b37760a305c98c08981116c2bc9e821e3b423221fad8c8
   license: Apache-2.0
+- dependency: buildifier_prebuilt
+  version: https://github.com/keith/buildifier-prebuilt/releases/download/8.5.1.4/buildifier-prebuilt.8.5.1.4.tar.gz
+  retrieved: "2026-11-20"
+  commit: 2d23069a6f2111875011df0e776942b2ca3c1a8d
+  sha256: bc0a95ad65808ce60dda3bf9e30865568021842fbef95191599fb0325347f90b
+  license: MIT
 - dependency: buildkite_pipeline_schema
   version: https://raw.githubusercontent.com/buildkite/pipeline-schema/3413455899dadd5f721f481ca247bc55e78bf5b9/schema.json
   retrieved: "2026-10-26"
@@ -783,10 +791,10 @@
   sha256: 55c8ce068257aa0d263aad7470113dafcd50f955ee754fc853c2fdcd31ad096f
   license: Apache-2.0
 - dependency: github_workflow_schema
-  version: https://raw.githubusercontent.com/SchemaStore/schemastore/166136b96a14f103a948053903e9339e63ad9170/src/schemas/json/github-workflow.json
-  retrieved: "2026-08-27"
-  commit: 166136b96a14f103a948053903e9339e63ad9170
-  sha256: 7499ccb3e75975504ea1ee7c70291e0c9f6c1f684678091d013061fe263e3ddb
+  version: https://raw.githubusercontent.com/SchemaStore/schemastore/498a42a4f41f467d8cdc36a5b5c546605a8935c3/src/schemas/json/github-workflow.json
+  retrieved: "2026-11-19"
+  commit: 498a42a4f41f467d8cdc36a5b5c546605a8935c3
+  sha256: 0528a890c1a6f4209444c421dbb752888a934a540f2a677146d78ed7f2321cbf
   license: Apache-2.0
 - dependency: go.opencensus.io
   version: v0.24.0
@@ -1109,20 +1117,32 @@
   commit: f5dcbae736e5d7f83a35718e01be1a8e3010fa39
   sha256: 7ab5feffbf78557f626f2e3e3204788528394494715a30fc2070fcddc2051b7b
   license: BSD-2-Clause
+- dependency: libpluginstack
+  version: https://github.com/alipay/tldk/archive/cec8ff773c2ee609a1fcbc389aecb4dbb4e3bb88.tar.gz
+  retrieved: "2026-09-26"
+  commit: cec8ff773c2ee609a1fcbc389aecb4dbb4e3bb88
+  sha256: 00bc2824cbc3024c4e5514ebac7ecab6598dd60e444af9dfeece079bc5b96980
+  license:
+    - Apache-2.0
+    - BSD-3-Clause
+    - CC0-1.0
 - dependency: llvm
-  version: https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.24/hermetic-llvm-v0.8.24.tar.gz
-  retrieved: "2026-10-02"
-  commit: 39e71f9391895169b05ccd62cbb1956ae5322ff3
-  sha256: 64d421959bba30cb3bcdd1e57a01b8ef2f12b93db3d1ab4a34fe5f4d2ca78aa4
+  version: https://github.com/hermeticbuild/hermetic-llvm/releases/download/v0.8.26/hermetic-llvm-v0.8.26.tar.gz
+  retrieved: "2026-11-12"
+  commit: 53ff474eae0a3e617ce615dec635c4b38db495c8
+  sha256: b00dbcf7fdfa111ee9ea763b76b775e627696c27bc552cf63e74e0ea8e2ddfb7
   license: MIT
-- dependency: llvm-raw
-  version: https://github.com/llvm/llvm-project/archive/cb2f0d0a5f14c183e7182aba0f0e54a518de9e3f.tar.gz
-  retrieved: "2026-08-27"
-  commit: cb2f0d0a5f14c183e7182aba0f0e54a518de9e3f
-  sha256: e8ece380fdb57dc6f8e42df9db872a1ade5056c5379075e3e2f99c89200aea69
+- dependency: llvm-project
+  version: https://github.com/hermeticbuild/llvm-redist/releases/download/llvmorg-23.1.2-r1/llvm-project-23.1.2.src.tar.zst
+  retrieved: "2026-11-05"
+  commit: 85ac560262434c9ccfc0c183ec22d4138ed647fb
+  sha256: 271da53a2feb0cb221a9276a14268a3b76ad802c7fc8fb1098291a43b06e4c56
   license:
     - Apache-2.0 WITH LLVM-exception
-    - MIT
+    - BSD-3-Clause
+    - CC0-1.0
+    - NCSA
+    - Spencer-94
 - dependency: ltp
   version: https://github.com/linux-test-project/ltp/releases/download/20260930/ltp-full-20260930.tar.xz
   retrieved: "2026-10-22"
@@ -1141,6 +1161,14 @@
   commit: 2d4b4996f0bf52376704c49264164e166213159e
   sha256: dbad4a23abcca6171e47b79edc53bd6a41067a3b75f9e8b104656b459ff25046
   license: Apache-2.0
+- dependency: plugin_dpdk
+  version: https://github.com/DPDK/dpdk/archive/refs/tags/v18.11.tar.gz
+  retrieved: "2026-09-26"
+  commit: 0da7f445df445630c794897347ee360d6fe6348b
+  sha256: 0026a9bc67f37f07969101bdf72fd5921169b4744f765118e5db57cace645bee
+  license:
+    - BSD-3-Clause
+    - GPL-2.0-only
 - dependency: protobuf
   version: https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protobuf-35.1.bazel.tar.gz
   retrieved: "2026-10-06"
@@ -1299,11 +1327,17 @@
   commit: 77064f0caa37d0fb2232f54feb5fba275aeebbd3
   sha256: bd7124a844d0403b4b353bcea34d6c8b2ba88dc26881c26c9ee668da89b71846
   license: Apache-2.0
+- dependency: rules_foreign_cc
+  version: https://github.com/bazel-contrib/rules_foreign_cc/releases/download/0.16.0/rules_foreign_cc-0.16.0.tar.gz
+  retrieved: "2026-09-26"
+  commit: 931cb33cf882380394a9c32dcd548259a2a0a357
+  sha256: 327b3fcacde97b9665424db2b6c37e6f8da59ecc783dc5b8683c69396f820a12
+  license: Apache-2.0
 - dependency: rules_go
-  version: https://github.com/bazel-contrib/rules_go/releases/download/v0.63.0/rules_go-v0.63.0.zip
-  retrieved: "2026-09-29"
-  commit: 9792f1c079a7602347e0fd966542b6d6b35a6c64
-  sha256: c3e253237109ab2e2a8d3cb075688b98a6e6fce43d849849648e8e3a84f20d6f
+  version: https://github.com/bazel-contrib/rules_go/releases/download/v0.65.0/rules_go-v0.65.0.zip
+  retrieved: "2026-10-27"
+  commit: fb591bc876354b939ef767887e772c15f679a283
+  sha256: d4a6e93dc63944172bc3b915a11bfa8d7391c9f1fdc11d7e43724f497617f0e5
   license: Apache-2.0
 - dependency: rules_img
   version: https://github.com/bazel-contrib/rules_img/releases/download/v0.3.23/rules_img-v0.3.23.tar.gz
@@ -1364,6 +1398,12 @@
     - Apache-2.0
     - BSD-3-Clause
     - MIT
+- dependency: tar.bzl
+  version: https://github.com/bazel-contrib/tar.bzl/releases/download/v0.10.9/tar.bzl-v0.10.9.tar.gz
+  retrieved: "2026-11-07"
+  commit: 00abfca5723f527a2651c36d059188f702bbd392
+  sha256: 8a3b78120510962fc74b577aaaf52412537cfbc25c88a596a375bd409e66b98a
+  license: Apache-2.0
 - dependency: xds
   version: https://github.com/cncf/xds/archive/ee656c7534f5d7dc23d44dd611689568f72017a6.tar.gz
   retrieved: "2026-08-27"

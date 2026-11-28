@@ -54,6 +54,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -307,6 +308,12 @@ type Kernel struct {
 	// +checkatomic
 	uniqueID atomicbitops.Uint64
 
+	bootIDMu sync.Mutex `state:"nosave"`
+	// bootID is generated on first use and saved across checkpoints.
+	//
+	// +checklocks:bootIDMu
+	bootID string
+
 	// nextInotifyCookie is a monotonically increasing counter used for
 	// generating unique inotify event cookies.
 	//
@@ -380,10 +387,6 @@ type Kernel struct {
 	// avoids the possibility of inode number collisions due to the hack
 	// described in shm.Shm.InodeID().
 	sysVShmDevID uint32
-
-	// If set to true, report address space activation waits as if the task is in
-	// external wait so that the watchdog doesn't report the task stuck.
-	SleepForAddressSpaceActivation bool
 
 	// Exceptions to YAMA ptrace restrictions. Each key-value pair represents a
 	// tracee-tracer relationship. The key is a process (technically, the thread
@@ -478,6 +481,10 @@ type Kernel struct {
 
 	// IOUringEnabled determines if io_uring is enabled.
 	IOUringEnabled bool
+
+	// LandlockEnabled determines if the Landlock syscalls are available. If
+	// false, they fail with ENOSYS. LandlockEnabled is immutable.
+	LandlockEnabled bool
 
 	// MaxKeySetSize is the maximum number of keys in a key set.
 	MaxKeySetSize atomicbitops.Int32
@@ -675,7 +682,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		return fmt.Errorf("failed to create pipefs filesystem: %v", err)
 	}
 	defer pipeFilesystem.DecRef(ctx)
-	pipeMount := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{})
+	pipeMount := k.vfs.NewDisconnectedMount(pipeFilesystem, nil, &vfs.MountOptions{Internal: true})
 	k.pipeMount = pipeMount
 
 	nsfsFilesystem, err := nsfs.NewFilesystem(&k.vfs)
@@ -683,7 +690,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		return fmt.Errorf("failed to create nsfs filesystem: %v", err)
 	}
 	defer nsfsFilesystem.DecRef(ctx)
-	k.nsfsMount = k.vfs.NewDisconnectedMount(nsfsFilesystem, nil, &vfs.MountOptions{})
+	k.nsfsMount = k.vfs.NewDisconnectedMount(nsfsFilesystem, nil, &vfs.MountOptions{Internal: true})
 	k.rootUserNamespace.SetInode(nsfs.NewInode(ctx, k.nsfsMount, k.rootUserNamespace))
 	k.rootNetworkNamespace.SetInode(nsfs.NewInode(ctx, k.nsfsMount, k.rootNetworkNamespace))
 	k.rootIPCNamespace.SetInode(nsfs.NewInode(ctx, k.nsfsMount, k.rootIPCNamespace))
@@ -706,14 +713,14 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	}
 	defer tmpfsFilesystem.DecRef(ctx)
 	defer tmpfsRoot.DecRef(ctx)
-	k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{})
+	k.shmMount = k.vfs.NewDisconnectedMount(tmpfsFilesystem, tmpfsRoot, &vfs.MountOptions{Internal: true})
 
 	socketFilesystem, err := sockfs.NewFilesystem(&k.vfs)
 	if err != nil {
 		return fmt.Errorf("failed to create sockfs filesystem: %v", err)
 	}
 	defer socketFilesystem.DecRef(ctx)
-	k.socketMount = k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{})
+	k.socketMount = k.vfs.NewDisconnectedMount(socketFilesystem, nil, &vfs.MountOptions{Internal: true})
 
 	sysVShmDevMinor, err := k.vfs.GetAnonBlockDevMinor()
 	if err != nil {
@@ -1231,8 +1238,10 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 		}
 		log.Infof("Memory files load took [%s].", time.Since(mfStart))
 	} else {
-		if err := asyncMFLoader.WaitMainMFStart(); err != nil {
-			return fmt.Errorf("main MF start failed: %w", err)
+		// The upper layer may store its data in a private MemoryFile, which
+		// must be loaded before TarUpperLayer reads it.
+		if err := asyncMFLoader.WaitMetadata(); err != nil {
+			return fmt.Errorf("failed to load MemoryFile metadata: %w", err)
 		}
 	}
 
@@ -1260,6 +1269,16 @@ func (k *Kernel) ExtractRootfsUpperLayer(ctx context.Context, r io.Reader, async
 	}
 
 	return nil
+}
+
+// BootID returns the UUID shared by this kernel's proc mounts.
+func (k *Kernel) BootID() string {
+	k.bootIDMu.Lock()
+	defer k.bootIDMu.Unlock()
+	if k.bootID == "" {
+		k.bootID = rand.UUID()
+	}
+	return k.bootID
 }
 
 // UniqueID returns a unique identifier.

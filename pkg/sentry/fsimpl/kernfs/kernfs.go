@@ -163,6 +163,17 @@ func (fs *Filesystem) SafeDecRefFD(ctx context.Context, fd *vfs.FileDescription)
 	fd.DecRef(ctx)
 }
 
+// DeferDecRefFD defers dropping a reference on fd until fs processes its
+// deferred references, which kernfs does after it releases Filesystem.mu.
+// Inode methods that kernfs calls with Filesystem.mu locked, such as Getlink,
+// must use DeferDecRefFD instead of SafeDecRefFD: even if fd's dentry belongs
+// to another filesystem, releasing fd may drop references on dentries of this
+// filesystem (for example, a Landlock ruleset holds references on the files
+// that its rules name).
+func (fs *Filesystem) DeferDecRefFD(fd *vfs.FileDescription) {
+	fs.deferDecRef(fd)
+}
+
 // SafeDecRef safely DecRef the virtual dentry making sure DecRef is deferred
 // in case Filesystem.mu is held. See comment on Filesystem.mu.
 func (fs *Filesystem) SafeDecRef(ctx context.Context, vd vfs.VirtualDentry) {
@@ -246,6 +257,9 @@ type Dentry struct {
 
 	parent atomic.Pointer[Dentry] `state:".(*Dentry)"`
 
+	// +checklocks:fs.mu
+	// +checklocks:fs.ancestryMu
+	// +checklocksreadany
 	name string
 
 	// If cached is true, dentryEntry links dentry into
@@ -449,6 +463,10 @@ func (d *Dentry) cacheLocked(ctx context.Context) {
 func (fs *Filesystem) evictCachedDentryLocked(ctx context.Context) {
 	// Evict the least recently used dentry because cache size is greater than
 	// max cache size (configured on mount).
+	//
+	// TODO(b/579946399): Don't evict dentries with inotify watches. Watches
+	// don't hold a reference on their target, so this may destroy the watches
+	// of inodes that are created on lookup.
 	fs.cachedDentries.Back().evictLocked(ctx)
 }
 
@@ -475,7 +493,7 @@ func (d *Dentry) evictLocked(ctx context.Context) {
 			for _, rc := range rcs {
 				d.fs.deferDecRef(rc)
 			}
-			delete(parent.children, d.name)
+			delete(parent.children, d.name) // +checklocksignore: d.fs.mu is held for writing per precondition.
 			parent.dirMu.Unlock()
 		}
 		d.destroy(ctx)
@@ -616,6 +634,11 @@ func (d *Dentry) Watches() *vfs.Watches {
 	return d.inode.Watches()
 }
 
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot.
+func (d *Dentry) LandlockSlot() vfs.LandlockSlot {
+	return d.inode.LandlockSlot()
+}
+
 // OnZeroWatches implements vfs.Dentry.OnZeroWatches.
 func (d *Dentry) OnZeroWatches(context.Context) {}
 
@@ -645,7 +668,7 @@ func (d *Dentry) insertChildLocked(name string, child *Dentry) {
 	}
 	d.IncRef() // DecRef in child's Dentry.destroy.
 	child.parent.Store(d)
-	child.name = name
+	child.name = name // +checklocksignore: child is newly allocated and not yet published.
 	if d.children == nil {
 		d.children = make(map[string]*Dentry)
 	}
@@ -799,6 +822,10 @@ type Inode interface {
 
 	// Watches returns the set of inotify watches associated with this inode.
 	Watches() *vfs.Watches
+
+	// LandlockSlot returns the slot that locates the Landlock object of this
+	// inode, or nil if Landlock rules cannot name it.
+	LandlockSlot() vfs.LandlockSlot
 
 	// Anonymous indicates that the Inode is anonymous. It will never have
 	// a name or parent.

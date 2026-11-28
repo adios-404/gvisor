@@ -18,8 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"unsafe"
-
-	"gvisor.dev/gvisor/pkg/gohacks"
 )
 
 // An AddrRangeSeq represents a sequence of AddrRanges.
@@ -164,7 +162,7 @@ func (ars AddrRangeSeq) externalTail() AddrRangeSeq {
 	if ars.limit > headLen {
 		tailLimit = int64(ars.limit - headLen)
 	}
-	extSlice := gohacks.Slice(data, ars.length)
+	extSlice := unsafe.Slice(data, ars.length)
 	return addrRangeSeqFromSliceLimited(extSlice[1:], tailLimit)
 }
 
@@ -211,7 +209,9 @@ func (ars AddrRangeSeq) DropFirst64(n int64) AddrRangeSeq {
 			return AddrRangeSeq{}
 		}
 	default:
-		if rawHeadLen := (*AddrRange)(ars.data).Length(); ars.offset == rawHeadLen {
+		// The head is empty if all of its bytes were dropped, or if the limit
+		// truncates it to 0 bytes.
+		if rawHeadLen := (*AddrRange)(ars.data).Length(); ars.offset == rawHeadLen || ars.limit == 0 {
 			ars = ars.externalTail()
 		}
 	}

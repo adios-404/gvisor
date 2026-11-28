@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,9 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/sandboxposture"
 	"gvisor.dev/gvisor/pkg/test/testutil"
+	"gvisor.dev/gvisor/runsc/cgroup"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/gvisorbinaries"
+	"gvisor.dev/gvisor/runsc/sandbox"
 )
 
 // This test checks the security posture of the Sentry (`boot`) process.
@@ -110,6 +114,8 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		conf.FDLimit = tc.fdLimit
 	}
 	conf.EnableCoreTags = tc.coreTags
+	// The Sentry must not hold the error log after it starts the container.
+	conf.LogFilename = filepath.Join(t.TempDir(), "error.log")
 	// testutil.TestConfig sets this so that tests can run without privileges.
 	// Undo it here since we do want to test the non-test case.
 	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = false
@@ -194,6 +200,17 @@ func testBootPosture(t *testing.T, tc postureCase) {
 	}
 
 	pid := c.Sandbox.Getpid()
+	// Wait for the control server to be responsive.
+	if _, err := c.Sandbox.Stacks(); err != nil {
+		t.Fatalf("Error getting the stacks of the created sandbox: %v", err)
+	}
+	created, err := sandboxposture.Collect(sandboxposture.Opts{PID: pid, RefPID: os.Getpid()})
+	if err != nil {
+		t.Fatalf("Error collecting posture of created sandbox %d: %v", pid, err)
+	}
+	if created.FDs.Counts[sandboxposture.FDErrorLog] == 0 {
+		t.Errorf("Created sandbox %d does not hold the error log %q", pid, conf.LogFilename)
+	}
 	if err := c.Start(conf); err != nil {
 		t.Fatalf("Error starting container: %v", err)
 	}
@@ -214,7 +231,63 @@ func testBootPosture(t *testing.T, tc postureCase) {
 		if err := checkProcessCaps(goferPid, goferCaps); err != nil {
 			t.Errorf("Gofer capabilities: %v", err)
 		}
+		checkGoferPosture(t, goferPid)
 	})
+}
+
+func checkGoferPosture(t *testing.T, pid int) {
+	t.Helper()
+	var statfs unix.Statfs_t
+	path := fmt.Sprintf("/proc/%d/root/..", pid)
+	if err := unix.Statfs(path, &statfs); err != nil {
+		t.Fatalf("Statfs(%q): %v", path, err)
+	}
+	if statfs.Type != unix.TMPFS_MAGIC {
+		t.Errorf("Parent of gofer root: filesystem type = %#x, want %#x (tmpfs)", statfs.Type, unix.TMPFS_MAGIC)
+	}
+	if want := int64(unix.ST_RDONLY | unix.ST_NOSUID | unix.ST_NODEV | unix.ST_NOEXEC); statfs.Flags&want != want {
+		t.Errorf("Parent of gofer root: mount flags = %#x, want all of %#x", statfs.Flags, want)
+	}
+	rawEnv, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		t.Fatalf("Reading gofer environ: %v", err)
+	}
+	var gomaxprocsVals, godebugVals []string
+	for _, entry := range strings.Split(strings.TrimSuffix(string(rawEnv), "\x00"), "\x00") {
+		if v, ok := strings.CutPrefix(entry, "GOMAXPROCS="); ok {
+			gomaxprocsVals = append(gomaxprocsVals, v)
+		}
+		if v, ok := strings.CutPrefix(entry, "GODEBUG="); ok {
+			godebugVals = append(godebugVals, v)
+		}
+	}
+	selfCg, _ := cgroup.NewSelf()
+	selfCPUs, _ := sandbox.CalculateCPUNum(selfCg, nil, true /* cpuNumFromQuota */)
+	wantProcs := strconv.Itoa(max(1, min(selfCPUs, 8)))
+	if len(gomaxprocsVals) != 1 || gomaxprocsVals[0] != wantProcs {
+		t.Errorf("Gofer GOMAXPROCS = %v, want [%s]", gomaxprocsVals, wantProcs)
+	}
+	if len(godebugVals) != 1 || !strings.HasSuffix(godebugVals[0], "containermaxprocs=0,updatemaxprocs=0") {
+		t.Errorf("Gofer GODEBUG = %v, want single entry ending with containermaxprocs=0,updatemaxprocs=0", godebugVals)
+	}
+
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	fds, err := os.ReadDir(fdDir)
+	if err != nil {
+		t.Fatalf("Reading %s: %v", fdDir, err)
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(target, "config.json") {
+			t.Errorf("Gofer FD %s still points to spec file %q after startup", fd.Name(), target)
+		}
+		if strings.HasPrefix(target, "/sys/fs/cgroup/") {
+			t.Errorf("Gofer FD %s holds host cgroup file %q", fd.Name(), target)
+		}
+	}
 }
 
 // ownNetNS is whether this process has a network namespace of its own.

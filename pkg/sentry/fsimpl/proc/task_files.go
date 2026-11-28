@@ -855,7 +855,13 @@ func (s *taskStatData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d ", ppid)
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfProcessGroup(s.task.ThreadGroup().ProcessGroup()))
 	fmt.Fprintf(buf, "%d ", s.pidns.IDOfSession(s.task.ThreadGroup().Session()))
-	fmt.Fprintf(buf, "0 0 " /* tty_nr tpgid */)
+	ttyNr, tpgid := s.task.ThreadGroup().ControllingTTYStat(s.pidns)
+	// Use strconv rather than fmt to avoid boxing the values.
+	var nb [32]byte
+	b := strconv.AppendUint(nb[:0], uint64(ttyNr), 10)
+	b = append(b, ' ')
+	b = strconv.AppendInt(b, int64(tpgid), 10)
+	buf.Write(append(b, ' '))
 	flags := 0
 	if s.task.ExitState() >= kernel.TaskExitInitiated {
 		flags |= linux.PF_EXITING
@@ -1052,17 +1058,11 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	sgid := creds.SavedKGID.In(s.userns).OrOverflow()
 	fsgid := creds.FilesystemKGID.In(s.userns).OrOverflow()
 	var fds int
-	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
 			fds = fdTable.CurrentMaxFDs()
 		}
 	})
-	if mm := getMM(s.task); mm != nil {
-		vss = mm.VirtualMemorySize()
-		rss = mm.ResidentSetSize()
-		data = mm.VirtualDataSize()
-	}
 	fmt.Fprintf(buf, "Uid:\t%d\t%d\t%d\t%d\n", ruid, euid, suid, fsuid)
 	fmt.Fprintf(buf, "Gid:\t%d\t%d\t%d\t%d\n", rgid, egid, sgid, fsgid)
 	fmt.Fprintf(buf, "FDSize:\t%d\n", fds)
@@ -1076,9 +1076,16 @@ func (s *statusFD) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	}
 	buf.WriteString(" \n")
 
-	fmt.Fprintf(buf, "VmSize:\t%d kB\n", vss>>10)
-	fmt.Fprintf(buf, "VmRSS:\t%d kB\n", rss>>10)
-	fmt.Fprintf(buf, "VmData:\t%d kB\n", data>>10)
+	// A task without an mm, such as an exited thread group leader, has no Vm*
+	// lines.
+	if mm := getMM(s.task); mm != nil {
+		// Read ResidentSetSize before MaxResidentSetSize so VmHWM >= VmRSS.
+		rss := mm.ResidentSetSize()
+		fmt.Fprintf(buf, "VmSize:\t%d kB\n", mm.VirtualMemorySize()>>10)
+		fmt.Fprintf(buf, "VmHWM:\t%d kB\n", mm.MaxResidentSetSize()>>10)
+		fmt.Fprintf(buf, "VmRSS:\t%d kB\n", rss>>10)
+		fmt.Fprintf(buf, "VmData:\t%d kB\n", mm.VirtualDataSize()>>10)
+	}
 
 	fmt.Fprintf(buf, "Threads:\t%d\n", s.task.ThreadGroup().Count())
 	// Signal masks are rendered as in Linux's fs/proc/array.c:task_sig().
@@ -1122,6 +1129,9 @@ type ioUsage interface {
 type ioData struct {
 	kernfs.DynamicBytesFile
 
+	// task is the task whose /proc/[pid] directory contains the file.
+	task *kernel.Task
+
 	ioUsage
 }
 
@@ -1129,6 +1139,9 @@ var _ dynamicInode = (*ioData)(nil)
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (i *ioData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	if err := kernel.CheckLandlockTaskAccess(ctx, i.task); err != nil {
+		return err
+	}
 	io := usage.IO{}
 	io.Accumulate(i.IOUsage())
 
@@ -1573,6 +1586,9 @@ func (s *namespaceSymlink) getInode(t *kernel.Task) *nsfs.Inode {
 
 // Readlink implements kernfs.Inode.Readlink.
 func (s *namespaceSymlink) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
+	if err := kernel.CheckLandlockTaskAccess(ctx, s.task); err != nil {
+		return "", err
+	}
 	if err := checkTaskState(s.task); err != nil {
 		return "", err
 	}
@@ -1590,6 +1606,9 @@ func (s *namespaceSymlink) Readlink(ctx context.Context, mnt *vfs.Mount) (string
 
 // Getlink implements kernfs.Inode.Getlink.
 func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if err := kernel.CheckLandlockTaskAccess(ctx, s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}

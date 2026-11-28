@@ -183,7 +183,7 @@ const capSysPtrace = "CAP_SYS_PTRACE"
 // config.
 var baseFDClasses = []string{
 	FDNullDev,
-	FDRegular, // debug and log files donated by the parent
+	FDRegular, // log files donated by the parent other than `FDErrorLog`
 	FDPipe,
 	FDSocket,
 	FDAnonPrefix + "eventfd",
@@ -312,7 +312,7 @@ func expectedNamespaces(opts ExpectedOpts, newUserNS bool) Namespaces {
 		PID:    NSNew,
 		IPC:    NSNew,
 		UTS:    NSNew,
-		Cgroup: NSInherited, // We set IgnoreCgroups, so this doesn't change.
+		Cgroup: NSNew,
 		Time:   NSInherited,
 		User:   NSInherited,
 	}
@@ -334,7 +334,7 @@ func expectedFilesystem(opts ExpectedOpts) Filesystem {
 	entries := []string{"etc/", "etc/localtime", "proc/"}
 	entries = append(entries, opts.ExtraRootEntries...)
 
-	mounts := []string{"/ tmpfs ro"}
+	mounts := []string{"/ tmpfs ro,nosuid,nodev,noexec"}
 	mounts = append(mounts, opts.ExtraMounts...)
 
 	sort.Strings(entries)
@@ -410,6 +410,13 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		memlock = LimitUnlimited
 	}
 
+	// runsc confines the cgroup it creates; a sandbox it leaves in the
+	// reference process's cgroup inherits its device access.
+	deviceCgroup := DeviceCgroupSameAsRef
+	if opts.Cgroup {
+		deviceCgroup = DeviceCgroupConfined
+	}
+
 	uidMap, gidMap := MapSameAsRef, MapSameAsRef
 	if newUserNS {
 		if applyCaps {
@@ -430,6 +437,7 @@ func expectedAttrs(opts ExpectedOpts, applyCaps, newUserNS bool) Attrs {
 		UIDMap:             uidMap,
 		GIDMap:             gidMap,
 		ProcFileOwner:      OwnerSameAsProcess,
+		DeviceCgroup:       deviceCgroup,
 	}
 }
 

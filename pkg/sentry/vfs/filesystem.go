@@ -22,6 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // A Filesystem is a tree of nodes represented by Dentries, which forms part of
@@ -42,6 +43,18 @@ type Filesystem struct {
 
 	// fsType is the FilesystemType of this Filesystem.
 	fsType FilesystemType
+
+	// landlockMu serializes creating, releasing and detaching the
+	// LandlockObjects of files on this filesystem.
+	landlockMu sync.Mutex `state:"nosave"`
+
+	// landlockObjects contains every live LandlockObject of a file on this
+	// filesystem. landlockObjects is protected by landlockMu.
+	landlockObjects map[*LandlockObject]struct{} `state:"nosave"`
+
+	// landlockDetached is true once detachLandlockObjects has run.
+	// landlockDetached is protected by landlockMu.
+	landlockDetached bool `state:"nosave"`
 
 	// impl is the FilesystemImpl associated with this Filesystem. impl is
 	// immutable. This should be the last field in Dentry.
@@ -80,6 +93,7 @@ func (fs *Filesystem) DecRef(ctx context.Context) {
 		fs.vfs.filesystemsMu.Lock()
 		delete(fs.vfs.filesystems, fs)
 		fs.vfs.filesystemsMu.Unlock()
+		fs.detachLandlockObjects(ctx)
 		fs.impl.Release(ctx)
 	})
 }
@@ -127,6 +141,11 @@ type FilesystemImpl interface {
 	// Sync "causes all pending modifications to filesystem metadata and cached
 	// file data to be written to the underlying [filesystem]", as by syncfs(2).
 	Sync(ctx context.Context) error
+
+	// DrainDentryCache evicts unused cached dentries without changing cache
+	// policy. Live references are preserved, and concurrent operations may
+	// refill the cache. Unsupported filesystems return EOPNOTSUPP.
+	DrainDentryCache(ctx context.Context) error
 
 	// AccessAt checks whether a user with creds can access the file at rp.
 	AccessAt(ctx context.Context, rp *ResolvingPath, creds *auth.Credentials, ats AccessTypes) error
@@ -544,6 +563,19 @@ type FilesystemImpl interface {
 	// Preconditions: vd.Mount().Filesystem().Impl() == this FilesystemImpl.
 	IsDescendant(vfsroot, vd VirtualDentry) bool
 
+	// WalkAncestors calls visit on d and then on each of d's ancestors in this
+	// filesystem, up to the filesystem root. It stops early if visit returns
+	// false. While WalkAncestors runs, renames in this filesystem cannot
+	// change the ancestry of d. Files with no parent yield d alone.
+	//
+	// visit runs while WalkAncestors holds its locks, so visit must not
+	// acquire filesystem locks.
+	//
+	// Most implementations can use genericfstree.WalkAncestors.
+	//
+	// Preconditions: d is a dentry of this filesystem.
+	WalkAncestors(d *Dentry, visit func(*Dentry) bool)
+
 	// MountOptions returns mount options for the current filesystem. This
 	// should only return options specific to the filesystem (i.e. don't return
 	// "ro", "rw", etc). Options should be returned as a comma-separated string,
@@ -600,6 +632,12 @@ func (PrependPathSyntheticError) Error() string {
 // HostFDProvider is implemented by VFS objects backed by a host FD.
 type HostFDProvider interface {
 	HostFD() int
+}
+
+// DMABufProvider is implemented by file descriptions that wrap a host dma-buf
+// FD.
+type DMABufProvider interface {
+	DMABufHostFD() int
 }
 
 // MountRootPathProvider is an interface for filesystems that customize the

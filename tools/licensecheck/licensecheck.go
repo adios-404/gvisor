@@ -28,6 +28,7 @@
 // @google_root_pem) are maintained by hand: Fetch preserves an existing entry
 // whenever fetching fails. Explicit license_source notices are re-fetched on
 // every audit and fail closed if the notice or its artifact binding is invalid.
+// Terms audited from the artifact itself are retained while its pin matches.
 package licensecheck
 
 import (
@@ -77,8 +78,7 @@ type Entry struct {
 	LicenseSource string `yaml:"license_source,omitempty"`
 }
 
-// License is an SPDX license identifier (https://spdx.org/licenses/), one of
-// knownLicenses.
+// License is a recognized SPDX identifier or a document-local LicenseRef.
 type License string
 
 const (
@@ -95,6 +95,8 @@ const (
 	lgpl3       License = "LGPL-3.0-only"
 	mit         License = "MIT"
 	mpl2        License = "MPL-2.0"
+	ncsa        License = "NCSA"
+	spencer94   License = "Spencer-94"
 	unlicense   License = "Unlicense"
 	// noAssertion is the SPDX token for dependencies to which no software
 	// license applies, e.g. a certificate bundle.
@@ -116,6 +118,8 @@ var knownLicenses = map[License]bool{
 	lgpl3:       true,
 	mit:         true,
 	mpl2:        true,
+	ncsa:        true,
+	spencer94:   true,
 	unlicense:   true,
 	noAssertion: true,
 }
@@ -208,6 +212,8 @@ const (
 # by --mode=fetch, so you can hand-edit the file for these.
 # license_source selects an immutable upstream notice for a pinned binary artifact;
 # changing its artifact URL/hash requires renewing that explicit source audit.
+# A local LicenseRef records terms reviewed from the artifact itself.
+# Re-audit these terms when the artifact URL or SHA256 changes.
 `
 	dateFormat   = "2006-01-02"
 	fetchWorkers = 8
@@ -219,13 +225,35 @@ func Fetch(p Paths) error {
 	if err != nil {
 		return err
 	}
+	return fetch(p, deps)
+}
+
+func fetch(p Paths, deps []dep) error {
 	old, err := readEntries(p.YAML)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	oldByName := make(map[string]Entry)
 	for _, e := range old {
+		if _, ok := oldByName[e.Dependency]; ok {
+			return fmt.Errorf("duplicate entry for %s in %s", e.Dependency, p.YAML)
+		}
 		oldByName[e.Dependency] = e
+	}
+	// Validate every retained audit before starting network requests or
+	// rewriting the catalog. A changed pin needs a new artifact audit.
+	reviewed := make(map[string]Entry)
+	for _, d := range deps {
+		e := oldByName[d.name]
+		// Discovery emits only known licenses. Check any other recorded
+		// terms before discovery can overwrite a reviewed or malformed entry.
+		if !slices.ContainsFunc(e.License, func(l License) bool { return !knownLicenses[l] }) {
+			continue
+		}
+		if problems := verifyProblems([]dep{d}, []Entry{e}); len(problems) != 0 {
+			return fmt.Errorf("re-audit the license of %s: %s", d.name, strings.Join(problems, "; "))
+		}
+		reviewed[d.name] = e
 	}
 
 	type result struct {
@@ -236,6 +264,9 @@ func Fetch(p Paths) error {
 	sem := make(chan struct{}, fetchWorkers)
 	var wg sync.WaitGroup
 	for i, d := range deps {
+		if _, ok := reviewed[d.name]; ok {
+			continue
+		}
 		wg.Add(1)
 		go func(i int, d dep) {
 			defer wg.Done()
@@ -251,6 +282,11 @@ func Fetch(p Paths) error {
 	var entries []Entry
 	var failed []string
 	for i, d := range deps {
+		if e, ok := reviewed[d.name]; ok {
+			fmt.Fprintf(os.Stderr, "%-60s %s (kept artifact audit)\n", d.name, e.License)
+			entries = append(entries, e)
+			continue
+		}
 		r := results[i]
 		if r.err != nil {
 			if e := oldByName[d.name]; e.LicenseSource != "" {
@@ -360,13 +396,29 @@ func verifyProblems(deps []dep, entries []Entry) []string {
 			if d.sha256 != "" && e.SHA256 != d.sha256 {
 				problems = append(problems, fmt.Sprintf("%s was audited with sha256 %q, but is now pinned to %q", d.name, e.SHA256, d.sha256))
 			}
+			hasLicenseRef := false
 			for i, license := range e.License {
 				if !knownLicenses[license] {
-					problems = append(problems, fmt.Sprintf("%s has unknown license %q", d.name, license))
+					// SPDX 2.3, Annex D: a local reference ends in a nonempty idstring.
+					const idChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-"
+					id, ok := strings.CutPrefix(string(license), "LicenseRef-")
+					if !ok || id == "" || strings.Trim(id, idChars) != "" {
+						problems = append(problems, fmt.Sprintf("%s has unknown license %q", d.name, license))
+					} else {
+						hasLicenseRef = true
+					}
 				}
 				if i > 0 && e.License[i-1] >= license {
 					problems = append(problems, fmt.Sprintf("licenses of %s are not sorted and unique", d.name))
 					break
+				}
+			}
+			if hasLicenseRef {
+				if e.LicenseSource != "" {
+					problems = append(problems, fmt.Sprintf("%s: LicenseRef cannot be combined with license_source", d.name))
+				}
+				if d.kind != kindArchive || !artifactSHA256RE.MatchString(d.sha256) {
+					problems = append(problems, fmt.Sprintf("%s: artifact audit requires a pinned SHA256", d.name))
 				}
 			}
 			if _, err := time.Parse(dateFormat, e.Retrieved); err != nil {
@@ -397,48 +449,9 @@ func enumerate(p Paths) ([]dep, error) {
 	if err != nil {
 		return nil, err
 	}
-	// refs are the repos to audit: modules as name@version, everything else
-	// by apparent or canonical repo name.
-	var refs []repoRef
-	for _, m := range graph.Dependencies {
-		refs = append(refs, repoRef{m.Key, m.Name})
-	}
-	for _, u := range graph.ExtensionUsages {
-		switch {
-		case strings.HasPrefix(u.Key, "@@//:MODULE.bazel%") &&
-			(strings.HasSuffix(u.Key, " http_archive") || strings.HasSuffix(u.Key, " http_file")):
-			// http_archive/http_file declared directly in MODULE.bazel.
-		case strings.HasSuffix(u.Key, "%go_deps"):
-			// Go repos imported from the gazelle go_deps extension.
-		case strings.HasSuffix(u.Key, "//qemu/extension:qemu.bzl%qemu"):
-			// The public user toolchain refers to indirect archive repos. Audit
-			// its complete user-mode family, including unselected architectures.
-			root, err := readRepoMapping("")
-			if err != nil {
-				return nil, err
-			}
-			hub := root["qemu_user_toolchains"]
-			if hub == "" {
-				return nil, errors.New("QEMU user toolchain repository is not imported")
-			}
-			mapping, err := readRepoMapping(hub)
-			if err != nil {
-				return nil, err
-			}
-			qemuRefs, err := qemuUserRepoRefs(mapping)
-			if err != nil {
-				return nil, err
-			}
-			refs = append(refs, qemuRefs...)
-			continue
-		default:
-			// Toolchain extensions (crosstool, llvm_zlib, python, go_sdk,
-			// ...) are not audited.
-			continue
-		}
-		for _, r := range u.UsedRepos {
-			refs = append(refs, repoRef{"@" + r, r})
-		}
+	refs, err := graph.repoRefs()
+	if err != nil {
+		return nil, err
 	}
 	refNames := make([]string, 0, len(refs)+1)
 	refNames = append(refNames, "show_repo")
@@ -484,12 +497,12 @@ func enumerate(p Paths) ([]dep, error) {
 			if v, ok := goVersions[path]; !ok || semver.Compare(version, v) > 0 {
 				goVersions[path] = version
 			}
-		case "http_archive", "http_file":
-			urls := append(repo.attrs["url"], repo.attrs["urls"]...)
-			if len(urls) == 0 {
-				return nil, fmt.Errorf("%s %s has no URL", repo.rule, r.name)
+		case "http_archive", "http_file", "llvm_project_archive":
+			d, err := repo.archiveDependency(r.name)
+			if err != nil {
+				return nil, err
 			}
-			deps = append(deps, dep{name: r.name, kind: kindArchive, url: pickURL(urls), sha256: repoSHA256(repo)})
+			deps = append(deps, d)
 		case "local_repository", "new_local_repository":
 			// Local paths are part of the gVisor checkout, not external
 			// dependencies.
@@ -573,6 +586,53 @@ type modGraph struct {
 	} `json:"extensionUsages"`
 }
 
+// repoRefs selects source dependencies imported by the root module.
+func (graph *modGraph) repoRefs() ([]repoRef, error) {
+	var refs []repoRef
+	for _, m := range graph.Dependencies {
+		refs = append(refs, repoRef{m.Key, m.Name})
+	}
+	for _, u := range graph.ExtensionUsages {
+		switch {
+		case strings.HasPrefix(u.Key, "@@//:MODULE.bazel%") &&
+			(strings.HasSuffix(u.Key, " http_archive") || strings.HasSuffix(u.Key, " http_file")):
+			// http_archive/http_file declared directly in MODULE.bazel.
+		case u.Key == "@@llvm+//extensions:llvm.bzl%llvm":
+			// The public LLVM source extension supplies linked Clang libraries.
+		case strings.HasSuffix(u.Key, "%go_deps"):
+			// Go repos imported from the gazelle go_deps extension.
+		case strings.HasSuffix(u.Key, "//qemu/extension:qemu.bzl%qemu"):
+			// The public user toolchain refers to indirect archive repos. Audit
+			// its complete user-mode family, including unselected architectures.
+			root, err := readRepoMapping("")
+			if err != nil {
+				return nil, err
+			}
+			hub := root["qemu_user_toolchains"]
+			if hub == "" {
+				return nil, errors.New("QEMU user toolchain repository is not imported")
+			}
+			mapping, err := readRepoMapping(hub)
+			if err != nil {
+				return nil, err
+			}
+			qemuRefs, err := qemuUserRepoRefs(mapping)
+			if err != nil {
+				return nil, err
+			}
+			refs = append(refs, qemuRefs...)
+			continue
+		default:
+			// Toolchain extensions (crosstool, python, go_sdk, ...) are not audited.
+			continue
+		}
+		for _, r := range u.UsedRepos {
+			refs = append(refs, repoRef{"@" + r, r})
+		}
+	}
+	return refs, nil
+}
+
 // parseModGraph parses `bazel mod graph --output json` output, skipping any
 // container-management noise preceding the JSON document.
 func parseModGraph(out string) (*modGraph, error) {
@@ -600,6 +660,19 @@ func (r repoInfo) first(attr string) string {
 		return v[0]
 	}
 	return ""
+}
+
+// archiveDependency reads the selected source identity from repository metadata.
+func (r repoInfo) archiveDependency(name string) (dep, error) {
+	urls := append(r.attrs["url"], r.attrs["urls"]...)
+	if len(urls) == 0 || pickURL(urls) == "" {
+		return dep{}, fmt.Errorf("%s %s has no URL", r.rule, name)
+	}
+	sha256 := repoSHA256(r)
+	if r.rule == "llvm_project_archive" && sha256 == "" {
+		return dep{}, fmt.Errorf("%s %s has no SHA-256", r.rule, name)
+	}
+	return dep{name: name, kind: kindArchive, url: pickURL(urls), sha256: sha256}, nil
 }
 
 var (

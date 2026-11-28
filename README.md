@@ -1,8 +1,9 @@
 ![gVisor](g3doc/logo.png)
 
 [![Build status](https://badge.buildkite.com/3b159f20b9830461a71112566c4171c0bdfd2f980a8e4c0ae6.svg?branch=master)](https://buildkite.com/gvisor/pipeline)
-[![Issue reviver](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/issue_reviver.yml)
-[![CodeQL](https://github.com/google/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/google/gvisor/actions/workflows/codeql.yml)
+[![Issue reviver](https://github.com/gvisor/gvisor/actions/workflows/issue_reviver.yml/badge.svg)](https://github.com/gvisor/gvisor/actions/workflows/issue_reviver.yml)
+[![CodeQL](https://github.com/gvisor/gvisor/actions/workflows/codeql.yml/badge.svg)](https://github.com/gvisor/gvisor/actions/workflows/codeql.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/17098/badge)](https://www.bestpractices.dev/projects/17098)
 [![code search](https://img.shields.io/badge/code-search-blue)](https://cs.opensource.google/gvisor/gvisor)
 
 ## What is gVisor?
@@ -123,14 +124,14 @@ bazel test //runsc:version_test
 
 ### Mac OS
 
-Some packages support running tests directly on macOS. At the time of this
-writing, gVisor requires bazel 8, which you can install via homebrew:
+Some packages support running tests directly on macOS. Install Bazelisk with
+Homebrew to select the version pinned by the repository:
 
 ```sh
-brew install bazel@8
+brew install bazelisk
 
 # You can then run the tests, e.g.:
-$(brew --prefix bazel@8)/bin/bazel test --macos_sdk_version=$(xcrun --show-sdk-version) -- //tools/nogo/... //tools/check{aligned,const,escape,linkname,locks,unsafe}/...
+bazelisk test --macos_sdk_version=$(xcrun --show-sdk-version) -- //tools/nogo/... //tools/check{aligned,const,escape,linkname,locks,unsafe}/...
 ```
 
 ### Using `go get`
@@ -156,7 +157,8 @@ the `master` branch, which is then reflected into the `go` branch.
 
 ## Community & Governance
 
-See [GOVERNANCE.md](GOVERNANCE.md) for project governance information.
+See [GOVERNANCE.md](GOVERNANCE.md) for project governance information. gVisor
+follows the CNCF Code of Conduct. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 See [ADOPTERS.md](ADOPTERS.md) for a list of known production users and
 adopters.

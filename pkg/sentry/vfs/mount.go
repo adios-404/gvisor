@@ -142,6 +142,13 @@ type Mount struct {
 	// namespace. It is analogous to MNT_LOCKED in Linux.
 	locked bool
 
+	// internal is MountOptions.Internal at creation. internal is immutable.
+	internal bool
+
+	// landlockUnnameable is MountOptions.LandlockUnnameable at creation.
+	// landlockUnnameable is immutable.
+	landlockUnnameable bool
+
 	// lockedFlags contains the flags that RemountAt may not clear. lockedFlags
 	// is protected by VirtualFilesystem.mountMu.
 	lockedFlags mountLockFlags
@@ -162,8 +169,11 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 		root:     root,
 		ns:       mntns,
 		locked:   opts.Locked,
+		internal: opts.Internal,
 		isShared: false,
 		refs:     atomicbitops.FromInt64(1),
+
+		landlockUnnameable: opts.LandlockUnnameable,
 	}
 	if opts.ReadOnly {
 		mnt.setReadOnlyLocked(true)
@@ -673,6 +683,13 @@ func (vfs *VirtualFilesystem) cloneMount(mnt *Mount, root *Dentry, mopts *MountO
 			ReadOnly: mnt.ReadOnlyLocked(),
 		}
 	}
+	if opts.Internal || opts.LandlockUnnameable {
+		// Clones of a mount are never internal or LandlockUnnameable.
+		o := *opts
+		o.Internal = false
+		o.LandlockUnnameable = false
+		opts = &o
+	}
 	clone := vfs.NewDisconnectedMount(mnt.fs, root, opts)
 	if cloneType&(makeFollowerClone|makePrivateClone|sharedToFollowerClone) != 0 {
 		clone.groupID = 0
@@ -720,8 +737,22 @@ type cloneTreeNode struct {
 // `cloneFunc` is a callback that is executed for each cloned mount.
 // This method is analogous to fs/namespace.c:copy_tree() in Linux.
 //
+// If cloneType does not have copyMntNSFile, cloneMountTree returns EINVAL if
+// root is a mount namespace file, and does not copy descendants that are
+// mounts of mount namespace files. If cloneType has copyMntNSFile,
+// cloneMountTree returns EINVAL if a descendant is a mount of a mount
+// namespace file that ctx's mount namespace cannot contain.
+//
 // +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, root *Dentry, cloneType int, cloneFunc func(ctx context.Context, oldmnt, newMnt *Mount)) (*Mount, error) {
+	var ctxNS *MountNamespace
+	if cloneType&copyMntNSFile == 0 {
+		if isMountNSFile(VirtualDentry{mount: mnt, dentry: root}) != nil {
+			return nil, linuxerr.EINVAL
+		}
+	} else if ctxNS = MountNamespaceFromContext(ctx); ctxNS != nil {
+		vfs.delayDecRef(ctxNS)
+	}
 	clone, err := vfs.cloneMount(mnt, root, nil, cloneType)
 	if err != nil {
 		return nil, err
@@ -739,6 +770,15 @@ func (vfs *VirtualFilesystem) cloneMountTree(ctx context.Context, mnt *Mount, ro
 			}
 			if mp := c.getKey(); p.prevMount == mnt && !mp.mount.fs.Impl().IsDescendant(VirtualDentry{mnt, root}, mp) {
 				continue
+			}
+			if ns := isMountNSFile(VirtualDentry{mount: c, dentry: c.root}); ns != nil {
+				if cloneType&copyMntNSFile == 0 {
+					continue
+				}
+				if ctxNS != nil && !ctxNS.canMountNSFile(ns) {
+					vfs.abortUncommitedMount(ctx, clone)
+					return nil, linuxerr.EINVAL
+				}
 			}
 			m, err := vfs.cloneMount(c, c.root, nil, cloneType)
 			if err != nil {
@@ -781,6 +821,11 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 	}
 	defer targetVd.DecRef(ctx)
 
+	// A mount namespace file can only be bound in an older mount namespace.
+	if mntNSLoop(ctx, sourceVd) {
+		return linuxerr.EINVAL
+	}
+
 	// Linux's graft_tree() (fs/namespace.c) returns ENOTDIR if the source and
 	// target have mismatched types (one is a directory, the other is not).
 	sourceStat, err := vfs.StatAt(ctx, creds, &PathOperation{
@@ -821,10 +866,11 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 	if sourceVd.mount.umounted {
 		return linuxerr.EINVAL
 	}
-	// nsfs, cgroupfs, and cgroup2fs are exempt from the requirement that the source
-	// mount must be in a mount namespace, but *only* for non-recursive binds.
+	// The source mount must be in the caller's mount namespace, except for
+	// nsfs and, for non-recursive binds only, cgroupfs and cgroup2fs.
 	fsName := sourceVd.mount.Filesystem().FilesystemType().Name()
-	if !vfs.validInMountNS(ctx, sourceVd.mount) && (recursive || (fsName != nsfsName && fsName != cgroupFsName && fsName != cgroup2FsName)) {
+	sourceInMountNS := vfs.validInMountNS(ctx, sourceVd.mount)
+	if !sourceInMountNS && fsName != nsfsName && (recursive || (fsName != cgroupFsName && fsName != cgroup2FsName)) {
 		return linuxerr.EINVAL
 	}
 	if !vfs.validInMountNS(ctx, mp.mount) {
@@ -832,8 +878,8 @@ func (vfs *VirtualFilesystem) BindAt(ctx context.Context, creds *auth.Credential
 	}
 
 	var clone *Mount
-	if recursive {
-		clone, err = vfs.cloneMountTree(ctx, sourceVd.mount, sourceVd.dentry, 0, nil)
+	if recursive && sourceInMountNS {
+		clone, err = vfs.cloneMountTree(ctx, sourceVd.mount, sourceVd.dentry, copyMntNSFile, nil)
 	} else {
 		if vfs.mountHasLockedChildren(sourceVd.mount, sourceVd) {
 			return linuxerr.EINVAL
@@ -1452,10 +1498,14 @@ func (vfs *VirtualFilesystem) getMountpoint(ctx context.Context, creds *auth.Cre
 // mnt. It takes a reference on the returned VirtualDentry. If no such mount
 // point exists (i.e. mnt is a root mount), getMountpointAt returns (nil, nil).
 //
+// getMountpointAt drops the references that it takes on intermediate mounts and
+// mount points. If deferred is not nil, getMountpointAt hands them to deferred
+// instead of dropping them.
+//
 // Preconditions:
 //   - References are held on mnt and root.
 //   - vfsroot is not (mnt, mnt.root).
-func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
+func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry, deferred *DeferredDecRefs) VirtualDentry {
 	// The first mount is special-cased:
 	//
 	//	- The caller must have already checked mnt against vfsroot.
@@ -1479,12 +1529,12 @@ retryFirst:
 	if !point.TryIncRef() {
 		// Since Mount holds a reference on Mount.key.point, this can only
 		// happen due to a racing change to Mount.key.
-		parent.DecRef(ctx)
+		deferred.decRef(ctx, parent)
 		goto retryFirst
 	}
 	if !vfs.mounts.seq.ReadOk(epoch) {
-		point.DecRef(ctx)
-		parent.DecRef(ctx)
+		deferred.decRef(ctx, point)
+		deferred.decRef(ctx, parent)
 		goto retryFirst
 	}
 	mnt = parent
@@ -1506,16 +1556,16 @@ retryFirst:
 		if !point.TryIncRef() {
 			// Since Mount holds a reference on Mount.key.point, this can
 			// only happen due to a racing change to Mount.key.
-			parent.DecRef(ctx)
+			deferred.decRef(ctx, parent)
 			goto retryNotFirst
 		}
 		if !vfs.mounts.seq.ReadOk(epoch) {
-			point.DecRef(ctx)
-			parent.DecRef(ctx)
+			deferred.decRef(ctx, point)
+			deferred.decRef(ctx, parent)
 			goto retryNotFirst
 		}
-		d.DecRef(ctx)
-		mnt.DecRef(ctx)
+		deferred.decRef(ctx, d)
+		deferred.decRef(ctx, mnt)
 		mnt = parent
 		d = point
 	}
@@ -1713,6 +1763,18 @@ func (mnt *Mount) countSubmountsLocked() uint32 {
 // Dentry.
 func (mnt *Mount) Root() *Dentry {
 	return mnt.root
+}
+
+// LandlockNameable reports whether Landlock rules can name files reached
+// through mnt: mnt was created with neither MountOptions.Internal nor
+// MountOptions.LandlockUnnameable.
+func (mnt *Mount) LandlockNameable() bool {
+	return !mnt.internal && !mnt.landlockUnnameable
+}
+
+// IsInternal reports whether mnt was created with MountOptions.Internal.
+func (mnt *Mount) IsInternal() bool {
+	return mnt.internal
 }
 
 // GenerateProcMounts emits the contents of /proc/[pid]/mounts for vfs to buf.

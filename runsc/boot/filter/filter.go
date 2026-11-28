@@ -36,6 +36,18 @@ const debugFilter = false
 // Options is a re-export of the config Options type under this package.
 type Options = config.Options
 
+// HostFSAccess is a re-export of the config HostFSAccess type under this
+// package.
+type HostFSAccess = config.HostFSAccess
+
+// Re-exports of the config HostFSAccess values under this package.
+const (
+	HostFSNone                   = config.HostFSNone
+	HostFSReadOnly               = config.HostFSReadOnly
+	HostFSReadWriteExistingFiles = config.HostFSReadWriteExistingFiles
+	HostFSReadWrite              = config.HostFSReadWrite
+)
+
 // HostVendorSyscalls returns the vendor-specific syscalls that may be used on
 // the current host.
 func HostVendorSyscalls() precompiledseccomp.VarSyscallNumbers {
@@ -63,14 +75,14 @@ func Install(opt Options, timer *timing.Timer) error {
 		if !errors.Is(err, precompiledseccomp.ErrSyscallVarsNotRenderable) {
 			return fmt.Errorf("cannot render precompiled program for options %v / vars %v: %w", key, vars, err)
 		}
-		log.Warningf("Cannot use precompiled program for config options %v (%v), building seccomp program from scratch. This slows down sandbox startup.", key, err)
+		log.Warningf("PERF: Cannot use precompiled program for config options %v (%v), building seccomp program from scratch. This slows down sandbox startup.", key, err)
 	}
 	seccompOpts := config.SeccompOptions(opt)
 	if debugFilter {
 		log.Infof("Seccomp filter debugging is enabled; seccomp failures will result in a panic stack trace.")
 		seccompOpts.DefaultAction = seccomp.Trap
 	} else if !usePrecompiled {
-		log.Warningf("No precompiled program found for config options %v, building seccomp program from scratch. This slows down sandbox startup.", key)
+		log.Warningf("PERF: No precompiled program found for config options %v, building seccomp program from scratch. This slows down sandbox startup.", key)
 		if log.IsLogging(log.Debug) {
 			precompiledKeys := ListPrecompiled()
 			log.Debugf("Precompiled seccomp-bpf program configuration option variants (%d):", len(precompiledKeys))

@@ -43,7 +43,7 @@ COVERAGE_SRCS = [
     "//:go.sum",
     "//:gopath",
     "//tools:build_cover.sh",
-    "//tools:go-allow-internal.patch",
+    "//tools:go_cover_toolchain",
 ]
 
 COVERAGE_CMD = (
@@ -53,7 +53,7 @@ COVERAGE_CMD = (
     "\"$(execpath //:go.mod)\" " +
     "\"$(execpath //:go.sum)\" " +
     "\"$(execpath sentry_main.go)\" " +
-    "\"$(execpath //tools:go-allow-internal.patch)\" " +
+    "\"$(execpath //tools:go_cover_toolchain)\" " +
     "\"%s\" "
 )
 
@@ -62,6 +62,7 @@ go_cov(
     srcs = COVERAGE_SRCS,
     outs = ["gvisor_sentry_cov"],
     cmd = COVERAGE_CMD % ("//runsc/cmd/sentry:gvisor_sentry_cov", "false"),
+    tags = ["manual"],
     visibility = ["//debian:__pkg__"],
 )
 
@@ -70,6 +71,7 @@ go_cov(
     srcs = COVERAGE_SRCS,
     outs = ["gvisor_sentry_race_cov"],
     cmd = COVERAGE_CMD % ("//runsc/cmd/sentry:gvisor_sentry_race_cov", "true"),
+    tags = ["manual"],
     visibility = ["//debian:__pkg__"],
 )
 

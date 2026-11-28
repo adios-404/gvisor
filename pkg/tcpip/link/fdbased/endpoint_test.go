@@ -611,9 +611,12 @@ func (*fakeNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *st
 }
 
 func TestDispatchPacketFormat(t *testing.T) {
+	// A virtioNetHdr for TCPv4 segments of 1448 bytes coalesced by the host.
+	groVnetHdr := (&virtioNetHdr{gsoType: _VIRTIO_NET_HDR_GSO_TCPV4, gsoSize: 1448}).marshal()
 	for _, test := range []struct {
 		name          string
 		newDispatcher func(fd int, e *endpoint, opts *Options) (linkDispatcher, error)
+		vnetHdr       []byte
 		ethHdr        []byte
 		netHdr        []byte
 	}{
@@ -630,6 +633,28 @@ func TestDispatchPacketFormat(t *testing.T) {
 		{
 			name:          "recvMMsgDispatcher",
 			newDispatcher: newRecvMMsgDispatcher,
+			ethHdr: []byte{
+				1, 2, 3, 4, 5, 60,
+				1, 2, 3, 4, 5, 61,
+				8, 0,
+			},
+			netHdr: []byte{0x40, 0, 0, 0},
+		},
+		{
+			name:          "readVDispatcherHostGRO",
+			newDispatcher: newReadVDispatcher,
+			vnetHdr:       groVnetHdr,
+			ethHdr: []byte{
+				1, 2, 3, 4, 5, 60,
+				1, 2, 3, 4, 5, 61,
+				8, 0,
+			},
+			netHdr: []byte{0x40, 0, 0, 0},
+		},
+		{
+			name:          "recvMMsgDispatcherHostGRO",
+			newDispatcher: newRecvMMsgDispatcher,
+			vnetHdr:       groVnetHdr,
 			ethHdr: []byte{
 				1, 2, 3, 4, 5, 60,
 				1, 2, 3, 4, 5, 61,
@@ -688,7 +713,7 @@ func TestDispatchPacketFormat(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			data := append(test.ethHdr, test.netHdr...)
+			data := append(append(test.vnetHdr, test.ethHdr...), test.netHdr...)
 			err = unix.Sendmsg(fds[1], data, nil, nil, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -700,10 +725,15 @@ func TestDispatchPacketFormat(t *testing.T) {
 			if len(test.ethHdr) > 0 {
 				addr = tcpip.LinkAddress(test.ethHdr[:header.EthernetAddressSize])
 			}
+			gsoKind := stack.GSONotSupported
+			if len(test.vnetHdr) > 0 {
+				gsoKind = stack.HostGSOSupported
+			}
 			d, err := test.newDispatcher(fds[0], &endpoint{
 				addr:       addr,
 				hdrSize:    len(test.ethHdr),
 				dispatcher: sink,
+				gsoKind:    gsoKind,
 			}, &Options{ProcessorsPerChannel: 1})
 			if err != nil {
 				t.Fatal(err)
@@ -733,6 +763,13 @@ func TestDispatchPacketFormat(t *testing.T) {
 			}
 			if pkt.NetworkProtocolNumber != wantProto {
 				t.Errorf("pkt.NetworkProtocolNumber = %d, want %d", pkt.NetworkProtocolNumber, wantProto)
+			}
+			var wantGROSegmentSize uint16
+			if len(test.vnetHdr) > 0 {
+				wantGROSegmentSize = 1448
+			}
+			if pkt.GROSegmentSize != wantGROSegmentSize {
+				t.Errorf("pkt.GROSegmentSize = %d, want %d", pkt.GROSegmentSize, wantGROSegmentSize)
 			}
 		})
 	}
@@ -781,9 +818,83 @@ func TestCloseReleasesStopFDs(t *testing.T) {
 	}
 }
 
+func TestIovecBufferRetainsPackets(t *testing.T) {
+	for _, size := range []int{0, 128, 129, 1500, 9000} {
+		for _, vnet := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size=%d/vnet=%t", size, vnet), func(t *testing.T) {
+				recv := newIovecBuffer(BufConfig, vnet)
+				defer recv.release()
+				n := size
+				if vnet {
+					n += virtioNetHdrSize
+				}
+				input := make([]byte, n)
+				for i := range input {
+					input[i] = byte(i ^ (i >> 8))
+				}
+				remaining := input
+				for _, iov := range recv.nextIovecs() {
+					copied := copy(unsafe.Slice(iov.Base, int(iov.Len)), remaining)
+					remaining = remaining[copied:]
+				}
+				pkt := recv.pullBuffer(n)
+				defer pkt.Release()
+				for _, iov := range recv.nextIovecs() {
+					clear(unsafe.Slice(iov.Base, int(iov.Len)))
+				}
+				if got, want := pkt.Flatten(), input[len(input)-size:]; !bytes.Equal(got, want) {
+					t.Fatalf("received payload changed after refill: got %x, want %x", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
 	refs.DoLeakCheck()
 	os.Exit(code)
+}
+
+func BenchmarkIovecBuffer(b *testing.B) {
+	for _, size := range []int{64, 1500, 9000} {
+		for _, vnet := range []bool{false, true} {
+			b.Run(fmt.Sprintf("size=%d/vnet=%t", size, vnet), func(b *testing.B) {
+				recv := newIovecBuffer(BufConfig, vnet)
+				defer recv.release()
+				var pending [MaxMsgsPerRecv]buffer.Buffer
+				defer func() {
+					for i := range pending {
+						pending[i].Release()
+					}
+				}()
+				n := size
+				if vnet {
+					n += virtioNetHdrSize
+				}
+				payload := make([]byte, n)
+				recv.nextIovecs()
+				b.ReportAllocs()
+				b.SetBytes(int64(size))
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					slot := i % len(pending)
+					pending[slot].Release()
+					remaining := payload
+					for _, iov := range recv.nextIovecs() {
+						copied := copy(unsafe.Slice(iov.Base, int(iov.Len)), remaining)
+						remaining = remaining[copied:]
+						if len(remaining) == 0 {
+							break
+						}
+					}
+					if len(remaining) != 0 {
+						b.Fatal("receive buffers cannot hold payload")
+					}
+					pending[slot] = recv.pullBuffer(n)
+				}
+			})
+		}
+	}
 }

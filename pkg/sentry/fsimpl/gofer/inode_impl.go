@@ -108,9 +108,7 @@ func (i *inode) writeHandle() handle {
 	}
 }
 
-// Preconditions:
-//   - !d.isSynthetic().
-//   - fs.renameMu is locked.
+// Precondition: !d.isSynthetic().
 func (d *dentry) openHandle(ctx context.Context, read, write, trunc bool) (handle, error) {
 	flags := uint32(unix.O_RDONLY)
 	switch {
@@ -130,7 +128,7 @@ func (d *dentry) openHandle(ctx context.Context, read, write, trunc bool) (handl
 	case *lisafsInode:
 		return it.openHandle(ctx, flags)
 	case *directfsInode:
-		return it.openHandle(ctx, flags, d)
+		return it.openHandle(flags)
 	default:
 		panic("unknown inode implementation")
 	}
@@ -202,9 +200,7 @@ func (i *inode) updateMetadataLocked(ctx context.Context, h handle) error {
 	}
 }
 
-// Preconditions:
-//   - !d.isSynthetic().
-//   - fs.renameMu is locked.
+// Precondition: !d.isSynthetic().
 func (d *dentry) prepareSetStat(ctx context.Context, stat *linux.Statx) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -217,14 +213,12 @@ func (d *dentry) prepareSetStat(ctx context.Context, stat *linux.Statx) error {
 	}
 }
 
-// Precondition: For directfs sockets, the inode's lisafs control FD has been
-// initialized (see directfsInode.prepareSetStat()).
 func (d *dentry) chmod(ctx context.Context, mode uint16) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
 		return chmod(ctx, it.controlFD, mode)
 	case *directfsInode:
-		return it.chmod(ctx, mode, d)
+		return it.chmod(mode)
 	default:
 		panic("unknown inode implementation")
 	}
@@ -233,13 +227,12 @@ func (d *dentry) chmod(ctx context.Context, mode uint16) error {
 // Preconditions:
 //   - !d.isSynthetic().
 //   - i.handleMu is locked.
-//   - fs.renameMu is locked.
 func (d *dentry) setStatLocked(ctx context.Context, stat *linux.Statx) (uint32, error, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
 		return it.controlFD.SetStat(ctx, stat)
 	case *directfsInode:
-		failureMask, failureErr := it.setStatLocked(ctx, stat, d)
+		failureMask, failureErr := it.setStatLocked(stat)
 		return failureMask, failureErr, nil
 	default:
 		panic("unknown inode implementation")
@@ -296,6 +289,8 @@ func (i *inode) getRemoteChildAndWalkPathLocked(ctx context.Context, rp resolvin
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) listXattrImpl(ctx context.Context, size uint64) ([]string, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -308,6 +303,8 @@ func (d *dentry) listXattrImpl(ctx context.Context, size uint64) ([]string, erro
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (string, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -320,6 +317,8 @@ func (d *dentry) getXattrImpl(ctx context.Context, opts *vfs.GetXattrOptions) (s
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) setXattrImpl(ctx context.Context, opts *vfs.SetXattrOptions) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -332,6 +331,8 @@ func (d *dentry) setXattrImpl(ctx context.Context, opts *vfs.SetXattrOptions) er
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) removeXattrImpl(ctx context.Context, name string) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -344,6 +345,8 @@ func (d *dentry) removeXattrImpl(ctx context.Context, name string) error {
 }
 
 // Precondition: !d.isSynthetic().
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) mknod(ctx context.Context, name string, creds *auth.Credentials, opts *vfs.MknodOptions) (*dentry, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -453,6 +456,8 @@ func (i *inode) allocate(ctx context.Context, mode, offset, length uint64) error
 // Preconditions:
 //   - !d.isSynthetic().
 //   - fs.renameMu is locked.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) connect(ctx context.Context, sockType linux.SockType) (int, error) {
 	creds := auth.CredentialsOrNilFromContext(ctx)
 	// The host reports these IDs as the client's SO_PEERCRED, which Linux
@@ -547,6 +552,8 @@ func (fs *filesystem) restoreRoot(ctx context.Context, opts *vfs.CompleteRestore
 // Preconditions:
 //   - !d.isSynthetic().
 //   - d.parent != nil and has been restored.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
@@ -580,8 +587,9 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 			return nil
 		}
 		controlFD := d.parent.Load().inode.impl.(*directfsInode).controlFD
+		name := d.name
 		childFD, err := tryOpen(func(flags int) (int, error) {
-			n, err := unix.Openat(controlFD, d.name, flags, 0)
+			n, err := unix.Openat(controlFD, name, flags, 0)
 			return n, err
 		})
 		if err != nil {
@@ -591,13 +599,13 @@ func (d *dentry) restoreFile(ctx context.Context, opts *vfs.CompleteRestoreOptio
 
 			// Recreate directories that were created during volume mounting, since
 			// during restore we don't attempt to remount them.
-			if err := unix.Mkdirat(controlFD, d.name, it.mode.Load()); err != nil {
+			if err := unix.Mkdirat(controlFD, name, it.mode.Load()); err != nil {
 				return fmt.Errorf("failed to create mountpoint directory at %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
 			}
 
 			// Try again...
 			childFD, err = tryOpen(func(flags int) (int, error) {
-				return unix.Openat(controlFD, d.name, flags, 0)
+				return unix.Openat(controlFD, name, flags, 0)
 			})
 			if err != nil {
 				return fmt.Errorf("failed to open %q in mount %q: %w", genericDebugPathname(it.fs, d), it.fs.iopts.UniqueID, err)
@@ -615,31 +623,14 @@ func (d *dentry) readHandleForDeleted(ctx context.Context) (handle, error) {
 	if d.inode.isReadHandleOk() {
 		return d.inode.readHandle(), nil
 	}
-	switch dt := d.inode.impl.(type) {
-	case *lisafsInode:
-		// ensureSharedHandle locks handleMu for write. Unlock it temporarily.
-		d.inode.handleMu.RUnlock()
-		err := d.ensureSharedHandle(ctx, true /* read */, false /* write */, false /* trunc */)
-		d.inode.handleMu.RLock()
-		if err != nil {
-			return handle{}, fmt.Errorf("failed to open read handle: %w", err)
-		}
-		return d.inode.readHandle(), nil
-	case *directfsInode:
-		// The sentry does not have access to any procfs mount which it could use
-		// to re-open dt.controlFD with a different mode (via /proc/self/fd/). The
-		// file is unlinked, so we can't use openat(parent.controlFD, name) either.
-		// dt.controlFD must be a read-only FD (see tryOpen() documentation). Just
-		// seek the control FD to 0 and return it. The control FD is not used for
-		// reading by the sentry, so this should be safe.
-		// TODO(b/431481259): Use dentry.ensureSharedHandle() here as well.
-		if _, err := unix.Seek(dt.controlFD, 0, unix.SEEK_SET); err != nil {
-			return handle{}, fmt.Errorf("failed to seek control FD to 0: %w", err)
-		}
-		return handle{fd: int32(dt.controlFD)}, nil
-	default:
-		panic("unknown inode implementation")
+	// ensureSharedHandle locks handleMu for write. Unlock it temporarily.
+	d.inode.handleMu.RUnlock()
+	err := d.ensureSharedHandle(ctx, true /* read */, false /* write */, false /* trunc */)
+	d.inode.handleMu.RLock()
+	if err != nil {
+		return handle{}, fmt.Errorf("failed to open read handle: %w", err)
 	}
+	return d.inode.readHandle(), nil
 }
 
 // doRevalidation calls into r.start's dentry implementation to perform
@@ -648,6 +639,8 @@ func (d *dentry) readHandleForDeleted(ctx context.Context) (handle, error) {
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:r.start.inode.fs.renameMu
 func (r *revalidateState) doRevalidation(ctx context.Context, vfsObj *vfs.VirtualFilesystem, ds **[]*dentry) error {
 	// Skip synthetic dentries because there is no actual implementation that can
 	// be used to walk the remote filesystem. A start dentry cannot be replaced.

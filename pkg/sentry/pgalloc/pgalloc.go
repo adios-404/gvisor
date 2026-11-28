@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -703,8 +704,15 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 			}
 			if alloc.recycled {
 				// The contents of recycled waste pages are initially unknown, so we
-				// need to zero them.
-				f.manuallyZero(fr)
+				// need to zero them. Zeroing also commits them unless it skips pages
+				// of a disk-backed file; commit those if the caller asked for
+				// AllocateAndCommit.
+				if !f.manuallyZero(fr) && opts.Mode == AllocateAndCommit {
+					if err := f.commitFile(fr); err != nil {
+						f.DecRef(fr)
+						return memmap.FileRange{}, err
+					}
+				}
 			} else if needHugeTouch {
 				// We only need to touch a single byte in each huge page.
 				f.forEachMappingSlice(fr, func(bs []byte) {
@@ -984,7 +992,7 @@ func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
 			_, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, len, unix.MADV_HUGEPAGE)
 			if errno != 0 {
 				// Log this failure but continue.
-				log.Warningf("madvise(%#x, %d, MADV_HUGEPAGE) failed: %s", addr, len, errno)
+				log.Warningf("PERF: madvise(%#x, %d, MADV_HUGEPAGE) failed: %s", addr, len, errno)
 			}
 		}
 	} else {
@@ -1019,9 +1027,9 @@ func tryPopulateMadv(b safemem.Block) bool {
 	if errno != 0 {
 		if errno == unix.EINVAL {
 			// EINVAL is expected if MADV_POPULATE_WRITE is not supported (Linux <5.14).
-			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+			log.Infof("PERF: Disabling pgalloc.MemoryFile.AllocateAndFill pre-population by MADV_POPULATE_WRITE: madvise failed: %s", errno)
 		} else {
-			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: madvise failed: %s", errno)
+			log.Warningf("PERF: Disabling pgalloc.MemoryFile.AllocateAndFill pre-population by MADV_POPULATE_WRITE: madvise failed: %s", errno)
 		}
 		madvPopulateWriteDisabled.Store(1)
 		return false
@@ -1053,9 +1061,9 @@ func tryPopulateMlock(b safemem.Block) bool {
 		if errno == unix.ENOMEM || errno == unix.EPERM {
 			// These errors are expected from hitting non-zero RLIMIT_MEMLOCK, or
 			// hitting zero RLIMIT_MEMLOCK without CAP_IPC_LOCK, respectively.
-			log.Infof("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+			log.Infof("PERF: Disabling pgalloc.MemoryFile.AllocateAndFill pre-population by mlock: mlock failed: %s", errno)
 		} else {
-			log.Warningf("Disabling pgalloc.MemoryFile.AllocateAndFill pre-population: mlock failed: %s", errno)
+			log.Warningf("PERF: Disabling pgalloc.MemoryFile.AllocateAndFill pre-population by mlock: mlock failed: %s", errno)
 		}
 		mlockDisabled.Store(1)
 		return false
@@ -1141,15 +1149,55 @@ func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
 		int64(fr.Length()))
 }
 
-func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
-	f.forEachMappingSlice(fr, func(bs []byte) {
-		clear(bs)
+// manuallyZero zeroes the pages in fr through f's mappings. It returns false if
+// it skipped pages of a disk-backed file; see zeroDiskBacked.
+func (f *MemoryFile) manuallyZero(fr memmap.FileRange) bool {
+	wroteAll := true
+	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
+		bs := chunk.sliceAt(chunkFR)
+		if f.opts.DiskBackedFile {
+			if !zeroDiskBacked(int(f.file.Fd()), chunkFR.Start, bs) {
+				wroteAll = false
+			}
+		} else {
+			clear(bs)
+		}
+		return true
 	})
+	return wroteAll
+}
+
+// zeroDiskBacked zeroes bs, which maps the pages of the disk-backed file fd
+// that start at offset off. Writing to a page raises SIGBUS if the host cannot
+// allocate disk space for it, for example because its filesystem is full.
+// Such pages are skipped if they already read as zero, as holes do. They are
+// read with pread(2) instead of through bs, since a read fault on a hole can
+// also allocate, for example on tmpfs. zeroDiskBacked returns false if it
+// skipped any pages, which then remain uncommitted.
+func zeroDiskBacked(fd int, off uint64, bs []byte) bool {
+	wroteAll := true
+	for len(bs) != 0 {
+		n, err := safemem.ZeroSeq(safemem.BlockSeqOf(safemem.BlockFromUnsafeSlice(bs)))
+		if err == nil {
+			return wroteAll
+		}
+		wroteAll = false
+		start := hostarch.PageRoundDown(n)
+		end := start + uint64(hostarch.PageSize)
+		buf := make([]byte, hostarch.PageSize)
+		rn, rerr := unix.Pread(fd, buf, int64(off+start))
+		if rerr != nil || rn != len(buf) || slices.ContainsFunc(buf, func(b byte) bool { return b != 0 }) {
+			panic(fmt.Sprintf("failed to zero page of disk-backed file: %v", err))
+		}
+		bs = bs[end:]
+		off += end
+	}
+	return wroteAll
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
 	if err := f.decommitFile(fr); err != nil {
-		log.Warningf("Failed to decommit %v: %v", fr, err)
+		log.Warningf("PERF: Failed to decommit %v: %v; zeroing manually", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
 		// least ensures that the pages will be zeroed when reallocated.
 		f.manuallyZero(fr)
@@ -1843,6 +1891,24 @@ func (f *MemoryFile) TotalUsage() (uint64, error) {
 		return 0, err
 	}
 	return uint64(stat.Blocks * 512), nil
+}
+
+// UnaccountedUsage returns the number of bytes used by the backing file that
+// are not known to be committed, and so are not counted in
+// usage.MemoryAccounting: pages committed since the last scan for committed
+// pages, and waste pages that were committed before any scan saw them.
+func (f *MemoryFile) UnaccountedUsage() (uint64, error) {
+	total, err := f.TotalUsage()
+	if err != nil {
+		return 0, err
+	}
+	f.mu.Lock()
+	known := f.knownCommittedBytes
+	f.mu.Unlock()
+	if total < known {
+		return 0, nil
+	}
+	return total - known, nil
 }
 
 // TotalSize returns the current size of the backing file in bytes, which is an

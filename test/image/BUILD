@@ -25,6 +25,7 @@ go_test(
     deps = [
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
+        "//test/moby/mobyutil",
         "@com_github_cenkalti_backoff//:go_default_library",
         "@in_gopkg_yaml_v3//:go_default_library",
     ],

@@ -17,8 +17,10 @@ package sandbox
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 )
@@ -42,6 +45,9 @@ func fdbasedLinkEqual(a, b sentryapi.FDBasedLink) bool {
 		return false
 	}
 	if a.MTU != b.MTU {
+		return false
+	}
+	if a.Multicast != b.Multicast {
 		return false
 	}
 	if a.QDisc != b.QDisc {
@@ -118,6 +124,9 @@ func loopbackLinksEqual(a, b []sentryapi.LoopbackLink) bool {
 	}
 	for i := range a {
 		if a[i].Name != b[i].Name {
+			return false
+		}
+		if a[i].Multicast != b[i].Multicast {
 			return false
 		}
 		if len(a[i].Addresses) != len(b[i].Addresses) {
@@ -313,6 +322,62 @@ func defaultLoopbackLinks() []sentryapi.LoopbackLink {
 	}
 }
 
+func TestCollectLinksAndRoutes_Multicast(t *testing.T) {
+	requireRoot(t)
+	for _, test := range []struct {
+		name      string
+		multicast bool
+	}{
+		{name: "disabled", multicast: false},
+		{name: "enabled", multicast: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			veth := setupVethInterface(t, "testveth0", "10.0.0.1", 24, 32)
+			setupLoopback(t)
+			lo, err := netlink.LinkByName("lo")
+			if err != nil {
+				t.Fatalf("LinkByName(lo): %v", err)
+			}
+			for _, link := range []netlink.Link{veth, lo} {
+				setMulticast := netlink.LinkSetMulticastOff
+				if test.multicast {
+					setMulticast = netlink.LinkSetMulticastOn
+				}
+				if err := setMulticast(link); err != nil {
+					t.Fatalf("setting multicast=%t on %s: %v", test.multicast, link.Attrs().Name, err)
+				}
+			}
+			for _, xdp := range []config.XDP{{Mode: config.XDPModeOff}, {Mode: config.XDPModeNS}} {
+				args, err := collectLinksAndRoutes(&config.Config{XDP: xdp}, false, false)
+				if err != nil {
+					t.Fatalf("collectLinksAndRoutes(%+v): %v", xdp, err)
+				}
+				if got, want := len(args.LoopbackLinks), 1; got != want {
+					t.Fatalf("len(LoopbackLinks) = %d, want %d; links = %+v", got, want, args.LoopbackLinks)
+				}
+				if got := args.LoopbackLinks[0].Multicast; got != test.multicast {
+					t.Errorf("loopback Multicast = %t, want %t", got, test.multicast)
+				}
+				if xdp.Mode == config.XDPModeOff {
+					if got, want := len(args.FDBasedLinks), 1; got != want {
+						t.Fatalf("len(FDBasedLinks) = %d, want %d; links = %+v", got, want, args.FDBasedLinks)
+					}
+					if got := args.FDBasedLinks[0].Multicast; got != test.multicast {
+						t.Errorf("FD-based Multicast = %t, want %t", got, test.multicast)
+					}
+				} else {
+					if got, want := len(args.XDPLinks), 1; got != want {
+						t.Fatalf("len(XDPLinks) = %d, want %d; links = %+v", got, want, args.XDPLinks)
+					}
+					if got := args.XDPLinks[0].Multicast; got != test.multicast {
+						t.Errorf("XDP Multicast = %t, want %t", got, test.multicast)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 	requireRoot(t)
 	link := setupVethInterface(t, "testveth0", "10.0.0.1", 24, 32)
@@ -325,7 +390,7 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, false)
+	args, err := collectLinksAndRoutes(conf, false, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -333,6 +398,7 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 	wantFDLinks := []sentryapi.FDBasedLink{
 		{
 			Name:        "testveth0",
+			Multicast:   true,
 			MTU:         1500,
 			LinkAddress: link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
@@ -383,6 +449,80 @@ func TestCollectLinksAndRoutes_SingleInterface(t *testing.T) {
 	}
 }
 
+func TestCollectLinksAndRoutes_RDMAExclusion(t *testing.T) {
+	requireRoot(t)
+	setupTestNamespace(t)
+
+	interfaces := []struct {
+		name string
+		ipv4 string
+		ipv6 string
+	}{
+		{"testveth0", "192.0.2.1/24", "2001:db8:1::1/64"},
+		{"rdmatest0", "198.51.100.1/24", "2001:db8:2::1/64"},
+	}
+	for _, iface := range interfaces {
+		link := createVethPair(t, iface.name)
+		if err := netlink.LinkSetUp(link); err != nil {
+			t.Fatalf("bringing up %s: %v", iface.name, err)
+		}
+		for _, cidr := range []string{iface.ipv4, iface.ipv6} {
+			addr, err := netlink.ParseAddr(cidr)
+			if err != nil {
+				t.Fatalf("parsing %s: %v", cidr, err)
+			}
+			addr.Flags = unix.IFA_F_NODAD
+			if err := netlink.AddrAdd(link, addr); err != nil {
+				t.Fatalf("adding %s to %s: %v", cidr, iface.name, err)
+			}
+		}
+	}
+
+	rdmaDevice := fmt.Sprintf("rxe_%x", time.Now().UnixNano())
+	if err := netlink.RdmaLinkAdd(rdmaDevice, "rxe", "rdmatest0"); err != nil {
+		if errors.Is(err, unix.EPROTONOSUPPORT) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOENT) {
+			t.Skipf("RXE is unavailable: %v", err)
+		}
+		if errors.Is(err, unix.EINVAL) {
+			if _, statErr := os.Stat("/sys/module/rdma_rxe"); os.IsNotExist(statErr) {
+				t.Skipf("RXE is unavailable: %v", err)
+			}
+		}
+		t.Fatalf("creating RXE device: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := netlink.RdmaLinkDel(rdmaDevice); err != nil {
+			t.Errorf("deleting RXE device: %v", err)
+		}
+	})
+
+	rdmaLinks, err := rdmaNetdevs()
+	if err != nil {
+		t.Fatalf("discovering RDMA interfaces: %v", err)
+	}
+	if !rdmaLinks["rdmatest0"] || rdmaLinks["testveth0"] {
+		t.Fatalf("RDMA interfaces = %v, want rdmatest0 and not testveth0", rdmaLinks)
+	}
+
+	// Add default routes through rdmatest0 to check that excluding
+	// the interface also excludes its default routes.
+	for _, gateway := range []string{"198.51.100.254", "2001:db8:2::ffff"} {
+		addRoute(t, nil, net.ParseIP(gateway))
+	}
+	conf := &config.Config{XDP: config.XDP{Mode: config.XDPModeOff}}
+
+	args, err := collectLinksAndRoutes(conf, false, true)
+	if err != nil {
+		t.Fatalf("collecting with RDMA exclusion: %v", err)
+	}
+	if len(args.FDBasedLinks) != 1 || args.FDBasedLinks[0].Name != "testveth0" {
+		t.Errorf("FDBasedLinks = %+v, want only testveth0", args.FDBasedLinks)
+	}
+	if !args.Defaultv4Gateway.Route.Empty() || !args.Defaultv6Gateway.Route.Empty() {
+		t.Errorf("RDMA default routes were included: IPv4=%+v, IPv6=%+v", args.Defaultv4Gateway, args.Defaultv6Gateway)
+	}
+}
+
 func mustParseMAC(s string) net.HardwareAddr {
 	hw, _ := net.ParseMAC(s)
 	return hw
@@ -397,7 +537,7 @@ func TestCollectLinksAndRoutes_LoopbackOnly(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, false)
+	args, err := collectLinksAndRoutes(conf, false, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -464,7 +604,7 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, false)
+	args, err := collectLinksAndRoutes(conf, false, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -472,6 +612,7 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 	wantFDLinks := []sentryapi.FDBasedLink{
 		{
 			Name:        "testveth0",
+			Multicast:   true,
 			MTU:         1500,
 			LinkAddress: veth0Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
@@ -489,6 +630,7 @@ func TestCollectLinksAndRoutes_MultipleInterfaces(t *testing.T) {
 		},
 		{
 			Name:        "testveth1",
+			Multicast:   true,
 			MTU:         1500,
 			LinkAddress: veth1Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
@@ -555,7 +697,7 @@ func TestCollectLinksAndRoutes_IPv6Disabled(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, true)
+	args, err := collectLinksAndRoutes(conf, true, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -563,6 +705,7 @@ func TestCollectLinksAndRoutes_IPv6Disabled(t *testing.T) {
 	wantFDLinks := []sentryapi.FDBasedLink{
 		{
 			Name:        "testveth0",
+			Multicast:   true,
 			MTU:         1500,
 			LinkAddress: veth0Link.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
@@ -619,7 +762,7 @@ func TestCollectLinksAndRoutes_DownInterface(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, false)
+	args, err := collectLinksAndRoutes(conf, false, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -651,7 +794,7 @@ func TestCollectLinksAndRoutes_NoUsableAddresses(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, true)
+	args, err := collectLinksAndRoutes(conf, true, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -697,7 +840,7 @@ func TestCollectLinksAndRoutes_LoopbackExtraRoutes(t *testing.T) {
 		XDP: config.XDP{Mode: config.XDPModeOff},
 	}
 
-	args, err := collectLinksAndRoutes(conf, false)
+	args, err := collectLinksAndRoutes(conf, false, false)
 	if err != nil {
 		t.Fatalf("collectLinksAndRoutes failed: %v", err)
 	}
@@ -739,6 +882,7 @@ func TestCollectLinksAndRoutes_LoopbackExtraRoutes(t *testing.T) {
 	wantFDLinks := []sentryapi.FDBasedLink{
 		{
 			Name:        "testveth0",
+			Multicast:   true,
 			MTU:         1500,
 			LinkAddress: vethLink.Attrs().HardwareAddr,
 			QDisc:       config.QDiscNone,
@@ -757,6 +901,101 @@ func TestCollectLinksAndRoutes_LoopbackExtraRoutes(t *testing.T) {
 	}
 	if !fdbasedLinksEqual(args.FDBasedLinks, wantFDLinks) {
 		t.Errorf("FDBasedLinks mismatch:\ngot  %+v\nwant %+v", args.FDBasedLinks, wantFDLinks)
+	}
+}
+
+func TestStopNetgoferNonChildRecycledPID(t *testing.T) {
+	s := &Sandbox{
+		ID:              "test-sandbox-id",
+		netgoferIsChild: false,
+	}
+	// Set NetgoferPid to the current test process's PID (simulating a recycled PID
+	// from a deserialized state.json whose process is not runsc-netgofer).
+	s.NetgoferPid.Store(os.Getpid())
+
+	s.stopNetgofer()
+
+	if got := s.NetgoferPid.Load(); got != 0 {
+		t.Errorf("s.NetgoferPid.Load() = %d, want 0", got)
+	}
+}
+
+// startFakeNetgofer starts a child process standing in for netgofer and wires
+// up the Sandbox bookkeeping exactly as startProxy() does.
+func startFakeNetgofer(t *testing.T, s *Sandbox, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(args[0], args[1:]...)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fake netgofer %v: %v", args, err)
+	}
+	stopped := make(chan struct{})
+	s.netgoferMu.Lock()
+	s.NetgoferPid.Store(cmd.Process.Pid)
+	s.netgoferIsChild = true
+	s.netgoferStopped = stopped
+	s.netgoferMu.Unlock()
+	s.reapNetgoferBackground(cmd.Process.Pid, stopped)
+	return cmd
+}
+
+func TestStopNetgoferChildExitsWithinGracePeriod(t *testing.T) {
+	s := &Sandbox{ID: "test-sandbox-id"}
+	// Hold stdin open so the child stays alive until stopNetgofer() is
+	// waiting on <-stopped, then close stdin to simulate netgofer observing its
+	// UDS peer closing and exiting on its own.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	cmd := exec.Command("/bin/cat")
+	cmd.Stdin = r
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fake netgofer: %v", err)
+	}
+	_ = r.Close()
+	pid := cmd.Process.Pid
+
+	stopped := make(chan struct{})
+	s.netgoferMu.Lock()
+	s.NetgoferPid.Store(pid)
+	s.netgoferIsChild = true
+	s.netgoferStopped = stopped
+	s.netgoferMu.Unlock()
+	s.reapNetgoferBackground(pid, stopped)
+
+	// Close the pipe shortly after stopNetgofer() starts waiting, well within
+	// netgoferGracePeriod (100ms), so stopNetgofer() deterministically enters
+	// the `select { case <-stopped: ... }` block while NetgoferPid != 0.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		_ = w.Close()
+	}()
+	s.stopNetgofer()
+
+	if got := s.NetgoferPid.Load(); got != 0 {
+		t.Errorf("s.NetgoferPid.Load() = %d, want 0", got)
+	}
+	if err := unix.Kill(pid, 0); err != unix.ESRCH {
+		t.Errorf("unix.Kill(%d, 0) = %v, want ESRCH (process should be reaped)", pid, err)
+	}
+}
+
+func TestStopNetgoferChildKilledAfterGracePeriod(t *testing.T) {
+	s := &Sandbox{ID: "test-sandbox-id"}
+	// A netgofer that never exits on its own must be SIGKILLed.
+	cmd := startFakeNetgofer(t, s, "/bin/sleep", "600")
+	pid := cmd.Process.Pid
+
+	s.stopNetgofer()
+
+	if got := s.NetgoferPid.Load(); got != 0 {
+		t.Errorf("s.NetgoferPid.Load() = %d, want 0", got)
+	}
+	if err := unix.Kill(pid, 0); err != unix.ESRCH {
+		t.Errorf("unix.Kill(%d, 0) = %v, want ESRCH (process should have been killed and reaped)", pid, err)
 	}
 }
 
@@ -1009,5 +1248,49 @@ func TestPrimaryInterface(t *testing.T) {
 				t.Errorf("primaryInterface(%+v) = %q, want %q", tc.args, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLoopbackLinkNetgoferProxyLoopback(t *testing.T) {
+	loIface, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Fatalf("net.InterfaceByName(\"lo\") failed: %v", err)
+	}
+	addrs := []net.Addr{
+		&net.IPNet{
+			IP:   net.ParseIP("127.0.0.1"),
+			Mask: net.CIDRMask(8, 32),
+		},
+		&net.IPNet{
+			IP:   net.IPv6loopback,
+			Mask: net.CIDRMask(128, 128),
+		},
+	}
+
+	baseLink, err := loopbackLink(&config.Config{Netgofer: config.NetgoferModeProxy}, *loIface, addrs, false)
+	if err != nil {
+		t.Fatalf("loopbackLink(NetgoferModeProxy) failed: %v", err)
+	}
+	got, err := loopbackLink(&config.Config{Netgofer: config.NetgoferModeProxyLoopback}, *loIface, addrs, false)
+	if err != nil {
+		t.Fatalf("loopbackLink(NetgoferModeProxyLoopback) failed: %v", err)
+	}
+
+	want := baseLink
+	want.Addresses = []sentryapi.IPWithPrefix{
+		{Address: net.ParseIP("127.0.0.1"), PrefixLen: 32},
+		{Address: net.IPv6loopback, PrefixLen: 128},
+	}
+	want.Routes = append([]sentryapi.Route{
+		{
+			Destination: net.IPNet{
+				IP:   net.IP{127, 0, 0, 1},
+				Mask: net.IPMask{255, 255, 255, 255},
+			},
+		},
+	}, baseLink.Routes[1:]...)
+
+	if !loopbackLinksEqual([]sentryapi.LoopbackLink{got}, []sentryapi.LoopbackLink{want}) {
+		t.Errorf("loopbackLink(NetgoferModeProxyLoopback) =\n%+v\nwant\n%+v", got, want)
 	}
 }

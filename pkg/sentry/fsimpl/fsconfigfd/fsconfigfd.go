@@ -179,10 +179,9 @@ type awaitingMountContext struct {
 	// The root of the filesystem created using FSCONFIG_CMD_CREATE.
 	root *vfs.Dentry
 
-	// The MountOptions which will be used to mount the filesystem by fsmount(2).
-	// Note that the filesystem-specific options have already been processed by
-	// FSCONFIG_CMD_CREATE, so only the mount-specific options are relevant here.
-	opts *vfs.MountOptions
+	// fsmount inherits the read-only setting from fsconfig. Filesystem-specific
+	// options have already been consumed by FSCONFIG_CMD_CREATE.
+	readOnly bool
 
 	// The credentials of the process that mounted the filesystem.
 	creds *auth.Credentials
@@ -192,6 +191,8 @@ func (awaitingMountContext) isFSContext() {}
 
 // reconfParamsContext represents a filesystem configuration context after fsmount(2) has
 // been called.
+//
+// +stateify savable
 type reconfParamsContext struct {
 	// The credentials of the process that mounted the filesystem.
 	creds *auth.Credentials
@@ -332,7 +333,7 @@ func (fd *Fd) DoCmdCreate(ctx context.Context, vfsObj *vfs.VirtualFilesystem) er
 	fd.context = &awaitingMountContext{
 		filesystem: fs,
 		root:       root,
-		opts:       opts,
+		readOnly:   opts.ReadOnly,
 		creds:      creds,
 	}
 
@@ -357,6 +358,11 @@ func (fd *Fd) DoCmdReconfigure(ctx context.Context, vfsObj *vfs.VirtualFilesyste
 	if !creds.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 		return linuxerr.EPERM
 	}
+	// The caller's Landlock domain decides, not the domain of the context's
+	// creator.
+	if err := vfs.LandlockDomainOf(auth.CredentialsFromContext(ctx)).CheckMountChange(); err != nil {
+		return err
+	}
 
 	// TODO(gvisor.dev/issues/13450): properly support reconfiguration on underlying filesystems.
 
@@ -378,7 +384,7 @@ func (fd *Fd) PeekFilesystem() (string, vfs.MountOptions, error) {
 			return "", vfs.MountOptions{}, linuxerr.EBUSY
 		}
 	}
-	return fdContext.filesystem.FilesystemType().Name(), *fdContext.opts, nil
+	return fdContext.filesystem.FilesystemType().Name(), vfs.MountOptions{ReadOnly: fdContext.readOnly}, nil
 }
 
 // GetFilesystem returns the filesystem and transitions the fd into the appropriate state if the

@@ -118,6 +118,98 @@ func TestReadSpansInlineTail(t *testing.T) {
 	}
 }
 
+func newInlineTailImage(blockBits uint8, data []byte) []byte {
+	const rootNid, fileNid = 96, 100
+	blockSize := 1 << blockBits
+	tailOff := len(data) &^ (blockSize - 1)
+	blocks := 1 + tailOff/blockSize
+	image := make([]byte, blocks*blockSize)
+	sb := erofs.SuperBlock{Magic: erofs.SuperBlockMagicV1, BlockSizeBits: blockBits, RootNid: rootNid, Blocks: uint32(blocks)}
+	sb.MarshalUnsafe(image[erofs.SuperBlockOffset:])
+	rootOff := rootNid << erofs.InodeSlotBits
+	root := erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatInline << erofs.InodeDataLayoutBit, Mode: linux.S_IFDIR | 0755, Size: 16, Nlink: 2}
+	root.MarshalUnsafe(image[rootOff:])
+	dirent := erofs.Dirent{NidLow: fileNid, NameOff: erofs.DirentSize, FileType: 1}
+	dirent.MarshalUnsafe(image[rootOff+erofs.InodeCompactSize:])
+	copy(image[rootOff+erofs.InodeCompactSize+erofs.DirentSize:], "file")
+	fileOff := fileNid << erofs.InodeSlotBits
+	file := erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatInline << erofs.InodeDataLayoutBit, Mode: linux.S_IFREG | 0444, Nlink: 1, Size: uint32(len(data)), RawBlockAddr: 1}
+	file.MarshalUnsafe(image[fileOff:])
+	copy(image[blockSize:], data[:tailOff])
+	tail := image[fileOff+erofs.InodeCompactSize : blockSize]
+	for i := copy(tail, data[tailOff:]); i < len(tail); i++ {
+		tail[i] = 0xff
+	}
+	return image
+}
+
+func checkMapping(t *testing.T, fd *regularFileFD, r memmap.MappableRange, want []byte) []memmap.Translation {
+	t.Helper()
+	ts, err := fd.inode().Translate(contexttest.Context(t), r, r, hostarch.Read)
+	if err := memmap.CheckTranslateResult(r, r, hostarch.Read, ts, err); err != nil {
+		t.Fatalf("Translate(%v): %v", r, err)
+	}
+	got := make([]byte, r.Length())
+	for _, tr := range ts {
+		blocks, err := tr.File.MapInternal(tr.FileRange(), hostarch.Read)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got[tr.Source.Start-r.Start:tr.Source.End-r.Start])), blocks); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("mapped byte %d = %#x, want %#x", r.Start+uint64(i), got[i], want[i])
+		}
+	}
+	return ts
+}
+
+func TestMMapInlineTail(t *testing.T) {
+	page := int(hostarch.PageSize)
+	for _, tc := range []struct {
+		blockBits uint8
+		size      int
+	}{
+		{blockBits: uint8(hostarch.PageShift), size: 800},
+		{blockBits: uint8(hostarch.PageShift), size: page + 800},
+		{blockBits: uint8(hostarch.PageShift) + 2, size: 2*page + 800},
+		{blockBits: uint8(hostarch.PageShift) + 2, size: 4*page + 2*page + 800},
+	} {
+		t.Run(fmt.Sprintf("block=%d/size=%d", 1<<tc.blockBits, tc.size), func(t *testing.T) {
+			if tc.blockBits > 16 {
+				t.Skipf("block size %d is larger than EROFS supports", 1<<tc.blockBits)
+			}
+			data := make([]byte, tc.size)
+			for i := range data {
+				data[i] = byte(i % 251)
+			}
+			fd := openTestFile(t, newInlineTailImage(tc.blockBits, data))
+			end, _ := hostarch.PageRoundUp(uint64(tc.size))
+			want := make([]byte, end)
+			copy(want, data)
+			ts := checkMapping(t, fd, memmap.MappableRange{Start: 0, End: end}, want)
+
+			tailOff := uint64(tc.size &^ (1<<tc.blockBits - 1))
+			var tailTr memmap.Translation
+			for _, tr := range ts {
+				if tr.Source.Start == tailOff {
+					tailTr = tr
+				}
+			}
+			for off := tailOff; off < end; off += uint64(page) {
+				r := memmap.MappableRange{Start: off, End: off + uint64(page)}
+				tailTS := checkMapping(t, fd, r, want[off:])
+				if got, wantOff := tailTS[0].Offset, tailTr.Offset+(off-tailOff); tailTS[0].File != tailTr.File || got != wantOff {
+					t.Errorf("page at %#x translated to %+v, want offset %#x in the tail copy", off, tailTS[0], wantOff)
+				}
+			}
+		})
+	}
+}
+
 func TestTranslateBeyondEOF(t *testing.T) {
 	file := erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatPlain << erofs.InodeDataLayoutBit, Size: uint32(hostarch.PageSize) + 17, RawBlockAddr: 4}
 	fd := openTestFile(t, newTestImage(0, file))
@@ -210,4 +302,103 @@ func TestChunkReadAndMMap(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestMountFailureClosesImageFD(t *testing.T) {
+	ctx := contexttest.Context(t)
+	mf := pgalloc.MemoryFileFromContext(ctx)
+	defer mf.Destroy()
+
+	vfsObj := &vfs.VirtualFilesystem{}
+	if err := vfsObj.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer vfsObj.Release(ctx)
+	vfsObj.MustRegisterFilesystemType(Name, &FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{AllowUserMount: true})
+
+	rootImage := newTestImage(0, erofs.InodeCompact{Format: erofs.InodeDataLayoutFlatInline << erofs.InodeDataLayoutBit})
+	rootFile, err := os.CreateTemp(t.TempDir(), "root-image")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rootFile.Write(rootImage); err != nil {
+		rootFile.Close()
+		t.Fatal(err)
+	}
+	rootImageFD, err := unix.Dup(int(rootFile.Fd()))
+	rootFile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mntns, err := vfsObj.NewMountNamespace(ctx, auth.CredentialsFromContext(ctx), "", Name, &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: fmt.Sprintf("ifd=%d", rootImageFD)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mntns.DecRef(ctx)
+	rootVD := mntns.Root(ctx)
+	defer rootVD.DecRef(ctx)
+
+	t.Run("MountAtNonexistentTarget", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "image")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(rootImage); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		imageFD, err := unix.Dup(int(f.Fd()))
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		pop := vfs.PathOperation{
+			Root:  rootVD,
+			Start: rootVD,
+			Path:  fspath.Parse("nonexistent"),
+		}
+		opts := vfs.MountOptions{
+			ReadOnly: true,
+			GetFilesystemOptions: vfs.GetFilesystemOptions{
+				InternalMount: true,
+				Data:          fmt.Sprintf("ifd=%d", imageFD),
+			},
+		}
+		if _, err := vfsObj.MountAt(ctx, auth.CredentialsFromContext(ctx), "", &pop, Name, &opts); err == nil {
+			t.Fatal("MountAt succeeded on nonexistent target, want error")
+		}
+		if _, err := unix.FcntlInt(uintptr(imageFD), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Errorf("FcntlInt(imageFD, F_GETFD) got err = %v, want %v (closed FD)", err, unix.EBADF)
+		}
+	})
+
+	t.Run("GetFilesystemRootInodeFailure", func(t *testing.T) {
+		badRootImage := make([]byte, len(rootImage))
+		copy(badRootImage, rootImage)
+		const rootNid = 96
+		badRoot := erofs.InodeCompact{Format: 7 << erofs.InodeDataLayoutBit, Mode: linux.S_IFDIR | 0755, Size: 16, Nlink: 2}
+		badRoot.MarshalUnsafe(badRootImage[rootNid<<erofs.InodeSlotBits:])
+
+		f, err := os.CreateTemp(t.TempDir(), "bad-root-image")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(badRootImage); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		imageFD, err := unix.Dup(int(f.Fd()))
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := vfsObj.NewMountNamespace(ctx, auth.CredentialsFromContext(ctx), "", Name, &vfs.MountOptions{GetFilesystemOptions: vfs.GetFilesystemOptions{Data: fmt.Sprintf("ifd=%d", imageFD)}}, nil); err == nil {
+			t.Fatal("NewMountNamespace succeeded with invalid root inode format, want error")
+		}
+		if _, err := unix.FcntlInt(uintptr(imageFD), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Errorf("FcntlInt(imageFD, F_GETFD) got err = %v, want %v (closed FD)", err, unix.EBADF)
+		}
+	})
 }

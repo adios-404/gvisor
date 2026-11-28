@@ -27,13 +27,64 @@ import (
 	"gvisor.dev/gvisor/runsc/gofer/filter"
 )
 
+const procSelfFDVarName = "proc_self_fd"
+
+// HostFSAccess is the set of host filesystem syscalls that the gofer can make
+// in addition to the ones that every gofer can make. Every gofer can open,
+// create, read and write host files, and can change their extended
+// attributes by path, so no level makes the host filesystem read-only for
+// the gofer.
+//
+// The levels are ordered. Each level allows all that the level before it
+// allows.
+type HostFSAccess int
+
+const (
+	// HostFSNone means that the gofer can make no more syscalls. This is
+	// sufficient when the Sentry uses directfs for every mount.
+	HostFSNone HostFSAccess = iota
+
+	// HostFSReadOnly means that the gofer can also list directories, read
+	// symlinks and the metadata of host files, and set the size of a file.
+	// The gofer sets the size of the memory that it shares with the Sentry
+	// for the channels of a connection. This level is sufficient when every
+	// connection is read-only.
+	HostFSReadOnly
+
+	// HostFSReadWriteExistingFiles means that the gofer can also change
+	// the metadata of host files and allocate space for them. This level
+	// is sufficient when the root of every writable connection is not a
+	// directory and not a symlink.
+	HostFSReadWriteExistingFiles
+
+	// HostFSReadWrite means that the gofer can also make directories,
+	// symlinks, hard links and whiteouts, and rename and remove host files.
+	HostFSReadWrite
+)
+
+// String returns the name of the access level.
+func (a HostFSAccess) String() string {
+	switch a {
+	case HostFSNone:
+		return "none"
+	case HostFSReadOnly:
+		return "readonly"
+	case HostFSReadWriteExistingFiles:
+		return "readwriteexistingfiles"
+	case HostFSReadWrite:
+		return "readwrite"
+	default:
+		return fmt.Sprintf("HostFSAccess(%d)", int(a))
+	}
+}
+
 // Options are seccomp filter related options.
 type Options struct {
 	UDSOpenEnabled   bool
 	UDSCreateEnabled bool
 	ProfileEnabled   bool
-	DirectFS         bool
-	LisafsNeeded     bool
+	HostFS           HostFSAccess
+	ProcSelfFD       uint32
 	CgoEnabled       bool
 	VendorSyscalls   precompiledseccomp.VarSyscallNumbers
 	ExtraRules       []seccomp.SyscallRules
@@ -71,8 +122,7 @@ func (opt Options) ConfigKey() string {
 	fmt.Fprintf(&sb, "UDSOpenEnabled=%t ", opt.UDSOpenEnabled)
 	fmt.Fprintf(&sb, "UDSCreateEnabled=%t ", opt.UDSCreateEnabled)
 	fmt.Fprintf(&sb, "ProfileEnabled=%t ", opt.ProfileEnabled)
-	fmt.Fprintf(&sb, "DirectFS=%t ", opt.DirectFS)
-	fmt.Fprintf(&sb, "LisafsNeeded=%t ", opt.LisafsNeeded)
+	fmt.Fprintf(&sb, "HostFS=%v ", opt.HostFS)
 	fmt.Fprintf(&sb, "Instrumentation=%t ", isInstrumentationEnabled())
 	fmt.Fprintf(&sb, "CgoEnabled=%t ", opt.CgoEnabled)
 	fmt.Fprintf(&sb, "VendorSyscalls=%q ", opt.VendorSyscalls.Key())
@@ -109,6 +159,13 @@ func Warnings(opt Options) []string {
 func (opt Options) Vars() precompiledseccomp.Values {
 	vars := precompiledseccomp.Values{}
 	vars.SetUint64(filter.SelfPIDVarName, uint64(os.Getpid()))
+	switch opt.HostFS {
+	case HostFSNone, HostFSReadOnly:
+	case HostFSReadWriteExistingFiles, HostFSReadWrite:
+		vars[procSelfFDVarName] = opt.ProcSelfFD
+	default:
+		panic(fmt.Sprintf("unknown HostFSAccess: %v", opt.HostFS))
+	}
 	opt.VendorSyscalls.SetVars(vars)
 	return vars
 }
@@ -145,10 +202,14 @@ func rules(opt Options, vars precompiledseccomp.Values) (seccomp.SyscallRules, s
 		s.Merge(filter.CgoFilters())
 	}
 	s.Merge(filter.InstrumentationFilters())
-	// When DirectFS is not enabled, filters for LisaFS are installed.
-	// Also needed when needing to serve a mount that disallows DirectFS.
-	if !opt.DirectFS || opt.LisafsNeeded {
-		s.Merge(lisafsFilters)
+	if opt.HostFS >= HostFSReadOnly {
+		s.Merge(hostFSReadSyscalls)
+	}
+	if opt.HostFS >= HostFSReadWriteExistingFiles {
+		s.Merge(hostFSReadWriteExistingFilesSyscalls(vars[procSelfFDVarName]))
+	}
+	if opt.HostFS >= HostFSReadWrite {
+		s.Merge(hostFSReadWriteSyscalls)
 	}
 	for _, rules := range opt.ExtraRules {
 		s.Merge(rules)

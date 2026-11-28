@@ -20,6 +20,8 @@
 //	  dentry.dirMu
 //	    inode.dirMu
 //	    inodeBucket.mu
+//	      *** "memmap.Mappable locks taken by Translate" below this point
+//	      inode.inlineTailMu
 //	    filesystem.cacheMu
 package erofs
 
@@ -153,7 +155,8 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		f.Close()
 		return nil, nil, err
 	}
-	cu.Add(func() { image.Close() })
+	imageCu := cleanup.Make(func() { image.Close() })
+	defer imageCu.Clean()
 
 	iopts, ok := opts.InternalData.(InternalFilesystemOptions)
 	if opts.InternalData != nil && !ok {
@@ -189,6 +192,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 	cu.Add(func() { fs.vfsfs.DecRef(ctx) })
+	imageCu.Release()
 
 	fs.zeroPage, err = fs.memoryFile.Allocate(uint64(hostarch.PageSize), pgalloc.AllocOpts{Kind: usage.PageCache, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
 	if err != nil {
@@ -358,11 +362,23 @@ type inode struct {
 	// +checklocks:mapsMu
 	mappings memmap.MappingSet
 
+	// inlineTailMu protects inlineTail.
+	inlineTailMu sync.Mutex `state:"nosave"`
+
+	// inlineTail is the range of fs.memoryFile that holds a copy of the
+	// file's tail-packed inline data, or an empty range until the tail is
+	// first mapped. Translations of other file data are into fs.mf.
+	// +checklocks:inlineTailMu
+	inlineTail memmap.FileRange
+
 	// locks supports POSIX and BSD style locks.
 	locks vfs.FileLocks
 
 	// Inotify watches for this inode.
 	watches vfs.Watches
+
+	// landlock holds the Landlock object of this inode.
+	landlock vfs.LandlockFileSlot
 }
 
 // getInode returns the inode identified by nid. A reference on inode is also
@@ -402,6 +418,11 @@ func (i *inode) DecRef(ctx context.Context) {
 	defer ib.mu.Unlock()
 	i.inodeRefs.DecRef(func() {
 		ib.removeInodeLocked(nid) // +checklocksforce: ib.mu is locked above.
+		i.inlineTailMu.Lock()
+		if i.inlineTail.Length() != 0 {
+			i.fs.memoryFile.DecRef(i.inlineTail)
+		}
+		i.inlineTailMu.Unlock()
 	})
 }
 
@@ -759,6 +780,11 @@ func (d *dentry) InotifyWithParent(ctx context.Context, events, cookie uint32, e
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
 	return &d.inode.watches
+}
+
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot.
+func (d *dentry) LandlockSlot() vfs.LandlockSlot {
+	return &d.inode.landlock
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.

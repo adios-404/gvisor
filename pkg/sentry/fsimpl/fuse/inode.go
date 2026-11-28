@@ -59,6 +59,11 @@ type inode struct {
 	nodeID     uint64
 	generation uint64
 
+	// landlock locates the Landlock object of this inode in fs.landlock by
+	// (nodeID, generation), so that the object outlives the inode. landlock
+	// is immutable after init.
+	landlock vfs.LandlockKeySlot
+
 	// entryTime is the time at which the entry must be revalidated. Reading
 	// entryTime requires either using entryTimeSeq and SeqAtomicLoadTime, or
 	// that attrMu is locked. Writing entryTime requires that attrMu is locked
@@ -159,6 +164,7 @@ func (i *inode) touchAtime() {
 // +checklocks:i.attrMu
 func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid uint64, mode linux.FileMode, nlink uint32) {
 	i.nodeID = nodeid
+	i.landlock = i.fs.landlock.Slot(landlockKey{nodeID: nodeid, generation: i.generation})
 	i.ino.Store(nodeid)
 	i.mode.Store(uint32(mode))
 	i.uid.Store(uint32(creds.FilesystemKUID))
@@ -170,6 +176,21 @@ func (i *inode) init(creds *auth.Credentials, devMajor, devMinor uint32, nodeid 
 	i.atime.Store(now)
 	i.mtime.Store(now)
 	i.ctime.Store(now)
+}
+
+// landlockKey identifies a FUSE file to Landlock in filesystem.landlock. A
+// node ID that the server reuses after forgetting the node comes with a new
+// generation, and so is a different file.
+//
+// +stateify savable
+type landlockKey struct {
+	nodeID     uint64
+	generation uint64
+}
+
+// LandlockSlot implements kernfs.Inode.LandlockSlot.
+func (i *inode) LandlockSlot() vfs.LandlockSlot {
+	return &i.landlock
 }
 
 // DecRef implements kernfs.Inode.DecRef.
@@ -237,7 +258,16 @@ func (i *inode) newEntry(ctx context.Context, name string, fileType linux.FileMo
 	if err != nil {
 		return nil, err
 	}
-	if opcode != linux.FUSE_LOOKUP && ((out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 || out.NodeID == 0 || out.NodeID == linux.FUSE_ROOT_ID) {
+	if out.NodeID == 0 {
+		if opcode == linux.FUSE_LOOKUP {
+			return nil, linuxerr.ENOENT
+		}
+		return nil, linuxerr.EIO
+	}
+	if out.NodeID == linux.FUSE_ROOT_ID {
+		return nil, linuxerr.EIO
+	}
+	if opcode != linux.FUSE_LOOKUP && (out.Attr.Mode&linux.S_IFMT)^uint32(fileType) != 0 {
 		return nil, linuxerr.EIO
 	}
 	child, err := i.fs.newInode(ctx, out.FUSEEntryOut)

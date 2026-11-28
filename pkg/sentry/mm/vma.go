@@ -226,9 +226,9 @@ func (mm *MemoryManager) findAvailableLocked(length uint64, opts findAvailableOp
 		// application address spaces.
 		hugeEnd := hostarch.HugePageRoundDown(opts.Offset + length)
 		if hugeStart, ok := hostarch.HugePageRoundUp(opts.Offset); ok && hugeStart < hugeEnd {
-			if paddedLen := length + hostarch.HugePageSize - hostarch.PageSize; length < paddedLen {
+			if paddedLen := length + uint64(hostarch.HugePageSize) - uint64(hostarch.PageSize); length < paddedLen {
 				if hugePaddedLen, ok := hostarch.HugePageRoundUp(paddedLen); ok {
-					if addr, err := mm.findAlignedAvailableLocked(hugePaddedLen, hostarch.HugePageSize, allowedAR, opts); err == nil {
+					if addr, err := mm.findAlignedAvailableLocked(hugePaddedLen, uint64(hostarch.HugePageSize), allowedAR, opts); err == nil {
 						return addr + hostarch.Addr(hostarch.HugePageOffset(opts.Offset)), nil
 					}
 				}
@@ -551,6 +551,7 @@ func (vmaSetFunctions) Merge(ar1 hostarch.AddrRange, vma1 vma, ar2 hostarch.Addr
 		vma1.numaPolicy != vma2.numaPolicy ||
 		vma1.numaNodemask != vma2.numaNodemask ||
 		vma1.dontfork != vma2.dontfork ||
+		vma1.dontdump != vma2.dontdump ||
 		vma1.eagerForkCopy != vma2.eagerForkCopy ||
 		vma1.sealed != vma2.sealed ||
 		vma1.id != vma2.id ||

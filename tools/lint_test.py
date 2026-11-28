@@ -36,10 +36,13 @@ class LintTest(unittest.TestCase):
     self.root = pathlib.Path(self.temp.name)
     self.cache = self.root / "cache"
     self.bin = self.root / "bin"
+    self.execroot = self.root / "execroot"
+    self.bazel_log = self.root / "bazel.log"
     self.env = dict(os.environ, LINT_CACHE_DIR=str(self.cache))
     self.env["PATH"] = str(self.bin) + os.pathsep + self.env["PATH"]
     self.cache.mkdir()
     self.bin.mkdir()
+    self.execroot.mkdir()
     self.versions = dict(
         re.findall(
             r'^declare -r ([A-Z_]+)_VERSION="([^"]+)"$',
@@ -49,6 +52,19 @@ class LintTest(unittest.TestCase):
     )
     self.tool(self.bin / "git", "printf 'tracked source\\0'")
     self.tool(self.bin / "curl", "echo unexpected-download >&2; exit 42")
+    # Bazel materializes both tools at the execroot-relative paths from cquery.
+    self.tool(
+        self.bin / "bazel",
+        f'echo "$*" >> "{self.bazel_log}"\n'
+        'case " $* " in\n'
+        f'  *" info "*) echo "{self.execroot}" ;;\n'
+        '  *" cquery "*)\n'
+        '    case "$*" in\n'
+        '      *"@buildifier_prebuilt//:buildifier"*) echo "buildifier buildifier" ;;\n'
+        '      *) echo "goimports goimports" ;;\n'
+        '    esac ;;\n'
+        "esac",
+    )
     for name in ("goimports", "clang-format", "buildifier"):
       self.tool(self.formatter(name), "exit 0")
 
@@ -57,8 +73,8 @@ class LintTest(unittest.TestCase):
     path.chmod(0o755)
 
   def formatter(self, name: str) -> pathlib.Path:
-    if name == "goimports":
-      return self.bin / "bazel"
+    if name in ("goimports", "buildifier"):
+      return self.execroot / name
     version = self.versions[name.upper().replace("-", "_")]
     return self.cache / f"{name}-{version}"
 
@@ -90,12 +106,36 @@ class LintTest(unittest.TestCase):
         ("clang-format",),
         ("buildifier",),
         ("--fix", "goimports"),
+        ("--fix", "buildifier"),
     ):
       name = args[-1]
       with self.subTest(args=args):
         self.tool(self.formatter(name), "exit 7")
         self.assert_failed(self.lint(*args), name)
         self.tool(self.formatter(name), "exit 0")
+
+  def test_bazel_options(self) -> None:
+    result = self.lint(
+        "--bazel=bazel --startup=1",
+        "--bazel-options=--opt=1 --opt=2",
+        "goimports",
+    )
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn("PASS  goimports", result.stderr)
+    commands = [c.split() for c in self.bazel_log.read_text().splitlines()]
+    self.assertEqual(
+        [c[:4] for c in commands],
+        [
+            ["--startup=1", command, "--opt=1", "--opt=2"]
+            for command in ("build", "info", "cquery")
+        ],
+    )
+
+  def test_bazel_failure(self) -> None:
+    self.tool(self.bin / "bazel", "echo bazel-build-failed >&2; exit 7")
+    result = self.lint("goimports")
+    self.assert_failed(result, "goimports")
+    self.assertIn("bazel-build-failed", result.stderr)
 
   def test_diagnostics_and_continuation(self) -> None:
     self.tool(
@@ -107,17 +147,17 @@ class LintTest(unittest.TestCase):
     self.assertIn("PASS  buildifier", result.stderr)
 
   def test_installer_failure(self) -> None:
-    # Both failures occur in an installer command substitution. A stale cache
-    # entry must not be made executable by commands following the failure.
-    self.formatter("buildifier").chmod(0o644)
-    result = self.lint("buildifier")
-    self.assert_failed(result, "buildifier")
+    # The remaining native formatter must not make a stale cache executable
+    # after an installer failure in a command substitution.
+    self.formatter("clang-format").chmod(0o644)
+    result = self.lint("clang-format")
+    self.assert_failed(result, "clang-format")
     self.assertIn("unexpected-download", result.stderr)
-    self.assertEqual(self.formatter("buildifier").stat().st_mode & 0o111, 0)
-    # mktemp adds another substitution, whose status local must not mask.
+    self.assertEqual(self.formatter("clang-format").stat().st_mode & 0o111, 0)
+    # A failed temporary-file allocation must not be masked by local assignment.
     self.tool(self.bin / "mktemp", "echo temporary-file-failed >&2; exit 7")
-    result = self.lint("buildifier", "goimports")
-    self.assert_failed(result, "buildifier")
+    result = self.lint("clang-format", "goimports")
+    self.assert_failed(result, "clang-format")
     self.assertIn("temporary-file-failed", result.stderr)
     self.assertNotIn("unexpected-download", result.stderr)
     self.assertIn("PASS  goimports", result.stderr)

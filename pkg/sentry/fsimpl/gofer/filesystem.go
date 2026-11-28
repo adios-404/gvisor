@@ -37,6 +37,19 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
+	if fs.dentryCache.isGlobal {
+		return linuxerr.EOPNOTSUPP
+	}
+	fs.renameMu.Lock()
+	defer fs.renameMu.Unlock()
+	// Keep renameMu locked so lookups cannot repopulate the cache during the
+	// drain. Existing references may still be released and become cacheable.
+	fs.evictAllCachedDentriesLocked(ctx, true /* keepRenameMu */)
+	return fs.client.FlushCloses(ctx)
+}
+
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	// Snapshot current syncable dentries and special file FDs.
@@ -132,8 +145,9 @@ func putDentrySlice(ds *[]*dentry) {
 }
 
 // renameMuRUnlockAndCheckCaching calls fs.renameMu.RUnlock(), then calls
-// dentry.checkCachingLocked on all dentries in *dsp with fs.renameMu locked
-// for writing.
+// dentry.checkCachingLocked on all dentries in *dsp. Cache updates do not require
+// fs.renameMu; checkCachingLocked acquires it for writing if eviction or
+// destruction is needed.
 //
 // dsp is a pointer-to-pointer since defer evaluates its arguments immediately,
 // but dentry slices are allocated lazily, and it's much easier to say "defer
@@ -147,7 +161,7 @@ func (fs *filesystem) renameMuRUnlockAndCheckCaching(ctx context.Context, dsp **
 	}
 	ds := **dsp
 	for _, d := range ds {
-		d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+		d.checkCachingLocked(ctx, false /* renameMuWriteLocked */, false /* keepRenameMu */)
 	}
 	putDentrySlice(*dsp)
 }
@@ -159,7 +173,7 @@ func (fs *filesystem) renameMuUnlockAndCheckCaching(ctx context.Context, ds **[]
 		return
 	}
 	for _, d := range **ds {
-		d.checkCachingLocked(ctx, true /* renameMuWriteLocked */)
+		d.checkCachingLocked(ctx, true /* renameMuWriteLocked */, false /* keepRenameMu */)
 	}
 	fs.renameMu.Unlock()
 	putDentrySlice(*ds)
@@ -284,7 +298,7 @@ func (fs *filesystem) getRemoteChildLocked(ctx context.Context, parent *dentry, 
 			fs.inodeMu.Lock()
 			child.inode.refs.DecRef(func() {
 				destroyInode = true
-				if !child.isDir() {
+				if !child.isDir() && fs.inodeByKey[child.inode.inoKey] == child.inode {
 					// Only non-directory inodes are cached in inodeByKey.
 					delete(fs.inodeByKey, child.inode.inoKey)
 				}
@@ -357,6 +371,8 @@ func (d *dentry) getCachedChildLocked(name string) (*dentry, error) {
 //   - !rp.Done().
 //   - If !d.inode.cachedMetadataAuthoritative(), then d's cached metadata must be up
 //     to date.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) walkParentDirLocked(ctx context.Context, vfsRP *vfs.ResolvingPath, d *dentry, ds **[]*dentry) (*dentry, error) {
 	rp := resolvingPathParent(vfsRP)
 	if err := fs.revalidatePath(ctx, rp, d, ds); err != nil {
@@ -385,6 +401,8 @@ func (fs *filesystem) walkParentDirLocked(ctx context.Context, vfsRP *vfs.Resolv
 // resolveLocked resolves rp to an existing file.
 //
 // Preconditions: fs.renameMu must be locked.
+//
+// +checklocksread:fs.renameMu
 func (fs *filesystem) resolveLocked(ctx context.Context, vfsRP *vfs.ResolvingPath, ds **[]*dentry) (*dentry, error) {
 	rp := resolvingPathFull(vfsRP)
 	d := rp.Start().Impl().(*dentry)
@@ -913,7 +931,7 @@ func (fs *filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 func (fs *filesystem) MknodAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.MknodOptions) error {
 	return fs.doCreateAt(ctx, rp, false /* dir */, func(parent *dentry, name string, ds **[]*dentry) (*dentry, error) {
 		creds := rp.Credentials()
-		if child, err := parent.mknod(ctx, name, creds, &opts); err == nil {
+		if child, err := parent.mknod(ctx, name, creds, &opts); err == nil { // +checklocksforce: fs.renameMu is locked by doCreateAt.
 			return child, nil
 		} else if !linuxerr.Equals(linuxerr.EPERM, err) {
 			return nil, err
@@ -987,6 +1005,11 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		}
 		if mustCreate {
 			return nil, linuxerr.EEXIST
+		}
+		// The start is a file if the path ends at the root of a file bind
+		// mount or at a magic link to a file.
+		if rp.MustBeDir() && !start.isDir() {
+			return nil, linuxerr.ENOTDIR
 		}
 		if !start.inode.cachedMetadataAuthoritative() {
 			// Refresh dentry's attributes before opening.
@@ -1115,15 +1138,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			return nil, err
 		}
 	}
-	if !d.inode.isSynthetic() {
-		// renameMu is locked here because it is required by d.openHandle(), which
-		// is called by d.ensureSharedHandle() and d.openSpecialFile() below. It is
-		// also required by d.connect() which is called by
-		// d.openSocketByConnecting(). Note that opening non-synthetic pipes may
-		// block, renameMu is unlocked separately in d.openSpecialFile() for pipes.
-		d.inode.fs.renameMu.RLock()
-		defer d.inode.fs.renameMu.RUnlock()
-	}
 
 	mnt := rp.Mount()
 	trunc := opts.Flags&linux.O_TRUNC != 0 && d.inode.fileType() == linux.S_IFREG
@@ -1199,7 +1213,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		}
 		if d.inode.fs.opts.disableFifoOpen {
 			logRejectedFifoOpenOnce.Do(func() {
-				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", d.name)
+				log.Warningf("Rejecting attempt to open fifo/pipe from host filesystem: %q. If you want to allow this, set flag --host-fifo=open", d.loadName())
 			})
 			return nil, linuxerr.EPERM
 		}
@@ -1209,7 +1223,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		case charDevEmulatedOnly:
 			if !rp.VirtualFilesystem().IsDeviceRegistered(vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor) {
 				logUnimplementedCharDevOpenOnce.Do(func() {
-					log.Warningf("Opening character device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO. If you want to allow this device to be opened on the host instead, set flag --character-device-policy=prefer-emulated", d.inode.rdevMajor, d.inode.rdevMinor, d.name)
+					log.Warningf("Opening character device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO. If you want to allow this device to be opened on the host instead, set flag --character-device-policy=prefer-emulated", d.inode.rdevMajor, d.inode.rdevMinor, d.loadName())
 				})
 			}
 			emulate = true
@@ -1217,20 +1231,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 			emulate = rp.VirtualFilesystem().IsDeviceRegistered(vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor)
 		}
 		if emulate {
-			// Dispatch to the sentry's device registry with renameMu dropped (so
-			// that it may block and lock in peace).
-			//
-			// It is safe because renameMu guards the dentry tree (parents, names,
-			// children); this dispatch consults none of it. It passes only mnt,
-			// &d.vfsd, and the immutable device numbers, and d stays alive across
-			// the window because the caller holds a reference on it (see the
-			// child.IncRef in the open path). A concurrent rename may relink d
-			// while we are unlocked, but we read no tree state afterwards: we
-			// re-acquire only to satisfy the deferred RUnlock and return at once.
-			d.inode.fs.renameMu.RUnlock()
-			fd, err := rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, mnt, &d.vfsd, vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor, opts)
-			d.inode.fs.renameMu.RLock()
-			return fd, err
+			return rp.VirtualFilesystem().OpenDeviceSpecialFile(ctx, mnt, &d.vfsd, vfs.CharDevice, d.inode.rdevMajor, d.inode.rdevMinor, opts)
 		}
 	case linux.S_IFBLK:
 		// This should be unreachable: block devices are rejected at walk time
@@ -1243,7 +1244,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// block device with no driver. There is deliberately no passthrough
 		// policy for block devices.
 		logUnimplementedBlockDevOpenOnce.Do(func() {
-			log.Warningf("Opening block device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO.", d.inode.rdevMajor, d.inode.rdevMinor, d.name)
+			log.Warningf("Opening block device %d:%d (%q), which the sentry does not implement; the open will fail with ENXIO.", d.inode.rdevMajor, d.inode.rdevMinor, d.loadName())
 		})
 		return nil, linuxerr.ENXIO
 	}
@@ -1268,7 +1269,6 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 	return vfd, err
 }
 
-// Precondition: fs.renameMu is locked.
 func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fsmetric.GoferOpensByConnecting.Increment()
 	if opts.Flags&linux.O_DIRECT != 0 {
@@ -1276,7 +1276,9 @@ func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptio
 	}
 	// Note that special value of linux.SockType = 0 is interpreted by lisafs
 	// as "do not care about the socket type". Analogous to p9.AnonymousSocket.
+	d.inode.fs.renameMu.RLock()
 	sockFD, err := d.connect(ctx, 0 /* sockType */)
+	d.inode.fs.renameMu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
@@ -1293,8 +1295,7 @@ func (d *dentry) openSocketByConnecting(ctx context.Context, opts *vfs.OpenOptio
 
 // Preconditions:
 //   - !d.inode.isSynthetic().
-//   - fs.renameMu is locked. It may be released temporarily while pipe blocks.
-//   - If d is a pipe, no other locks (other than fs.renameMu) should be held.
+//   - If d is a pipe, no locks should be held.
 func (d *dentry) openSpecialFile(ctx context.Context, mnt *vfs.Mount, opts *vfs.OpenOptions) (*vfs.FileDescription, error) {
 	ats := vfs.AccessTypesForOpenFlags(opts)
 	if opts.Flags&linux.O_DIRECT != 0 && !d.inode.isRegularFile() {
@@ -1318,12 +1319,8 @@ retry:
 		if isBlockingOpenOfNamedPipe && ats == vfs.MayWrite && linuxerr.Equals(linuxerr.ENXIO, err) {
 			// An attempt to open a named pipe with O_WRONLY|O_NONBLOCK fails
 			// with ENXIO if opening the same named pipe with O_WRONLY would
-			// block because there are no readers of the pipe. Release renameMu
-			// while blocking.
-			d.inode.fs.renameMu.RUnlock()
-			err := sleepBetweenNamedPipeOpenChecks(ctx)
-			d.inode.fs.renameMu.RLock()
-			if err != nil {
+			// block because there are no readers of the pipe.
+			if err := sleepBetweenNamedPipeOpenChecks(ctx); err != nil {
 				return nil, err
 			}
 			goto retry
@@ -1331,11 +1328,7 @@ retry:
 		return nil, err
 	}
 	if isBlockingOpenOfNamedPipe && ats == vfs.MayRead && h.fd >= 0 {
-		// Release renameMu while blocking.
-		d.inode.fs.renameMu.RUnlock()
-		err := blockUntilNonblockingPipeHasWriter(ctx, h.fd)
-		d.inode.fs.renameMu.RLock()
-		if err != nil {
+		if err := blockUntilNonblockingPipeHasWriter(ctx, h.fd); err != nil {
 			h.close(ctx)
 			return nil, err
 		}
@@ -1659,11 +1652,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 				newParent.syntheticChildren++
 				oldParent.syntheticChildren-- // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
 			}
-			renamed.parent.Store(newParent)
-			replaced.parent.Store(oldParent)
 		}
-		renamed.name = newName
-		replaced.name = oldName
+		genericSetParentAndName(fs, renamed, newParent, newName)
+		genericSetParentAndName(fs, replaced, oldParent, oldName)
 		newParent.children[newName] = renamed
 		oldParent.children[oldName] = replaced // +checklocksforce: oldParent.childrenMu is held if oldParent != newParent.
 		vfsObj.CommitRenameExchangeDentry(&handle, &renamed.vfsd, replacedVFSD)
@@ -1901,7 +1892,7 @@ func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 	if err != nil {
 		return nil, err
 	}
-	return d.listXattr(ctx, size)
+	return d.listXattr(ctx, size) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 }
 
 // GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
@@ -1913,7 +1904,7 @@ func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	if err != nil {
 		return "", err
 	}
-	return d.getXattr(ctx, rp.Credentials(), &opts)
+	return d.getXattr(ctx, rp.Credentials(), &opts) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 }
 
 // SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
@@ -1925,7 +1916,7 @@ func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	err = d.setXattr(ctx, rp.Credentials(), &opts)
+	err = d.setXattr(ctx, rp.Credentials(), &opts) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 	if err == nil {
 		d.InotifyWithParent(withCheckCachingList(ctx, &ds), linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	}
@@ -1942,7 +1933,7 @@ func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	err = d.removeXattr(ctx, rp.Credentials(), name)
+	err = d.removeXattr(ctx, rp.Credentials(), name) // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 	if err == nil {
 		d.InotifyWithParent(withCheckCachingList(ctx, &ds), linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	}
@@ -1981,6 +1972,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
+func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
+	genericWalkAncestors(fs, d.Impl().(*dentry), visit)
 }
 
 type mopt struct {

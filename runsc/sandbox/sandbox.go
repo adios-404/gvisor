@@ -174,6 +174,9 @@ type Sandbox struct {
 	// Zero if unknown.
 	PidIdentity uint64 `json:"pidIdentity,omitempty"`
 
+	// NetgoferPid is the PID of the netgofer running alongside the sandbox.
+	NetgoferPid Pid `json:"netgoferPid"`
+
 	// UID is the user ID in the parent namespace that the sandbox is running as.
 	UID int `json:"uid"`
 	// GID is the group ID in the parent namespace that the sandbox is running as.
@@ -247,6 +250,16 @@ type Sandbox struct {
 	// will have it as a child process.
 	child bool `nojson:"true"`
 
+	// netgoferMu protects NetgoferPid, netgoferIsChild, and netgoferStopped.
+	netgoferMu sync.Mutex `nojson:"true"`
+
+	// netgoferIsChild is set if the netgofer process is a child of the current process.
+	netgoferIsChild bool `nojson:"true"`
+
+	// netgoferStopped is closed when a child netgofer process has been reaped by
+	// reapNetgoferBackground.
+	netgoferStopped chan struct{} `nojson:"true"`
+
 	// statusMu protects status.
 	statusMu sync.Mutex `nojson:"true"`
 
@@ -254,6 +267,8 @@ type Sandbox struct {
 	// child==true and the sandbox was waited on. This field allows for multiple
 	// threads to wait on sandbox and get the exit code, since Linux will return
 	// WaitStatus to one of the waiters only.
+	//
+	// +checklocks:statusMu
 	status unix.WaitStatus `nojson:"true"`
 
 	// Checkpointed will be true when the sandbox has been checkpointed.
@@ -288,6 +303,10 @@ type Args struct {
 
 	// Spec is the OCI spec that describes the container.
 	Spec *specs.Spec
+
+	// NvidiaDriverVersion is the NVIDIA driver ABI version for nvproxy, or
+	// empty if nvproxy is disabled.
+	NvidiaDriverVersion string
 
 	// BundleDir is the directory containing the container bundle.
 	BundleDir string
@@ -476,7 +495,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 		return err
 	}
 	// Configure the network.
-	if err := setupNetwork(conn, pid, conf, disableIPv6, false); err != nil {
+	if err := s.setupNetwork(conn, pid, spec, conf, disableIPv6, false); err != nil {
 		return fmt.Errorf("setting up network: %w", err)
 	}
 
@@ -487,6 +506,7 @@ func (s *Sandbox) StartRoot(conf *config.Config, spec *specs.Spec) error {
 
 	// Send a message to the sandbox control server to start the root container.
 	if err := conn.Call(sentryapi.ContMgrRootContainerStart, &s.ID, nil); err != nil {
+		s.stopNetgofer()
 		return fmt.Errorf("starting root container: %w", err)
 	}
 	s.RegisteredMetrics = registeredMetrics
@@ -618,7 +638,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	// TODO(fvoznika): Once `runsc create --for-restore` exists, this should
 	// become a no-op and no longer be needed:
 	if err := s.switchCPULimit(cpuPhaseCreation, cpuPhaseLifecycle); err != nil {
-		log.Warningf("[Lifecycle CPU] Restore will run under the creation CPU limit: %v. This affects gVisor restore speed.", err)
+		log.Warningf("PERF: [Lifecycle CPU] Restore will run under the creation CPU limit: %v. This affects gVisor restore speed.", err)
 	}
 
 	if !s.FSRestore && HasFSCheckpointManifest(imagePath) {
@@ -664,10 +684,13 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 		}
 		// Scrape the host network to get the network config and store it in the
 		// loader. The kernel will restore loaded network stack with this config.
-		if err := setupNetwork(conn, s.Pid.Load(), conf, disableIPv6, true); err != nil {
+		if err := s.setupNetwork(conn, s.Pid.Load(), spec, conf, disableIPv6, true); err != nil {
 			return fmt.Errorf("setting up network: %w", err)
 		}
 	} else {
+		if conf.Netgofer.Enabled() {
+			log.Warningf("Netgofer proxy is enabled (--netgofer=%s) but custom network args are provided for restore; netgofer will not be started", conf.Netgofer)
+		}
 		// When network args is not nil, set it in the loader which will be used
 		// during restore to configure the loaded stack.
 		log.Debugf("Setting up network args, config: %+v", networkArgs)
@@ -684,6 +707,7 @@ func (s *Sandbox) Restore(conf *config.Config, spec *specs.Spec, cid string, ima
 	// Restore the container and start the root container.
 	var reply sentryapi.RestoreReply
 	if err := conn.Call(sentryapi.ContMgrRestore, &opt, &reply); err != nil {
+		s.stopNetgofer()
 		if opt.UseCheckpointGofer {
 			if target := getGCSURIFromImagePath(imagePath); target != "" {
 				return fmt.Errorf("restoring container %q from %s: %w", cid, target, err)
@@ -772,7 +796,7 @@ func openPagesFile(dirFD int, imagePath string, directIO DirectIO) (*os.File, er
 			return pf, err
 		}
 		// EINVAL means that the filesystem does not support O_DIRECT.
-		log.Infof("Reading pages file %q through the page cache: O_DIRECT is not supported", path.Join(imagePath, checkpointfiles.PagesFileName))
+		log.Infof("PERF: Reading pages file %q through the page cache: O_DIRECT is not supported", path.Join(imagePath, checkpointfiles.PagesFileName))
 	}
 	return openCheckpointFile(dirFD, imagePath, checkpointfiles.PagesFileName, unix.O_RDONLY)
 }
@@ -871,16 +895,24 @@ func (s *Sandbox) CreateTraceSession(config *seccheck.SessionConfig, force bool)
 	}
 	defer func() {
 		for _, f := range sinkFiles {
-			_ = f.Close()
+			if f != nil {
+				_ = f.Close()
+			}
 		}
 	}()
 
 	arg := sentryapi.CreateTraceSessionArgs{
 		Config: *config,
 		Force:  force,
-		FilePayload: urpc.FilePayload{
-			Files: sinkFiles,
-		},
+	}
+	// A sink that has no endpoint has a nil file, and urpc cannot send nil
+	// files. Send only the endpoints that exist, with the index of the sink of
+	// each one.
+	for i, f := range sinkFiles {
+		if f != nil {
+			arg.Files = append(arg.Files, f)
+			arg.SinkIndexes = append(arg.SinkIndexes, i)
+		}
 	}
 	if err := s.call(sentryapi.ContMgrCreateTraceSession, &arg, nil); err != nil {
 		return fmt.Errorf("creating trace session: %w", err)
@@ -1095,6 +1127,8 @@ func sentryGODEBUG(conf *config.Config) []string {
 	// initializers, before main runs.
 	if !conf.ProfileEnable {
 		godebug = append(godebug, "memprofilerate=0")
+	} else if conf.ProfileHeapRate != 0 {
+		godebug = append(godebug, "memprofilerate="+strconv.Itoa(conf.ProfileHeapRate))
 	}
 	return godebug
 }
@@ -1242,9 +1276,9 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	donations.DonateAndClose("mounts-fd", args.MountsFile)
 	var pinRing *os.File
 	if _, err := gvisorbinaries.FDParking.Path(); err != nil {
-		log.Warningf("Sidecar %q not found or usable (%v). This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
+		log.Warningf("PERF: Sidecar %q not found or usable (%v). This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
 	} else if ring, err := pinring.NewDisabledIOURing(); err != nil {
-		log.Warningf("Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
+		log.Warningf("PERF: Cannot create disabled io_uring ring: %v. This slows down gVisor sandbox teardown.", err)
 	} else {
 		pinRing = ring
 		defer pinRing.Close()
@@ -1329,22 +1363,18 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 	// nss is the set of namespaces to join or create before starting the sandbox
 	// process. Mount, IPC and UTS namespaces from the host are not used as they
 	// are virtualized inside the sandbox. Be paranoid and run inside an empty
-	// namespace for these. Don't unshare cgroup because sandbox is added to a
-	// cgroup in the caller's namespace.
-	log.Infof("Sandbox will be started in new mount, IPC and UTS namespaces")
+	// namespace for these.
+	log.Infof("Sandbox will be started in new cgroup, mount, IPC, PID and UTS namespaces")
 	nss := []specs.LinuxNamespace{
+		{Type: specs.CgroupNamespace},
 		{Type: specs.IPCNamespace},
 		{Type: specs.MountNamespace},
 		{Type: specs.UTSNamespace},
 		{Type: specs.PIDNamespace},
 	}
 
-	if specutils.NVProxyEnabled(args.Spec, conf) {
-		version, err := getNvproxyDriverVersion(conf)
-		if err != nil {
-			return fmt.Errorf("failed to get Nvidia driver version: %w", err)
-		}
-		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+version)
+	if args.NvidiaDriverVersion != "" {
+		cmd.Args = append(cmd.Args, "--nvidia-driver-version="+args.NvidiaDriverVersion)
 	}
 
 	// Joins the network namespace if network is enabled. the sandbox talks
@@ -1591,6 +1621,13 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 		}
 	}
 	cmd.Args = append(cmd.Args, "--total-memory", strconv.FormatUint(mem, 10))
+	productName, err := specutils.ProductName(args.Spec)
+	if err != nil {
+		return err
+	}
+	if productName != "" {
+		cmd.Args = append(cmd.Args, "--product-name", productName)
+	}
 
 	if args.Attached {
 		// Kill sandbox if parent process exits in attached mode.
@@ -1649,7 +1686,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 
 	if pinRing != nil {
 		if err := spawnFDParking(pinRing, cmd.Process.Pid); err != nil {
-			log.Warningf("Cannot spawn sidecar %q: %v. This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
+			log.Warningf("PERF: Cannot spawn sidecar %q: %v. This slows down gVisor sandbox teardown.", gvisorbinaries.FDParking.Name, err)
 		}
 	}
 	return nil
@@ -1721,6 +1758,26 @@ func cgroupCPUNum(cg cgroup.Cgroup) int {
 	return cpuNum
 }
 
+// CalculateCPUNum calculates the number of CPUs to configure for a process in
+// a cgroup, bounded by cpuset. If limits is set, it holds the application CPU
+// limit.
+func CalculateCPUNum(cg cgroup.Cgroup, limits *CPULimits, cpuNumFromQuota bool) (int, error) {
+	cgCPUNum := runtime.NumCPU()
+	if cg != nil {
+		if n, err := cg.NumCPU(); err == nil {
+			cgCPUNum = n
+		}
+	}
+	if !cpuNumFromQuota {
+		return cgCPUNum, nil
+	}
+	cpuNum, _, _, err := calculateCPUNum(cg, cgCPUNum, limits, true)
+	if err != nil {
+		return cgCPUNum, err
+	}
+	return cpuNum, nil
+}
+
 // calculateCPUNum calculates the number of CPUs to configure for the sandbox,
 // out of the `cgCPUNum` CPUs that `cg` can run on, along with the cgroup CPU
 // quota and period.
@@ -1730,8 +1787,15 @@ func calculateCPUNum(cg cgroup.Cgroup, cgCPUNum int, limits *CPULimits, cpuNumFr
 	cpuNum := cgCPUNum
 	var cpuQuota, cpuPeriod int64
 	if limits != nil {
-		cpuQuota, cpuPeriod = *limits.App.Quota, int64(*limits.App.Period)
-	} else {
+		if limits.App.Quota != nil {
+			cpuQuota = *limits.App.Quota
+		}
+		if limits.App.Period != nil && *limits.App.Period <= math.MaxInt64 {
+			cpuPeriod = int64(*limits.App.Period)
+		} else if cpuQuota > 0 {
+			cpuPeriod = cgroup.DefaultCPUPeriod
+		}
+	} else if cg != nil {
 		var err error
 		if cpuQuota, err = cg.CPUQuota(); err != nil {
 			return 0, 0, 0, fmt.Errorf("getting raw cpu quota from cgroups: %v", err)
@@ -1810,7 +1874,7 @@ func (s *Sandbox) Wait(cid string) (unix.WaitStatus, error) {
 		if err == nil {
 			if s.IsRootContainer(cid) {
 				if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
-					log.Warningf("[Lifecycle CPU] Sandbox teardown after root container exit will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+					log.Warningf("PERF: [Lifecycle CPU] Sandbox teardown after root container exit will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
 				}
 				if err := s.waitForStopped(); err != nil {
 					return unix.WaitStatus(0), err
@@ -1912,7 +1976,7 @@ func (s *Sandbox) destroy() error {
 	if pid != 0 {
 		if running, _ := s.IsRunning(); running {
 			if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
-				log.Warningf("[Lifecycle CPU] Sandbox destruction will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+				log.Warningf("PERF: [Lifecycle CPU] Sandbox destruction will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
 			}
 		}
 		log.Debugf("Killing sandbox %q", s.ID)
@@ -1924,7 +1988,132 @@ func (s *Sandbox) destroy() error {
 		}
 	}
 
+	s.stopNetgofer()
+
 	return nil
+}
+
+func isNetgoferProcess(pid int, sandboxID string) bool {
+	if pid <= 0 || sandboxID == "" {
+		return false
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	if len(args) == 0 || args[0] != "runsc-netgofer" {
+		return false
+	}
+	// startProxy() always appends the sandbox ID as the final positional
+	// argument.
+	return args[len(args)-1] == sandboxID
+}
+
+// netgoferGracePeriod is how long stopNetgofer() waits for netgofer to notice
+// that its UDS peer closed and exit on its own, before resorting to SIGKILL.
+const netgoferGracePeriod = 100 * time.Millisecond
+
+// netgoferKillTimeout bounds how long stopNetgofer() waits for netgofer to die
+// after SIGKILL. stopNetgofer() runs on the container deletion path and must
+// not be able to block indefinitely.
+const netgoferKillTimeout = 5 * time.Second
+
+// StopNetgofer stops the netgofer process running alongside the sandbox.
+func (s *Sandbox) StopNetgofer() {
+	s.stopNetgofer()
+}
+
+func (s *Sandbox) stopNetgofer() {
+	s.netgoferMu.Lock()
+	netgoferPid := s.NetgoferPid.Load()
+	if netgoferPid == 0 {
+		s.netgoferMu.Unlock()
+		return
+	}
+	isChild := s.netgoferIsChild
+	stopped := s.netgoferStopped
+	s.netgoferMu.Unlock()
+
+	if isChild && stopped != nil {
+		// Wait briefly for netgofer to exit gracefully (e.g. when the sandbox
+		// process exits and closes its end of the UDS socketpair).
+		select {
+		case <-stopped:
+			return
+		case <-time.After(netgoferGracePeriod):
+		}
+
+		s.netgoferMu.Lock()
+		if pid := s.NetgoferPid.Load(); pid == netgoferPid {
+			log.Debugf("Killing netgofer %q PID %d", s.ID, pid)
+			_ = unix.Kill(pid, unix.SIGKILL)
+		}
+		s.netgoferMu.Unlock()
+		select {
+		case <-stopped:
+		case <-time.After(netgoferKillTimeout):
+			log.Warningf("Timed out waiting for netgofer %q PID %d to be reaped", s.ID, netgoferPid)
+		}
+		return
+	}
+
+	if !isNetgoferProcess(netgoferPid, s.ID) {
+		s.netgoferMu.Lock()
+		if s.NetgoferPid.Load() == netgoferPid {
+			s.NetgoferPid.Store(0)
+		}
+		s.netgoferMu.Unlock()
+		return
+	}
+
+	if err := specutils.WaitForNonChildExit(netgoferPid, 0, netgoferGracePeriod); err != nil {
+		if isNetgoferProcess(netgoferPid, s.ID) {
+			log.Debugf("Killing netgofer %q PID %d", s.ID, netgoferPid)
+			_ = unix.Kill(netgoferPid, unix.SIGKILL)
+			if err := specutils.WaitForNonChildExit(netgoferPid, 0, netgoferKillTimeout); err != nil {
+				log.Warningf("Timed out waiting for netgofer %q PID %d to exit: %v", s.ID, netgoferPid, err)
+			}
+		}
+	}
+	s.netgoferMu.Lock()
+	if s.NetgoferPid.Load() == netgoferPid {
+		s.NetgoferPid.Store(0)
+	}
+	s.netgoferMu.Unlock()
+}
+
+func (s *Sandbox) reapNetgoferBackground(pid int, stopped chan struct{}) {
+	go func() {
+		defer close(stopped)
+		// Wait for the child to exit WITHOUT reaping it from the kernel process
+		// table (WNOWAIT), so the PID cannot be recycled before we clear NetgoferPid.
+		for {
+			err := unix.Waitid(unix.P_PID, pid, &unix.Siginfo{}, unix.WEXITED|unix.WNOWAIT, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			break
+		}
+		s.netgoferMu.Lock()
+		defer s.netgoferMu.Unlock()
+		if s.NetgoferPid.Load() == pid {
+			s.NetgoferPid.Store(0)
+		}
+		var status unix.WaitStatus
+		for {
+			_, err := unix.Wait4(pid, &status, 0, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if err == nil {
+				log.Infof("Netgofer process (PID=%d) reaped: exit code = %v", pid, status.ExitStatus())
+			} else if !errors.Is(err, unix.ECHILD) {
+				log.Warningf("error reaping netgofer process (PID=%d) from background goroutine: %v", pid, err)
+			}
+			break
+		}
+	}()
 }
 
 // SignalContainer sends the signal to a container in the sandbox. If all is
@@ -1935,7 +2124,7 @@ func (s *Sandbox) SignalContainer(cid string, sig unix.Signal, all bool) error {
 	if sig == unix.SIGKILL && s.IsRootContainer(cid) {
 		// This stops the application.
 		if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
-			log.Warningf("[Lifecycle CPU] Sandbox teardown after SIGKILL of the root container will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
+			log.Warningf("PERF: [Lifecycle CPU] Sandbox teardown after SIGKILL of the root container will run under the application CPU limit: %v. This slows down gVisor teardown.", err)
 		}
 	}
 	mode := sentryapi.DeliverToProcess
@@ -2013,6 +2202,14 @@ type CheckpointOpts struct {
 	// StateEngine, when non-nil, overrides the sandbox's boot-time state
 	// serialization engine for this checkpoint.
 	StateEngine *config.StateEnginePolicy
+
+	// SkipWaitForExit, if set, makes Checkpoint return as soon as the
+	// checkpoint is complete, without waiting for the sandbox to exit.
+	// This must be set when checkpointing a paused sandbox, since its tasks
+	// cannot finish exiting until the sandbox is resumed. For example,
+	// containerd checkpoints containers by doing pause+checkpoint+resume.
+	// Ignored if Resume is set.
+	SkipWaitForExit bool
 }
 
 // Checkpoint sends the checkpoint call for a container in the sandbox.
@@ -2060,7 +2257,7 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	}
 
 	if err := s.switchCPULimit(cpuPhaseApp, cpuPhaseLifecycle); err != nil {
-		log.Warningf("[Lifecycle CPU] Checkpoint will run under the application CPU limit: %v. This slows down gVisor checkpointing speed.", err)
+		log.Warningf("PERF: [Lifecycle CPU] Checkpoint will run under the application CPU limit: %v. This slows down gVisor checkpointing speed.", err)
 	}
 	if err := s.call(sentryapi.ContMgrCheckpoint, &opt, nil); err != nil {
 		// The application may still be running.
@@ -2077,6 +2274,12 @@ func (s *Sandbox) Checkpoint(conf *config.Config, cid string, imagePath string, 
 	s.Checkpointed = true
 	if opts.Resume {
 		return s.applyAppCPULimit(cpuPhaseLifecycle)
+	}
+	if opts.SkipWaitForExit {
+		return nil
+	}
+	if err := s.waitForStopped(); err != nil {
+		return fmt.Errorf("waiting for checkpointed sandbox %q to exit: %w", s.ID, err)
 	}
 	return nil
 }
@@ -3007,9 +3210,9 @@ func deviceFileForPlatform(name, devicePath string) (*fd.FD, error) {
 	return f, nil
 }
 
-// getNvproxyDriverVersion returns the NVIDIA driver ABI version to use by
+// NVProxyDriverVersion returns the NVIDIA driver ABI version to use by
 // nvproxy, or "latest", which the sentry resolves to the newest supported ABI.
-func getNvproxyDriverVersion(conf *config.Config) (string, error) {
+func NVProxyDriverVersion(conf *config.Config) (string, error) {
 	switch conf.NVProxyDriverVersion {
 	case "":
 		return nvconf.HostDriverVersion()
@@ -3233,6 +3436,13 @@ func SetUserMappings(spec *specs.Spec, pid int) error {
 		}
 	}
 	return nil
+}
+
+// DrainDentryCache drains unused dentries in the filesystem selected by path in
+// the container's init process view. It does not disable caching or pause tasks.
+func (s *Sandbox) DrainDentryCache(cid, path string) error {
+	args := sentryapi.DrainDentryCacheArgs{ContainerID: cid, Path: path}
+	return s.call(sentryapi.ContMgrDrainDentryCache, &args, nil)
 }
 
 // Mount mounts a filesystem in a container.

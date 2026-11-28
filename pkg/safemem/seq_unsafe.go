@@ -20,7 +20,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-	"gvisor.dev/gvisor/pkg/gohacks"
 )
 
 // A BlockSeq represents a sequence of Blocks, each of which has non-zero
@@ -185,7 +184,7 @@ func (bs BlockSeq) Tail() BlockSeq {
 		// The head Block exhausts the limit, so the tail is empty.
 		return BlockSeq{}
 	}
-	extSlice := gohacks.Slice(data, bs.length)
+	extSlice := unsafe.Slice(data, bs.length)
 	tailSlice := skipEmpty(extSlice[1:])
 	tailLimit := bs.limit - headLen
 	return blockSeqFromSliceLimited(tailSlice, tailLimit)
@@ -277,6 +276,25 @@ func CopySeq(dsts, srcs BlockSeq) (uint64, error) {
 		dst := dsts.Head()
 		src := srcs.Head()
 		n, err := Copy(dst, src)
+		done += uint64(n)
+		if err != nil {
+			return done, err
+		}
+		dsts = dsts.DropFirst(n)
+		srcs = srcs.DropFirst(n)
+	}
+	return done, nil
+}
+
+// CopySeqToUnsafe is equivalent to CopySeq, except that it uses safecopy to
+// access all Blocks in dsts, as if they were created by BlockFromUnsafeSlice
+// or BlockFromUnsafePointer.
+func CopySeqToUnsafe(dsts, srcs BlockSeq) (uint64, error) {
+	var done uint64
+	for !dsts.IsEmpty() && !srcs.IsEmpty() {
+		dst := dsts.Head()
+		dst.needSafecopy = true
+		n, err := Copy(dst, srcs.Head())
 		done += uint64(n)
 		if err != nil {
 			return done, err

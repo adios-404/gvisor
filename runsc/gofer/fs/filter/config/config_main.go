@@ -22,7 +22,6 @@ import (
 
 // allowedSyscalls is the set of syscalls executed by the gofer.
 var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-	unix.SYS_ACCEPT:        seccomp.MatchAll{},
 	unix.SYS_CLOCK_GETTIME: seccomp.MatchAll{},
 	unix.SYS_CLOSE:         seccomp.MatchAll{},
 	unix.SYS_DUP:           seccomp.MatchAll{},
@@ -40,9 +39,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	},
 	unix.SYS_EXIT:       seccomp.MatchAll{},
 	unix.SYS_EXIT_GROUP: seccomp.MatchAll{},
-	unix.SYS_FCHMOD:     seccomp.MatchAll{},
-	unix.SYS_FCHMODAT:   seccomp.MatchAll{},
-	unix.SYS_FCHOWNAT:   seccomp.MatchAll{},
 	unix.SYS_FCNTL: seccomp.Or{
 		seccomp.PerArg{
 			seccomp.AnyValue{},
@@ -145,7 +141,6 @@ var allowedSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_MUNMAP:    seccomp.MatchAll{},
 	unix.SYS_NANOSLEEP: seccomp.MatchAll{},
 	unix.SYS_OPENAT:    seccomp.MatchAll{},
-	unix.SYS_OPENAT2:   seccomp.MatchAll{},
 	unix.SYS_PPOLL:     seccomp.MatchAll{},
 	unix.SYS_PRCTL: seccomp.PerArg{
 		seccomp.EqualTo(unix.PR_SET_VMA),
@@ -237,14 +232,30 @@ var udsOpenSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 var udsCreateSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_ACCEPT4: seccomp.MatchAll{},
 	unix.SYS_BIND:    seccomp.MatchAll{},
-	unix.SYS_LISTEN:  seccomp.MatchAll{},
-})
-
-var lisafsFilters = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
-	unix.SYS_FALLOCATE: seccomp.PerArg{
+	// The gofer sets the mode and the owner of a socket that it binds, and
+	// removes the socket if a later step fails.
+	unix.SYS_FCHMOD: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
+		seccomp.AnyValue{},
+	},
+	unix.SYS_FCHOWNAT: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+	},
+	unix.SYS_LISTEN: seccomp.MatchAll{},
+	unix.SYS_UNLINKAT: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0),
 	},
+})
+
+// hostFSReadSyscalls are the syscalls with which the gofer reads directories,
+// symlinks and the metadata of host files, and sets the size of a file.
+var hostFSReadSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_FGETXATTR: seccomp.PerArg{
 		seccomp.NonNegativeFD{},
 		seccomp.AnyValue{},
@@ -256,19 +267,65 @@ var lisafsFilters = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.AnyValue{},
 	},
-	unix.SYS_FREMOVEXATTR: seccomp.PerArg{
-		seccomp.NonNegativeFD{},
-		seccomp.AnyValue{},
-	},
-	unix.SYS_FSETXATTR: seccomp.PerArg{
-		seccomp.NonNegativeFD{},
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-		seccomp.AnyValue{},
-	},
-	unix.SYS_FSTATFS:    seccomp.MatchAll{},
+	unix.SYS_FSTATFS: seccomp.MatchAll{},
+	// Used by flipcall.PacketWindowAllocator.Allocate() for the channels of
+	// a lisafs connection, and to change the size of a host file.
+	unix.SYS_FTRUNCATE:  seccomp.MatchAll{},
 	unix.SYS_GETDENTS64: seccomp.MatchAll{},
+	unix.SYS_READLINKAT: seccomp.MatchAll{},
+})
+
+// hostFSReadWriteExistingFilesSyscalls are the syscalls with which the gofer
+// changes the metadata of host files and allocates space for them.
+func hostFSReadWriteExistingFilesSyscalls(procSelfFD uint32) seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_FALLOCATE: seccomp.PerArg{
+			seccomp.AnyValue{},
+			seccomp.EqualTo(0),
+		},
+		unix.SYS_FCHMOD: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+		},
+		unix.SYS_FCHMODAT: seccomp.PerArg{
+			seccomp.EqualTo(procSelfFD),
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+		},
+		unix.SYS_FCHOWNAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.EqualTo(unix.AT_EMPTY_PATH | unix.AT_SYMLINK_NOFOLLOW),
+		},
+		unix.SYS_FREMOVEXATTR: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+		},
+		unix.SYS_FSETXATTR: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+			seccomp.AnyValue{},
+		},
+		unix.SYS_UTIMENSAT: seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.EqualTo(0),
+			seccomp.AnyValue{},
+			seccomp.EqualTo(0),
+		},
+	})
+}
+
+var atFDCWD = unix.AT_FDCWD
+
+// hostFSReadWriteSyscalls are the syscalls with which the gofer makes
+// directories, symlinks, hard links and whiteouts, and renames and removes
+// host files. The gofer makes them only for a writable connection whose root
+// is a directory or a symlink.
+var hostFSReadWriteSyscalls = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 	unix.SYS_LINKAT: seccomp.PerArg{
 		seccomp.NonNegativeFD{},
 		seccomp.AnyValue{},
@@ -276,12 +333,37 @@ var lisafsFilters = seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		seccomp.AnyValue{},
 		seccomp.EqualTo(0),
 	},
-	unix.SYS_MKDIRAT:    seccomp.MatchAll{},
-	unix.SYS_MKNODAT:    seccomp.MatchAll{},
-	unix.SYS_READLINKAT: seccomp.MatchAll{},
-	unix.SYS_RENAMEAT2:  seccomp.MatchAll{},
-	unix.SYS_SYMLINKAT:  seccomp.MatchAll{},
-	unix.SYS_FTRUNCATE:  seccomp.MatchAll{},
-	unix.SYS_UNLINKAT:   seccomp.MatchAll{},
-	unix.SYS_UTIMENSAT:  seccomp.MatchAll{},
+	unix.SYS_MKDIRAT: seccomp.MatchAll{},
+	// Allow creating only regular files and (0, 0) character device whiteouts.
+	unix.SYS_MKNODAT: seccomp.Or{
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFREG),
+			seccomp.EqualTo(0),
+		},
+		seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.MaskedEqual(unix.S_IFMT, unix.S_IFCHR),
+			seccomp.EqualTo(0),
+		},
+	},
+	// The gofer opens the parent directory of a symlink or of the target of
+	// a hard link.
+	unix.SYS_OPENAT2: seccomp.PerArg{
+		seccomp.EqualTo(uintptr(atFDCWD)),
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.EqualTo(unix.SizeofOpenHow),
+	},
+	unix.SYS_RENAMEAT2: seccomp.MatchAll{},
+	unix.SYS_SYMLINKAT: seccomp.MatchAll{},
+	unix.SYS_UNLINKAT:  seccomp.MatchAll{},
+	unix.SYS_UTIMENSAT: seccomp.PerArg{
+		seccomp.NonNegativeFD{},
+		seccomp.AnyValue{},
+		seccomp.AnyValue{},
+		seccomp.EqualTo(unix.AT_SYMLINK_NOFOLLOW),
+	},
 })

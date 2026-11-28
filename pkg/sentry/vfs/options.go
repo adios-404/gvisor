@@ -117,6 +117,22 @@ type MountOptions struct {
 	// normal user processes.
 	Locked bool
 
+	// Internal marks the mount as holding only sentry-internal files: Landlock
+	// checks allow all access to files reached through it, and Landlock rules
+	// cannot name them. Mounts cloned from an internal mount, such as bind
+	// mounts, are not internal. Internal is unrelated to
+	// GetFilesystemOptions.InternalMount, which lets the sentry create
+	// filesystems of types that applications cannot mount.
+	Internal bool
+
+	// LandlockUnnameable marks the mount as one whose files Landlock rules
+	// cannot name: landlock_add_rule(2) refuses them. Unlike for Internal
+	// mounts, Landlock still checks access to files reached through the
+	// mount. For example, the mount that mq_open(2) opens queues on is
+	// LandlockUnnameable, while an mqueue filesystem mounted at a path is not.
+	// Mounts cloned from a LandlockUnnameable mount are not LandlockUnnameable.
+	LandlockUnnameable bool
+
 	lockReadOnly bool
 }
 
@@ -231,6 +247,9 @@ type GetXattrOptions struct {
 	// free to ignore the hint entirely (i.e. the value returned may be larger
 	// than size). All size checking is done independently at the syscall layer.
 	Size uint64
+
+	// RawCapability skips memxattr's root ID conversion of security.capability.
+	RawCapability bool
 }
 
 // SetXattrOptions contains options to VirtualFilesystem.SetXattrAt(),

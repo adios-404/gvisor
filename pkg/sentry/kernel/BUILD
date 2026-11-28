@@ -368,6 +368,7 @@ go_library(
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/metric",
+        "//pkg/rand",
         "//pkg/refs",
         "//pkg/safemem",
         "//pkg/secio",
@@ -450,6 +451,7 @@ go_test(
     deps = [
         "//pkg/abi",
         "//pkg/abi/linux",
+        "//pkg/abi/sentry",
         "//pkg/bpf",
         "//pkg/context",
         "//pkg/errors/linuxerr",

@@ -38,6 +38,11 @@ const (
 	shortSymlinkLen = 128
 )
 
+// DrainDentryCache implements vfs.FilesystemImpl.DrainDentryCache.
+func (fs *filesystem) DrainDentryCache(ctx context.Context) error {
+	return linuxerr.EOPNOTSUPP
+}
+
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
 	// All filesystem state is in-memory.
@@ -1121,6 +1126,11 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 // IsDescendant implements vfs.FilesystemImpl.IsDescendant.
 func (fs *filesystem) IsDescendant(vfsroot, vd vfs.VirtualDentry) bool {
 	return genericIsDescendant(fs, vfsroot.Dentry(), vd.Dentry().Impl().(*dentry))
+}
+
+// WalkAncestors implements vfs.FilesystemImpl.WalkAncestors.
+func (fs *filesystem) WalkAncestors(d *vfs.Dentry, visit func(*vfs.Dentry) bool) {
+	genericWalkAncestors(fs, d.Impl().(*dentry), visit)
 }
 
 // MountOptions implements vfs.FilesystemImpl.MountOptions.

@@ -513,7 +513,8 @@ TEST(SeccompTest, TsyncAppliesToAllThreads) {
 
 // This test will validate that seccomp(2) rejects unsupported flags.
 TEST(SeccompTest, SeccompRejectsUnknownFlags) {
-  constexpr uint32_t kInvalidFlag = 123;
+  // No seccomp filter flag uses the high bit.
+  constexpr uint32_t kInvalidFlag = 1u << 31;
   ASSERT_THAT(
       syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, kInvalidFlag, nullptr),
       SyscallFailsWithErrno(EINVAL));

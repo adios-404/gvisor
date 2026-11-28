@@ -28,10 +28,14 @@
 //		        *** "memmap.Mappable locks taken by Translate" below this point
 //		        dentry.dataMu
 //		      filesystem.ancestryMu
+//		      vfs.Filesystem.landlockMu (taken by vfs.Filesystem.ShareLandlockObject)
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
 // stabilize this relationship.
+//
+// Locks on an outer stacked overlay filesystem (higher stackDepth) precede
+// locks on an inner overlay filesystem (lower stackDepth).
 package overlay
 
 import (
@@ -147,6 +151,60 @@ type filesystem struct {
 
 	// MaxFilenameLen is the maximum filename length allowed by the overlayfs.
 	maxFilenameLen uint64
+
+	// stackDepth is the 1-based overlay stacking depth of this filesystem,
+	// analogous to Linux's super_block.s_stack_depth. stackDepth is immutable.
+	stackDepth int
+
+	// landlock maps the layer files that overlay files' Landlock identities
+	// follow to the overlay files' Landlock objects. See
+	// dentry.LandlockSlot.
+	landlock vfs.LandlockKeyMap
+}
+
+func layerStackDepth(vd vfs.VirtualDentry) int {
+	if !vd.Ok() {
+		return 0
+	}
+	if ovlFS, ok := vd.Mount().Filesystem().Impl().(*filesystem); ok {
+		return ovlFS.stackDepth
+	}
+	return 0
+}
+
+func computeStackDepth(opts FilesystemOptions) int {
+	depth := layerStackDepth(opts.UpperRoot)
+	for _, lowerRoot := range opts.LowerRoots {
+		if d := layerStackDepth(lowerRoot); d > depth {
+			depth = d
+		}
+	}
+	return depth + 1
+}
+
+// depthIndex returns the index of fs' stacking depth among the per-depth lock
+// subclasses. Overlay locks have one lockdep subclass per depth, and
+// GetFilesystem limits the depth to linux.FILESYSTEM_MAX_STACK_DEPTH.
+func (fs *filesystem) depthIndex() int {
+	return fs.stackDepth - 1
+}
+
+func (fs *filesystem) renameLockIndex() renamelockNameIndex {
+	return renamelockNameIndex(fs.depthIndex())
+}
+
+const dirLocksPerDepth = dirLockD2 - dirLockD1
+
+func (d *dentry) dirLockIndex(offset dirlockNameIndex) dirlockNameIndex {
+	return dirlockNameIndex(d.fs.depthIndex())*dirLocksPerDepth + offset
+}
+
+func (d *dentry) mapsLockIndex() mapslockNameIndex {
+	return mapslockNameIndex(d.fs.depthIndex())
+}
+
+func (d *dentry) dataLockIndex() datalockNameIndex {
+	return datalockNameIndex(d.fs.depthIndex())
 }
 
 // +stateify savable
@@ -169,6 +227,11 @@ type createCredsKey struct {
 
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+	// The layers of an overlay that a task restricted by Landlock creates
+	// would escape its domain, so such a task may not create overlays.
+	if vfs.LandlockDomainOf(creds) != nil {
+		return nil, nil, linuxerr.EPERM
+	}
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsoptsRaw := opts.InternalData
 	fsopts, ok := fsoptsRaw.(FilesystemOptions)
@@ -179,6 +242,12 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	vfsroot := vfs.RootFromContext(ctx)
 	if vfsroot.Ok() {
 		defer vfsroot.DecRef(ctx)
+	}
+
+	// Used to resolve relative pathnames in the options below; see resolveStart.
+	vfscwd := vfs.WorkingDirectoryFromContext(ctx)
+	if vfscwd.Ok() {
+		defer vfscwd.DecRef(ctx)
 	}
 
 	userXattrVal, userXattr := mopts["userxattr"]
@@ -197,17 +266,22 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		// Linux overlayfs also requires a workdir when upperdir is
 		// specified; we don't, so silently ignore this option.
 		if workdir, ok := mopts["workdir"]; ok {
+			if len(workdir) == 0 {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir must not be empty")
+				return nil, nil, linuxerr.EINVAL
+			}
 			// Linux creates the "work" directory in `workdir`.
 			// Docker calls chown on it and fails if it doesn't
 			// exist.
 			workdirPath := fspath.Parse(workdir + "/work")
-			if !workdirPath.Absolute {
-				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q must be absolute", workdir)
-				return nil, nil, linuxerr.EINVAL
+			workdirStart, err := resolveStart(vfsroot, vfscwd, workdirPath)
+			if err != nil {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: workdir %q is relative, but the mount has no working directory", workdir)
+				return nil, nil, err
 			}
 			pop := vfs.PathOperation{
 				Root:               vfsroot,
-				Start:              vfsroot,
+				Start:              workdirStart,
 				Path:               workdirPath,
 				FollowFinalSymlink: false,
 			}
@@ -219,14 +293,19 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			}
 			delete(mopts, "workdir")
 		}
-		upperPath := fspath.Parse(upperPathname)
-		if !upperPath.Absolute {
-			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
+		if len(upperPathname) == 0 {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir must not be empty")
 			return nil, nil, linuxerr.EINVAL
+		}
+		upperPath := fspath.Parse(upperPathname)
+		upperStart, err := resolveStart(vfsroot, vfscwd, upperPath)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q is relative, but the mount has no working directory", upperPathname)
+			return nil, nil, err
 		}
 		upperRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
 			Root:               vfsroot,
-			Start:              vfsroot,
+			Start:              upperStart,
 			Path:               upperPath,
 			FollowFinalSymlink: true,
 		}, &vfs.GetDentryOptions{
@@ -273,14 +352,19 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		delete(mopts, "lowerdir")
 		lowerPathnames := strings.Split(lowerPathnamesStr, ":")
 		for _, lowerPathname := range lowerPathnames {
-			lowerPath := fspath.Parse(lowerPathname)
-			if !lowerPath.Absolute {
-				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
+			if len(lowerPathname) == 0 {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir must not contain an empty pathname")
 				return nil, nil, linuxerr.EINVAL
+			}
+			lowerPath := fspath.Parse(lowerPathname)
+			lowerStart, err := resolveStart(vfsroot, vfscwd, lowerPath)
+			if err != nil {
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q is relative, but the mount has no working directory", lowerPathname)
+				return nil, nil, err
 			}
 			lowerRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
 				Root:               vfsroot,
-				Start:              vfsroot,
+				Start:              lowerStart,
 				Path:               lowerPath,
 				FollowFinalSymlink: true,
 			}, &vfs.GetDentryOptions{
@@ -312,6 +396,11 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	if len(fsopts.LowerRoots) < 2 && !fsopts.UpperRoot.Ok() {
 		ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two lower layers are required when no upper layer is present")
+		return nil, nil, linuxerr.EINVAL
+	}
+	stackDepth := computeStackDepth(fsopts)
+	if stackDepth > linux.FILESYSTEM_MAX_STACK_DEPTH {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: stacking depth %d exceeds maximum %d", stackDepth, linux.FILESYSTEM_MAX_STACK_DEPTH)
 		return nil, nil, linuxerr.EINVAL
 	}
 	const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
@@ -351,6 +440,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		lowerDevMinors: make(map[layerDevNumber]uint32),
 		dirInoCache:    make(map[layerDevNoAndIno]uint64),
 		maxFilenameLen: linux.NAME_MAX,
+		stackDepth:     stackDepth,
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -381,7 +471,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	rootTopVD := root.topLayer()
 	rootCleanup := cleanup.Make(func() {
-		root.destroyLocked(ctx)
+		root.DecRef(ctx)
 		fs.vfsfs.DecRef(ctx)
 	})
 	defer rootCleanup.Clean()
@@ -445,6 +535,24 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 
 	rootCleanup.Release()
 	return &fs.vfsfs, &root.vfsd, nil
+}
+
+// resolveStart returns the VirtualDentry that path should be resolved from.
+// Linux resolves relative pathnames in overlayfs mount options against the
+// working directory of the mounting process. Mounts that do not originate from
+// a task have no working directory, in which case relative pathnames are
+// rejected rather than silently resolved against the root.
+//
+// Preconditions: No reference is taken on the returned VirtualDentry, so the
+// caller must keep vfsroot and vfscwd alive for as long as it uses the result.
+func resolveStart(vfsroot, vfscwd vfs.VirtualDentry, path fspath.Path) (vfs.VirtualDentry, error) {
+	if path.Absolute {
+		return vfsroot, nil
+	}
+	if !vfscwd.Ok() {
+		return vfs.VirtualDentry{}, linuxerr.EINVAL
+	}
+	return vfscwd, nil
 }
 
 // clonePrivateMount creates a non-recursive bind mount rooted at vd, not
@@ -680,6 +788,18 @@ type dentry struct {
 	// dirInoHash is the entry hash in fs.dirInoCache. This is only set for
 	// directories.
 	dirInoHash layerDevNoAndIno
+
+	// landlockLinked is true if, when the dentry was looked up, its topmost
+	// layer file was a lower non-directory with more than one link in an
+	// overlay with an upper layer. Copy-up breaks such links, so each name of
+	// the file is a file of its own to Landlock. landlockLinked is immutable.
+	landlockLinked bool
+
+	// landlockLower and landlockUpper cache the slots that LandlockSlot
+	// returns before and after copy-up. They are computed on first use, so
+	// that lookups of files that no Landlock check visits cost nothing extra.
+	landlockLower atomic.Pointer[vfs.LandlockKeySlot] `state:"nosave"`
+	landlockUpper atomic.Pointer[vfs.LandlockKeySlot] `state:"nosave"`
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -732,9 +852,10 @@ func (d *dentry) DecRef(ctx context.Context) {
 		refs.LogDecRef(d, r)
 	}
 	if r == 0 {
-		d.fs.renameMu.Lock()
+		idx := d.fs.renameLockIndex()
+		d.fs.renameMu.NestedLock(idx)
 		d.checkDropLocked(ctx)
-		d.fs.renameMu.Unlock()
+		d.fs.renameMu.NestedUnlock(idx)
 	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
 	}
@@ -803,11 +924,12 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 	d.watches.HandleDeletion(ctx)
 
 	if parent := d.parent.Load(); parent != nil {
-		parent.dirMu.Lock()
+		dirIdx := parent.dirLockIndex(dirLockD1)
+		parent.dirMu.NestedLock(dirIdx)
 		if !d.vfsd.IsDead() {
 			delete(parent.children, d.name)
 		}
-		parent.dirMu.Unlock()
+		parent.dirMu.NestedUnlock(dirIdx)
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
 		parent.decRefLocked(ctx)
@@ -857,6 +979,71 @@ func (d *dentry) Watches() *vfs.Watches {
 	return &d.watches
 }
 
+// LandlockSlot implements vfs.DentryImpl.LandlockSlot.
+//
+// The file's Landlock identity follows its topmost layer file: the topmost
+// lower file before copy-up, and the upper file after it. Copy-up carries the
+// identity over. For example, a rule added through a lower file still applies
+// after the file is copied up, and to hard links later made to the upper file
+// through the overlay.
+func (d *dentry) LandlockSlot() vfs.LandlockSlot {
+	if d.isCopiedUp() {
+		// Copy-up sets d.upperVD before it marks d copied up.
+		return d.cachedLandlockSlot(&d.landlockUpper, d.upperVD, false /* byName */)
+	}
+	return d.cachedLandlockSlot(&d.landlockLower, d.lowerVDs[0], d.landlockLinked)
+}
+
+// cachedLandlockSlot returns the slot in *cache, computing it from layer and
+// byName (see landlockSlot) on first use. It returns nil if Landlock rules
+// cannot name layer's file.
+func (d *dentry) cachedLandlockSlot(cache *atomic.Pointer[vfs.LandlockKeySlot], layer vfs.VirtualDentry, byName bool) vfs.LandlockSlot {
+	if s := cache.Load(); s != nil {
+		return s
+	}
+	s := d.fs.landlockSlot(layer, byName)
+	if s == nil {
+		return nil
+	}
+	// Concurrent callers compute equal slots, so either store may win.
+	cache.Store(s)
+	return s
+}
+
+// landlockSlot returns the slot under which fs finds the Landlock object of
+// an overlay file whose topmost layer file is layer, or nil if Landlock rules
+// cannot name layer's file.
+//
+// On layers that identify files by inode (tmpfs, gofer and erofs), the key is
+// the layer file's own LandlockSlot, so that hard links on the layer are one
+// file, unless byName is true. Otherwise the key is the layer dentry, so that
+// each name is a file of its own; this is the case on overlays and synthetic
+// filesystems. Either key stays unique while the overlay dentry holds a
+// reference on the layer dentry, which it does as long as its object does.
+func (fs *filesystem) landlockSlot(layer vfs.VirtualDentry, byName bool) *vfs.LandlockKeySlot {
+	layerSlot := layer.Dentry().Impl().LandlockSlot()
+	if layerSlot == nil {
+		return nil
+	}
+	var key any = layer.Dentry()
+	if !byName && layerIdentifiesFilesByInode(layer) {
+		key = layerSlot
+	}
+	slot := fs.landlock.Slot(key)
+	return &slot
+}
+
+// layerIdentifiesFilesByInode returns true if layer's filesystem gives all
+// names of a file one Landlock identity.
+func layerIdentifiesFilesByInode(layer vfs.VirtualDentry) bool {
+	switch layer.Mount().Filesystem().FilesystemType().Name() {
+	case "tmpfs", "9p", "erofs":
+		return true
+	default:
+		return false
+	}
+}
+
 // contextID is this package's type for context.Context.Value keys.
 type contextID int
 
@@ -884,9 +1071,10 @@ func (d *dentry) OnZeroWatches(ctx context.Context) {
 		*ds = appendDentry(*ds, d)
 		return
 	}
-	d.fs.renameMu.Lock()
+	idx := d.fs.renameLockIndex()
+	d.fs.renameMu.NestedLock(idx)
 	d.checkDropLocked(ctx)
-	d.fs.renameMu.Unlock()
+	d.fs.renameMu.NestedUnlock(idx)
 }
 
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
@@ -1055,7 +1243,7 @@ func (fd *fileDescription) dentry() *dentry {
 
 // ListXattr implements vfs.FileDescriptionImpl.ListXattr.
 func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
-	return fd.filesystem().listXattr(ctx, fd.dentry(), size)
+	return fd.filesystem().listXattr(ctx, fd.dentry(), auth.CredentialsFromContext(ctx))
 }
 
 // GetXattr implements vfs.FileDescriptionImpl.GetXattr.
@@ -1066,32 +1254,36 @@ func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOption
 // SetXattr implements vfs.FileDescriptionImpl.SetXattr.
 func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.setXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
 }
 
 // RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
 func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.removeXattrLocked(ctx, fd.dentry(), fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
 }
 
 // GetPosixACL implements vfs.FileDescriptionImpl.GetPosixACL.
 func (fd *fileDescription) GetPosixACL(ctx context.Context, t vfs.ACLType) (*vfs.PosixACL, error) {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.getPosixACLLocked(ctx, fd.dentry(), t)
 }
 
 // SetPosixACL implements vfs.FileDescriptionImpl.SetPosixACL.
 func (fd *fileDescription) SetPosixACL(ctx context.Context, t vfs.ACLType, acl *vfs.PosixACL, clearSGID bool) (*vfs.PosixACL, linux.FileMode, error) {
 	fs := fd.filesystem()
-	fs.renameMu.RLock()
-	defer fs.renameMu.RUnlock()
+	idx := fs.renameLockIndex()
+	fs.renameMu.NestedRLock(idx)
+	defer fs.renameMu.NestedRUnlock(idx)
 	return fs.setPosixACLLocked(ctx, fd.dentry(), auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), t, acl, clearSGID)
 }
 

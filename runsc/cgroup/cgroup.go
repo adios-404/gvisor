@@ -35,6 +35,7 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
+
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 )
@@ -47,8 +48,20 @@ const (
 	procRoot = "/proc"
 )
 
+// cgroupRootInfo contains info on the cgroups mount from /proc/self/mountinfo.
+type cgroupRootInfo struct {
+	// path is the cgroupfs root.
+	path string
+
+	// nsdelegate is whether the cgroupfs mount has the `nsdelegate` option.
+	nsdelegate bool
+}
+
+// defaultCgroupRoot is used when no cgroup mount is found.
+var defaultCgroupRoot = cgroupRootInfo{path: "/sys/fs/cgroup"}
+
 var (
-	cgroupRootInternal string
+	cgroupRootInternal cgroupRootInfo
 	cgroupRootOnce     sync.Once
 )
 
@@ -57,22 +70,29 @@ func cgroupRoot() string {
 	cgroupRootOnce.Do(func() {
 		cgroupRootInternal = findCgroupRoot()
 	})
-	return cgroupRootInternal
+	return cgroupRootInternal.path
 }
 
-// findCgroupRoot parses /proc/self/mountinfo to dynamically detect the cgroup root path.
+// HasNSDelegate returns whether cgroup2 is mounted with the `nsdelegate`
+// option. Only meaningful when `IsOnlyV2` is true.
+func HasNSDelegate() bool {
+	cgroupRoot() // Populates `cgroupRootInternal`.
+	return cgroupRootInternal.nsdelegate
+}
+
+// findCgroupRoot parses /proc/self/mountinfo to dynamically detect the cgroup root.
 // It defaults to "/sys/fs/cgroup" if detection fails.
-func findCgroupRoot() string {
+func findCgroupRoot() cgroupRootInfo {
 	f, err := os.Open(filepath.Join(procRoot, "self/mountinfo"))
 	if err != nil {
-		return "/sys/fs/cgroup"
+		return defaultCgroupRoot
 	}
 	defer f.Close()
 
 	return parseCgroupRoot(f)
 }
 
-func parseCgroupRoot(r io.Reader) string {
+func parseCgroupRoot(r io.Reader) cgroupRootInfo {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -81,20 +101,26 @@ func parseCgroupRoot(r io.Reader) string {
 		}
 		fstype := fields[len(fields)-3]
 		if fstype == cgroupv1FsName || fstype == cgroupv2FsName {
+			// The last field holds the superblock options.
+			info := cgroupRootInfo{
+				nsdelegate: fstype == cgroupv2FsName && slices.Contains(strings.Split(fields[len(fields)-1], ","), "nsdelegate"),
+			}
 			mountPoint := fields[4]
 			// If mountPoint is a controller subdirectory (e.g., /sys/fs/cgroup/memory,
-			// /sys/fs/cgroup/cpu,cpuacct, or /sys/fs/cgroup/unified), return its parent
-			// directory as the cgroup root. Otherwise, return mountPoint directly
+			// /sys/fs/cgroup/cpu,cpuacct, or /sys/fs/cgroup/unified), use its parent
+			// directory as the cgroup root. Otherwise, use mountPoint directly
 			// (e.g., /sys/fs/cgroup or /dev/cgroup).
 			base := filepath.Base(mountPoint)
 			name := strings.TrimPrefix(base, "name=")
 			if _, ok := controllers[name]; ok || base == "unified" || strings.Contains(base, ",") {
-				return filepath.Dir(mountPoint)
+				info.path = filepath.Dir(mountPoint)
+			} else {
+				info.path = mountPoint
 			}
-			return mountPoint
+			return info
 		}
 	}
-	return "/sys/fs/cgroup"
+	return defaultCgroupRoot
 }
 
 var controllers = map[string]controller{
@@ -290,7 +316,7 @@ func loadPathsHelper(cgroup, mountinfo io.Reader, unified bool) (map[string]stri
 	for scanner.Scan() {
 		// Format: ID:[name=]controller1,controller2:path
 		// Example: 2:cpu,cpuacct:/user.slice
-		tokens := strings.Split(scanner.Text(), ":")
+		tokens := strings.SplitN(scanner.Text(), ":", 3)
 		if len(tokens) != 3 {
 			return nil, fmt.Errorf("invalid cgroups file, line: %q", scanner.Text())
 		}
@@ -375,6 +401,10 @@ type Cgroup interface {
 	Update(res *specs.LinuxResources) error
 	Uninstall() error
 	Join() (func(), error)
+	// AllowDevices lets processes in the cgroup access the devices matched by
+	// rules, besides those allowed by earlier calls from any process. Other
+	// devices are denied.
+	AllowDevices(rules []DeviceRule) error
 	CloneIntoCgroup() (*os.File, error)
 	CPUQuota() (int64, error)
 	CPUPeriod() (int64, error)
@@ -415,6 +445,34 @@ func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
 	return new(strconv.Itoa(pid), "", useSystemd)
+}
+
+// NewSelf loads the cgroup of the current process for inspection. Unlike
+// NewFromPid, it preserves the leaf cgroup path on cgroup v2 rather than
+// resolving its parent directory.
+func NewSelf() (Cgroup, error) {
+	parents, err := loadPaths("self")
+	if err != nil {
+		return nil, fmt.Errorf("finding current cgroups: %w", err)
+	}
+	return newSelf(parents, IsOnlyV2(), cgroupRoot())
+}
+
+func newSelf(parents map[string]string, isV2 bool, root string) (Cgroup, error) {
+	if isV2 {
+		p, ok := parents[cgroup2Key]
+		if !ok {
+			return nil, ErrInvalidGroupPath
+		}
+		return &cgroupV2{
+			Mountpoint: root,
+			Path:       p,
+		}, nil
+	}
+	return &cgroupV1{
+		Parents: parents,
+		Own:     make(map[string]bool),
+	}, nil
 }
 
 // LikelySystemdPath returns true if the path looks like a systemd path. This is
@@ -991,7 +1049,22 @@ func (*blockIO) optional() bool {
 }
 
 func (*blockIO) skip(spec *specs.LinuxResources) error {
-	if spec != nil && spec.BlockIO != nil {
+	if spec == nil || spec.BlockIO == nil {
+		return nil
+	}
+
+	// Docker always populates BlockIO, even when no I/O limits are set
+	// (empty object, or Weight explicitly set to 0). Treat those as
+	// "no limits" so runsc still starts when the blkio controller is
+	// absent from the host.
+	b := spec.BlockIO
+	if (b.Weight != nil && *b.Weight != 0) ||
+		(b.LeafWeight != nil && *b.LeafWeight != 0) ||
+		len(b.WeightDevice) > 0 ||
+		len(b.ThrottleReadBpsDevice) > 0 ||
+		len(b.ThrottleWriteBpsDevice) > 0 ||
+		len(b.ThrottleReadIOPSDevice) > 0 ||
+		len(b.ThrottleWriteIOPSDevice) > 0 {
 		return fmt.Errorf("blkio controller is missing but limits are set in OCI spec")
 	}
 	return nil
@@ -1159,7 +1232,7 @@ func RunInCgroup(cg Cgroup, fn func(cloneIntoCgroupFD *os.File) error) error {
 		defer cgroupFD.Close()
 		return fn(cgroupFD)
 	}
-	log.Warningf("Cannot clone children directly into cgroup %q: %v. Joining it instead. This slows down gVisor startup and checkpoint/restore.", cg.MakePath(""), err)
+	log.Warningf("PERF: Cannot clone children directly into cgroup %q: %v. Joining it instead. This slows down gVisor startup and checkpoint/restore.", cg.MakePath(""), err)
 	restore, err := cg.Join()
 	if err != nil {
 		return err

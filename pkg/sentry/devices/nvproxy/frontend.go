@@ -250,7 +250,11 @@ func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, 
 	result, err := fd.dev.nvp.abi.frontendIoctl[nr].handle(&fi)
 	if err != nil {
 		if handleErr, ok := err.(*errHandler); ok {
-			fi.ctx.Warningf("nvproxy: %v for frontend ioctl %d == %#x (argSize=%d, cmd=%#x)", handleErr, nr, nr, argSize, cmd)
+			if fi.nr != nr {
+				fi.ctx.Warningf("nvproxy: %v for frontend ioctl %d == %#x (argSize=%d) in transfer (cmd=%#x)", handleErr, fi.nr, fi.nr, fi.ioctlParamsSize, cmd)
+			} else {
+				fi.ctx.Warningf("nvproxy: %v for frontend ioctl %d == %#x (argSize=%d, cmd=%#x)", handleErr, nr, nr, argSize, cmd)
+			}
 			return 0, linuxerr.EINVAL
 		}
 	}
@@ -272,6 +276,34 @@ type frontendIoctlState struct {
 	nr              uint32
 	ioctlParamsAddr hostarch.Addr
 	ioctlParamsSize uint32
+}
+
+// frontendIoctlXfer implements NV_ESC_IOCTL_XFER_CMD by dispatching the
+// enclosed ioctl to its own handler, as if the application had issued it
+// directly.
+func frontendIoctlXfer(fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.IoctlXfer
+	if int(fi.ioctlParamsSize) != ioctlParams.SizeBytes() {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+	// Handlers forward the enclosed ioctl to the host as a direct ioctl, so it
+	// cannot be another transfer, and its number and size must fit in the
+	// IOC_NRBITS and IOC_SIZEBITS fields of an ioctl request. The host driver
+	// also accepts a size of exactly NV_ABSOLUTE_MAX_IOCTL_SIZE
+	// (1 << IOC_SIZEBITS), which this check rejects.
+	if ioctlParams.Cmd == nvgpu.NV_ESC_IOCTL_XFER_CMD || ioctlParams.Cmd >= 1<<linux.IOC_NRBITS || ioctlParams.Size >= 1<<linux.IOC_SIZEBITS {
+		return 0, linuxerr.EINVAL
+	}
+	fi.nr = ioctlParams.Cmd
+	fi.ioctlParamsAddr = addrFromP64(ioctlParams.Ptr)
+	fi.ioctlParamsSize = ioctlParams.Size
+	if fi.ctx.IsLogging(log.Debug) {
+		fi.ctx.Debugf("nvproxy: frontend ioctl in transfer: nr = %d = %#x, argSize = %d", fi.nr, fi.nr, fi.ioctlParamsSize)
+	}
+	return fi.fd.dev.nvp.abi.frontendIoctl[fi.nr].handle(fi)
 }
 
 // frontendIoctlSimple implements a frontend ioctl whose parameters don't
@@ -312,6 +344,34 @@ func frontendIoctlSimpleNoStatus[Params any, PtrParams marshalPtr[Params]](fi *f
 	n, err := frontendIoctlInvokeNoStatus(fi, ioctlParams)
 	if err != nil {
 		return n, err
+	}
+	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+func rmGetEventData(fi *frontendIoctlState) (uintptr, error) {
+	var ioctlParams nvgpu.NVOS41_PARAMETERS
+	if fi.ioctlParamsSize != nvgpu.SizeofNVOS41Parameters {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr); err != nil {
+		return 0, err
+	}
+
+	var event nvgpu.NvUnixEvent
+	// The driver dequeues events before accessing the event buffer, so a failed copy-in
+	// must not prevent the host from processing the queue.
+	_, _ = event.CopyIn(fi.t, addrFromP64(ioctlParams.PEvent))
+	n, err := rmGetEventDataInvoke(fi, &ioctlParams, &event)
+	if err != nil {
+		return n, err
+	}
+	if ioctlParams.Status == nvgpu.NV_OK {
+		if _, err := event.CopyOut(fi.t, addrFromP64(ioctlParams.PEvent)); err != nil {
+			return n, frontendFailWithStatus(fi, &ioctlParams, nvgpu.NV_ERR_INVALID_ADDRESS)
+		}
 	}
 	if _, err := ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr); err != nil {
 		return n, err
@@ -449,7 +509,7 @@ func frontendExportToDMABufFD[Params any, PtrParams hasFrontendFDAndStatusPtr[Pa
 }
 
 // dmaBufFDWrapper wraps a host dma-buf fd returned by the NVIDIA driver's
-// export operation as an application FD. It implements vfs.HostFDProvider so
+// export operation as an application FD. It implements vfs.DMABufProvider so
 // that rdmaproxy can recover the host fd to hand to ibv_reg_dmabuf_mr.
 //
 // +stateify savable
@@ -462,8 +522,8 @@ type dmaBufFDWrapper struct {
 	hostFD int32
 }
 
-// HostFD implements vfs.HostFDProvider.HostFD.
-func (fd *dmaBufFDWrapper) HostFD() int {
+// DMABufHostFD implements vfs.DMABufProvider.DMABufHostFD.
+func (fd *dmaBufFDWrapper) DMABufHostFD() int {
 	return int(fd.hostFD)
 }
 
@@ -619,6 +679,7 @@ func rmAllocMemorySystem(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	ioctlParams.FD = mapFile.hostFD
 	client, unlock := fi.fd.dev.nvp.getClientWithLock(fi.ctx, ioctlParams.Params.HRoot)
 	if client == nil {
+		ioctlParams.FD = origFD
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
@@ -646,6 +707,7 @@ func rmAllocMemorySimple(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 	ioctlParams.FD = -1
 	client, unlock := fi.fd.dev.nvp.getClientWithLock(fi.ctx, ioctlParams.Params.HRoot)
 	if client == nil {
+		ioctlParams.FD = origFD
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_CLIENT)
 	}
 	n, err := frontendIoctlInvoke(fi, ioctlParams)
@@ -782,7 +844,7 @@ func mirrorAppRange(ctx context.Context, t *kernel.Task, ar hostarch.AddrRange, 
 		}
 		if _, _, errno := unix.Syscall(unix.SYS_MADVISE, m, uintptr(ar.Length()), uintptr(advice)); errno != 0 {
 			if !madvPopulateDisabled.Swap(true) {
-				log.Infof("nvproxy: disabling MADV_POPULATE_READ/WRITE before host driver pinning: %s", errno)
+				log.Infof("PERF: nvproxy: disabling MADV_POPULATE_READ/WRITE before host driver pinning: %s", errno)
 			}
 		}
 	}
@@ -799,7 +861,7 @@ func rmAllocOSDescriptor(fi *frontendIoctlState, ioctlParams *nvgpu.IoctlNVOS02P
 		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_OBJECT_HANDLE)
 	}
 	at := hostarch.Read
-	if ((ioctlParams.Params.Flags >> 21) & 0x1) == 0 /* NVOS02_FLAGS_ALLOC_USER_READ_ONLY_NO */ {
+	if (ioctlParams.Params.Flags>>nvgpu.NVOS02_FLAGS_ALLOC_USER_READ_ONLY_SHIFT)&nvgpu.NVOS02_FLAGS_ALLOC_USER_READ_ONLY_MASK != nvgpu.NVOS02_FLAGS_ALLOC_USER_READ_ONLY_YES {
 		at.Write = true
 	}
 	obj, m, status, err := pinOSDescriptor(fi, ioctlParams.Params.PMemory, ioctlParams.Params.Limit, at)
@@ -875,7 +937,10 @@ func pinOSDescriptor(fi *frontendIoctlState, pMemory nvgpu.P64, limit uint64, at
 	if err != nil {
 		return nil, 0, nvgpu.NV_OK, err
 	}
-	return &osDescMem{appMirror: am}, m, nvgpu.NV_OK, nil
+	return &osDescMem{
+		appMirror:      am,
+		pinnedWritable: at.Write,
+	}, m, nvgpu.NV_OK, nil
 }
 
 func rmDupObject(fi *frontendIoctlState) (uintptr, error) {
@@ -1241,9 +1306,40 @@ func ctrlRegisterVASpace(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAM
 	if err == nil && ioctlParams.Status == nvgpu.NV_OK {
 		// src/nvidia/src/kernel/gpu/bus/third_party_p2p.c:CliAddThirdPartyP2PVASpace()
 		// => refAddDependant()
+		// CliDelThirdPartyP2PVASpace() retains this dependency on unregister.
 		client.objAddDep(ioctlParams.HObject, ctrlParams.HVASpace)
 	}
 	unlock()
+	if err != nil {
+		return n, err
+	}
+	if _, err := ctrlParams.CopyOut(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return n, err
+	}
+	return n, nil
+}
+
+// ctrlNvencSwSessionUpdateInfo translates the embedded timestamp buffer. Compare
+// src/nvidia/src/kernel/gpu/nvenc/nvencsessionctrl.c:nvencsessionCtrlCmdNvencSwSessionUpdateInfo_IMPL().
+func ctrlNvencSwSessionUpdateInfo(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS54_PARAMETERS) (uintptr, error) {
+	var ctrlParams nvgpu.NVA0BC_CTRL_NVENC_SW_SESSION_UPDATE_INFO_PARAMS
+	if ctrlParams.SizeBytes() != int(ioctlParams.ParamsSize) {
+		return 0, linuxerr.EINVAL
+	}
+	if _, err := ctrlParams.CopyIn(fi.t, addrFromP64(ioctlParams.Params)); err != nil {
+		return 0, err
+	}
+	// rmapi/param_copy.c:rmapiParamsAcquire() requires the embedded pointer
+	// and size to be either both zero or both nonzero.
+	if ctrlParams.TimestampBufferSize > nvgpu.NVA0BC_CTRL_CMD_NVENC_MAX_BUFFER_ENTRIES ||
+		(ctrlParams.TimestampBufferSize == 0) != (ctrlParams.TimestampBuffer == 0) {
+		return 0, frontendFailWithStatus(fi, ioctlParams, nvgpu.NV_ERR_INVALID_ARGUMENT)
+	}
+	var timestampBuffer []byte
+	if ctrlParams.TimestampBufferSize != 0 {
+		timestampBuffer = make([]byte, int(ctrlParams.TimestampBufferSize)*(*nvgpu.NVA0BC_CTRL_NVENC_TIMESTAMP)(nil).SizeBytes())
+	}
+	n, err := ctrlNvencSwSessionUpdateInfoInvoke(fi, ioctlParams, &ctrlParams, timestampBuffer)
 	if err != nil {
 		return n, err
 	}
@@ -1579,6 +1675,14 @@ func rmAllocChannelGroupV615(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_P
 	})
 }
 
+// rmAllocChannelGroupV620 is the same as rmAllocChannelGroup, but for
+// 620.70.06.
+func rmAllocChannelGroupV620(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V620) {
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+	})
+}
+
 func rmAllocChannel(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
 	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CHANNEL_ALLOC_PARAMS) {
 		// See
@@ -1615,6 +1719,14 @@ func rmAllocContextShare(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAM
 		// group, so (given that we are representing graphics context
 		// dependencies as channel group dependencies) no separate dependency
 		// is required.
+		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
+	})
+}
+
+// rmAllocContextShareV620 is the same as rmAllocContextShare, but for
+// 620.70.06.
+func rmAllocContextShareV620(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool) (uintptr, error) {
+	return rmAllocSimpleParams(fi, ioctlParams, isNVOS64, func(fi *frontendIoctlState, client *rootClient, ioctlParams *nvgpu.NVOS64_PARAMETERS, rightsRequested nvgpu.RS_ACCESS_MASK, allocParams *nvgpu.NV_CTXSHARE_ALLOCATION_PARAMETERS_V620) {
 		fi.fd.dev.nvp.objAdd(fi.ctx, client, ioctlParams.HObjectNew, ioctlParams.HClass, newRmAllocObject(fi.fd, ioctlParams, rightsRequested, allocParams), ioctlParams.HObjectParent, allocParams.HVASpace)
 	})
 }
@@ -1870,6 +1982,17 @@ func rmMapMemory(fi *frontendIoctlState) (uintptr, error) {
 	}
 
 	return n, nil
+}
+
+func rmAllocFailWithStatus(fi *frontendIoctlState, ioctlParams *nvgpu.NVOS64_PARAMETERS, isNVOS64 bool, status uint32) error {
+	if log.IsLogging(log.Debug) {
+		fi.ctx.Debugf("nvproxy: NV_ESC_RM_ALLOC internally failed: status=%#x", status)
+	}
+	ioctlParams.SetStatus(status)
+	outIoctlParams := nvgpu.GetRmAllocParamObj(isNVOS64)
+	outIoctlParams.FromOS64(*ioctlParams)
+	_, err := outIoctlParams.CopyOut(fi.t, fi.ioctlParamsAddr)
+	return err
 }
 
 func frontendFailWithStatus[Params any, PtrParams hasStatusPtr[Params]](fi *frontendIoctlState, ioctlParams PtrParams, status uint32) error {

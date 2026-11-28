@@ -336,6 +336,7 @@ var Metrics = tcpip.Stats{
 		SegmentsAckedWithDSACK:             mustCreateMetric("/netstack/tcp/segments_acked_with_dsack", "Number of segments for which DSACK was received."),
 		SpuriousRecovery:                   mustCreateMetric("/netstack/tcp/spurious_recovery", "Number of times the connection entered loss recovery spuriously."),
 		SpuriousRTORecovery:                mustCreateMetric("/netstack/tcp/spurious_rto_recovery", "Number of times the connection entered RTO spuriously."),
+		DelayedACKs:                        mustCreateMetric("/netstack/tcp/delayed_acks", "Number of ACKs sent by the delayed ACK timer."),
 		ForwardMaxInFlightDrop:             mustCreateMetric("/netstack/tcp/forward_max_in_flight_drop", "Number of connection requests dropped due to exceeding in-flight limit."),
 	},
 	UDP: tcpip.UDPStats{
@@ -500,7 +501,7 @@ func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (s *sock) Release(ctx context.Context) {
 	kernel.KernelFromContext(ctx).DeleteSocket(&s.vfsfd)
-	e, ch := waiter.NewChannelEntry(waiter.EventHUp | waiter.EventErr)
+	e, ch := waiter.NewChannelEntry(waiter.EventHUp | waiter.EventErr | waiter.EventInternal)
 	s.EventRegister(&e)
 	defer s.EventUnregister(&e)
 
@@ -511,15 +512,36 @@ func (s *sock) Release(ctx context.Context) {
 	if family, skType, _ := s.Type(); skType == linux.SOCK_STREAM && (family == linux.AF_INET || family == linux.AF_INET6) {
 		v := s.Endpoint.SocketOptions().GetLinger()
 		// The case for zero timeout is handled in tcp endpoint close function.
-		// Close is blocked until either:
+		// As in Linux, close does not linger if the task is exiting.
+		// Otherwise, close is blocked until one of these happens:
 		// 1. The endpoint state is not in any of the states: FIN-WAIT1,
 		// CLOSING and LAST_ACK.
 		// 2. Timeout is reached.
-		if v.Enabled && v.Timeout != 0 {
-			_, _ = ctx.BlockWithTimeout(ch, true, v.Timeout)
+		// 3. The task is interrupted, for example by a signal.
+		t := kernel.TaskFromContext(ctx)
+		exiting := t != nil && t.ExitState() >= kernel.TaskExitInitiated
+		if v.Enabled && v.Timeout != 0 && !exiting {
+			timeout := v.Timeout
+			for isClosing(tcp.EndpointState(s.Endpoint.State())) {
+				var err error
+				if timeout, err = ctx.BlockWithTimeout(ch, true, timeout); err != nil {
+					break
+				}
+			}
 		}
 	}
 	s.namespace.DecRef(ctx)
+}
+
+// isClosing returns true if a TCP endpoint in state st waits for the peer to
+// acknowledge its FIN, like Linux's sk_stream_closing.
+func isClosing(st tcp.EndpointState) bool {
+	switch st {
+	case tcp.StateFinWait1, tcp.StateClosing, tcp.StateLastAck:
+		return true
+	default:
+		return false
+	}
 }
 
 // Epollable implements FileDescriptionImpl.Epollable.
@@ -1270,13 +1292,20 @@ func (s *sock) getSockOptTCP(t *kernel.Task, ep commonEndpoint, name, outLen int
 		}
 
 		info := linux.TCPInfo{
-			State:       uint8(v.State),
-			RTO:         uint32(v.RTO / time.Microsecond),
-			RTT:         uint32(v.RTT / time.Microsecond),
-			RTTVar:      uint32(v.RTTVar / time.Microsecond),
-			SndSsthresh: v.SndSsthresh,
-			SndCwnd:     v.SndCwnd,
-			SndMss:      v.SndMss,
+			State:        uint8(v.State),
+			RTO:          uint32(v.RTO / time.Microsecond),
+			RTT:          uint32(v.RTT / time.Microsecond),
+			RTTVar:       uint32(v.RTTVar / time.Microsecond),
+			SndSsthresh:  v.SndSsthresh,
+			SndCwnd:      v.SndCwnd,
+			SndMss:       v.SndMss,
+			TotalRetrans: v.TotalRetrans,
+		}
+		if v.Timestamps {
+			info.Options |= linux.TCPI_OPT_TIMESTAMPS
+		}
+		if v.SACKPermitted {
+			info.Options |= linux.TCPI_OPT_SACK
 		}
 		switch v.CcState {
 		case tcpip.RTORecovery:
@@ -3331,9 +3360,8 @@ func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDe
 	// Don't overwrite any data we received.
 	dst = dst.DropFirst(n)
 
-	// We'll have to block. Register for notifications and keep trying to
-	// send all the data.
-	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
+	// A connected UDP socket can receive an ICMP error without receiving data.
+	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.EventErr)
 	s.EventRegister(&e)
 	defer s.EventUnregister(&e)
 
@@ -3517,6 +3545,21 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr,
 		_, err := ifr.CopyOut(t, args[2].Pointer())
 		return 0, err
 
+	case linux.SIOCSIFFLAGS:
+		var ifr linux.IFReq
+		if _, err := ifr.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		// The capability is checked before the device is looked up, and the
+		// ifreq is not copied back.
+		if !t.HasCapabilityIn(linux.CAP_NET_ADMIN, t.NetworkNamespace().UserNamespace()) {
+			return 0, linuxerr.EPERM
+		}
+		if err := interfaceIoctl(ctx, io, arg, &ifr); err != nil {
+			return 0, err.ToError()
+		}
+		return 0, nil
+
 	case linux.SIOCGIFCONF:
 		// Return a list of interface addresses or the buffer size
 		// necessary to hold the list.
@@ -3636,6 +3679,14 @@ func interfaceIoctl(ctx context.Context, _ usermem.IO, arg int, ifr *linux.IFReq
 		// Drop the flags that don't fit in the size that we need to return. This
 		// matches Linux behavior.
 		hostarch.ByteOrder.PutUint16(ifr.Data[:2], uint16(f))
+
+	case linux.SIOCSIFFLAGS:
+		epstack, ok := stk.(*Stack)
+		if !ok {
+			return errStackType
+		}
+		flags := uint32(hostarch.ByteOrder.Uint16(ifr.Data[:2]))
+		return epstack.SetInterfaceFlags(ctx, tcpip.NICID(index), flags)
 
 	case linux.SIOCGIFADDR:
 		// Copy the IPv4 address out.
@@ -3775,16 +3826,21 @@ func interfaceStatusFlags(stack inet.Stack, name string) (uint32, *syserr.Error)
 func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	var rv uint32
 	if f.Up {
-		rv |= linux.IFF_UP | linux.IFF_LOWER_UP
+		rv |= linux.IFF_UP
 	}
+	// A NIC that is administratively up but disabled, such as while external
+	// networking is paused, is reported like a device without carrier.
 	if f.Running {
-		rv |= linux.IFF_RUNNING
+		rv |= linux.IFF_RUNNING | linux.IFF_LOWER_UP
 	}
 	if f.Promiscuous {
 		rv |= linux.IFF_PROMISC
 	}
 	if f.Loopback {
 		rv |= linux.IFF_LOOPBACK
+	}
+	if f.Multicast {
+		rv |= linux.IFF_MULTICAST
 	}
 	return rv
 }

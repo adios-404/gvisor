@@ -66,6 +66,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/timing"
+	"gvisor.dev/gvisor/runsc/boot/filter"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
@@ -435,7 +436,13 @@ func parseMountOption(opt string, allowedKeys ...string) (bool, error) {
 	if len(kv) > 2 {
 		return false, fmt.Errorf("invalid option %q", opt)
 	}
-	return slices.Contains(allowedKeys, kv[0]), nil
+	if !slices.Contains(allowedKeys, kv[0]) {
+		return false, nil
+	}
+	if strings.ContainsRune(opt, ',') {
+		return false, fmt.Errorf("invalid option %q: contains ','", opt)
+	}
+	return true, nil
 }
 
 type fdDispenser struct {
@@ -502,6 +509,13 @@ type containerMounter struct {
 	// rootfsUpperTarFD is the file descriptor to the tar file containing the rootfs
 	// upper layer changes.
 	rootfsUpperTarFD *fd.FD
+
+	// conf is the container's configuration.
+	conf *config.Config
+
+	// hostFS is the host filesystem access that the sandbox seccomp filters
+	// allow.
+	hostFS filter.HostFSAccess
 }
 
 // +checklocks:l.mu
@@ -518,6 +532,8 @@ func (l *Loader) newContainerMounter(info *containerInfo) *containerMounter {
 		containerID:       info.cid,
 		containerName:     info.containerName,
 		rootfsUpperTarFD:  info.rootfsUpperTarFD,
+		conf:              info.conf,
+		hostFS:            l.hostFS,
 	}
 }
 
@@ -548,8 +564,13 @@ func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Cre
 	if err != nil {
 		return nil, fmt.Errorf("creating mount namespace: %w", err)
 	}
-	rootProcArgs.StartupTimeline.Reached("rootfs mounted")
 	rootProcArgs.MountNamespace = mns
+	cu := cleanup.Make(func() {
+		rootProcArgs.MountNamespace = nil
+		mns.DecRef(rootCtx)
+	})
+	defer cu.Clean()
+	rootProcArgs.StartupTimeline.Reached("rootfs mounted")
 
 	root := mns.Root(rootCtx)
 	defer root.DecRef(rootCtx)
@@ -571,13 +592,13 @@ func (c *containerMounter) mountAll(rootCtx context.Context, rootCreds *auth.Cre
 		return nil, fmt.Errorf("mounting submounts: %w", err)
 	}
 	rootProcArgs.StartupTimeline.Reached("submounts mounted")
+	cu.Release()
 
 	return mns, nil
 }
 
 // createMountNamespace creates the container's root mount and namespace.
 func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs.Spec, conf *config.Config, creds *auth.Credentials) (*vfs.MountNamespace, error) {
-	ioFD := c.goferFDs.remove()
 	rootfsConf := c.goferMountConfs[0]
 
 	rootfsHint, err := sentryapi.NewRootfsHint(spec)
@@ -585,6 +606,18 @@ func (c *containerMounter) createMountNamespace(ctx context.Context, spec *specs
 		return nil, fmt.Errorf("parsing rootfs hint: %w", err)
 	}
 	suppressDirectFS := rootfsHint != nil && rootfsHint.SuppressDirectFS
+
+	if rootfsConf.ShouldUseLisafs() && conf.DirectFS && !suppressDirectFS && !c.l.root.conf.DisableSeccomp {
+		need := filter.HostFSReadWrite
+		if rootfsConf.ShouldUseOverlayfs() {
+			need = filter.HostFSReadOnly
+		}
+		if c.hostFS < need {
+			return nil, fmt.Errorf("root mount needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", need, c.hostFS)
+		}
+	}
+
+	ioFD := c.goferFDs.remove()
 
 	var (
 		fsName string
@@ -743,6 +776,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		// If a mount is being overlaid, it should not be limited by the default
 		// tmpfs size limit.
 		DisableDefaultSizeLimit: true,
+		TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
 	}
 	if filestoreFD != nil {
 		// Create memory file for disk-backed overlays.
@@ -805,8 +839,34 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}
 	}
 
+	// Propagate the lower layer's root's owner, group, and mode to the upper
+	// layer's root for consistency with VFS1.
+	upperRootSetStat := vfs.SetStatOptions{
+		Stat: linux.Statx{
+			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
+			UID:  stat.UID,
+			GID:  stat.GID,
+			Mode: stat.Mode,
+		},
+	}
+
 	// We need to hide the filestore from the containerized application.
 	if mountConf.IsSelfBacked() {
+		// The whiteout is internal and must not change the mtime of the upper
+		// layer's root, which may come from a filesystem checkpoint. Creating
+		// the whiteout does not change atime, and checkpoints do not keep ctime.
+		upperRootPop := &vfs.PathOperation{
+			Root:  upperRootVD,
+			Start: upperRootVD,
+		}
+		upperRootStat, err := c.l.k.VFS().StatAt(ctx, creds, upperRootPop, &vfs.StatOptions{
+			Mask: linux.STATX_MTIME,
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to stat upper layer's root: %w", err)
+		}
+		upperRootSetStat.Stat.Mask |= linux.STATX_MTIME
+		upperRootSetStat.Stat.Mtime = upperRootStat.Mtime
 		if err := overlay.CreateWhiteout(ctx, c.l.k.VFS(), creds, &vfs.PathOperation{
 			Root:  upperRootVD,
 			Start: upperRootVD,
@@ -816,19 +876,10 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 		}
 	}
 
-	// Propagate the lower layer's root's owner, group, and mode to the upper
-	// layer's root for consistency with VFS1.
 	err = c.l.k.VFS().SetStatAt(ctx, creds, &vfs.PathOperation{
 		Root:  upperRootVD,
 		Start: upperRootVD,
-	}, &vfs.SetStatOptions{
-		Stat: linux.Statx{
-			Mask: (linux.STATX_UID | linux.STATX_GID | linux.STATX_MODE) & stat.Mask,
-			UID:  stat.UID,
-			GID:  stat.GID,
-			Mode: stat.Mode,
-		},
-	})
+	}, &upperRootSetStat)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -842,7 +893,7 @@ func (c *containerMounter) configureOverlay(ctx context.Context, conf *config.Co
 }
 
 func (c *containerMounter) mountSubmounts(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, timeline *timing.Timeline) error {
-	mounts, err := c.prepareMounts()
+	mounts, err := c.prepareMounts(conf)
 	if err != nil {
 		return err
 	}
@@ -924,9 +975,12 @@ type mountInfo struct {
 	filestoreFD    *fd.FD
 }
 
-func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
+func (c *containerMounter) prepareMounts(conf *config.Config) ([]mountInfo, error) {
 	// If device gofer exists, connect to it.
 	if c.devGoferFD != nil {
+		if conf != nil && conf.DirectFS && !c.l.root.conf.DisableSeccomp && c.hostFS < filter.HostFSReadWrite {
+			return nil, fmt.Errorf("device gofer needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", filter.HostFSReadWrite, c.hostFS)
+		}
 		if err := c.l.k.AddDevGofer(c.containerName, c.devGoferFD.Release()); err != nil {
 			return nil, err
 		}
@@ -941,9 +995,18 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 			mount: &c.mounts[i],
 			hint:  c.l.mountHints.FindMount(c.mounts[i].Source),
 		}
-		specutils.MaybeConvertToBindMount(info.mount)
+		isErofs := specutils.IsErofsMount(*info.mount)
+		if !isErofs {
+			specutils.MaybeConvertToBindMount(info.mount)
+		}
 		if specutils.HasMountConfig(*info.mount) {
+			if goferMntIdx >= len(c.goferMountConfs) {
+				return nil, fmt.Errorf("missing gofer mount config for mount %q (dest: %q)", info.mount.Source, info.mount.Destination)
+			}
 			info.goferMountConf = c.goferMountConfs[goferMntIdx]
+			if !info.goferMountConf.ShouldUseTmpfs() && info.goferMountConf.ShouldUseErofs() != isErofs {
+				return nil, fmt.Errorf("mount %q (dest: %q, type: %q) does not match gofer mount config %v", info.mount.Source, info.mount.Destination, info.mount.Type, info.goferMountConf)
+			}
 			if info.goferMountConf.ShouldUseLisafs() || info.goferMountConf.ShouldUseErofs() {
 				info.goferFD = c.goferFDs.removeAsFD()
 			}
@@ -969,6 +1032,21 @@ func (c *containerMounter) prepareMounts() ([]mountInfo, error) {
 	return mounts, nil
 }
 
+func (c *containerMounter) checkDirectFSMountAllowed(conf *config.Config, submount *mountInfo, overlaid bool) error {
+	directFS := conf.DirectFS && (submount.hint == nil || !submount.hint.SuppressDirectFS)
+	if !directFS || c.l.root.conf.DisableSeccomp || submount.mount.Type != sentryapi.Bind {
+		return nil
+	}
+	need := filter.HostFSReadWrite
+	if overlaid {
+		need = filter.HostFSReadOnly
+	}
+	if c.hostFS < need {
+		return fmt.Errorf("mount %q (dest: %q) needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", submount.mount.Source, submount.mount.Destination, need, c.hostFS)
+	}
+	return nil
+}
+
 // getPathMode returns file mode for the specified path.
 func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credentials, path *vfs.PathOperation) (linux.FileMode, error) {
 	stat, err := c.l.k.VFS().StatAt(ctx, creds, path, &vfs.StatOptions{
@@ -984,6 +1062,9 @@ func (c *containerMounter) getPathMode(ctx context.Context, creds *auth.Credenti
 }
 
 func (c *containerMounter) mountSubmount(ctx context.Context, spec *specs.Spec, conf *config.Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountInfo) (*vfs.Mount, error) {
+	if err := c.checkDirectFSMountAllowed(conf, submount, submount.goferMountConf.ShouldUseOverlayfs()); err != nil {
+		return nil, err
+	}
 	fsName, opts, err := getMountNameAndOptions(spec, conf, submount, c.l.productName, c.containerName, c.containerID, c.l.fsRestore, c.l.rdmaSysfs)
 	if err != nil {
 		return nil, fmt.Errorf("mountOptions failed: %w", err)
@@ -1058,9 +1139,12 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 	// Find filesystem name and FS specific data field.
 	switch m.mount.Type {
 	case devpts.Name:
-		// /dev/ptmx is a symlink to pts/ptmx, so make ptmx usable by everyone, as
-		// container runtimes do. Linux and devpts default ptmxmode to 0000.
-		data = []string{"ptmxmode=0666"}
+		// Each container gets its own devpts instance, as with container
+		// runtimes, so that ptys and consoles of one container are not
+		// visible in other containers. /dev/ptmx is a symlink to pts/ptmx,
+		// so make ptmx usable by everyone, as container runtimes do. Linux
+		// and devpts default ptmxmode to 0000.
+		data = []string{"newinstance", "ptmxmode=0666"}
 
 	case dev.Name, devtmpfs.Name, cgroup2fs.Name:
 		// Nothing to do.
@@ -1098,6 +1182,7 @@ func getMountNameAndOptions(spec *specs.Spec, conf *config.Config, m *mountInfo,
 				// If a mount is being overlaid with tmpfs, it should not be limited by
 				// the default tmpfs size limit.
 				DisableDefaultSizeLimit: true,
+				TarNanosecondTimestamps: conf.TarTimestampResolution == config.TarTimestampNanoseconds,
 			}
 			sourceTar, err := fsr.tmpfsSourceTar(resourceID, containerID)
 			if err != nil {
@@ -1177,7 +1262,7 @@ func ParseMountOptions(opts []string) *vfs.MountOptions {
 	// Note: update mountHint.CheckCompatible when more options are added.
 	for _, o := range opts {
 		switch o {
-		case "ro":
+		case "ro", "rro":
 			mountOpts.ReadOnly = true
 		case "noatime":
 			mountOpts.Flags.NoATime = true
@@ -1220,8 +1305,7 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	}
 	loaded := pagesMetadataReader != nil
 	mfOpts := pgalloc.MemoryFileOpts{
-		// Private memory files are usually backed by files on disk. Ideally we
-		// would confirm with fstatfs(2) but that is prohibited by seccomp.
+		// Private memory files are usually backed by files on disk.
 		DiskBackedFile: true,
 		// Disk backed files need to be decommited on destroy to release disk space.
 		DecommitOnDestroy: true,
@@ -1274,9 +1358,10 @@ func (c *containerMounter) mountTmp(ctx context.Context, spec *specs.Spec, conf 
 	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
 	pop := vfs.PathOperation{
-		Root:  root,
-		Start: root,
-		Path:  fspath.Parse("/tmp"),
+		Root:               root,
+		Start:              root,
+		Path:               fspath.Parse("/tmp"),
+		FollowFinalSymlink: true,
 	}
 	fd, err := c.l.k.VFS().OpenAt(ctx, creds, &pop, &vfs.OpenOptions{Flags: linux.O_RDONLY | linux.O_DIRECTORY})
 	switch {
@@ -1547,6 +1632,7 @@ func (l *Loader) mountCgroupMounts(conf *config.Config, creds *auth.Credentials)
 				InternalMount: true,
 				InternalData:  internalData,
 			},
+			Internal: true,
 		}
 		fs, root, err := l.k.VFS().NewFilesystem(ctx, creds, "cgroup", cgroupfs.Name, mopts)
 		if err != nil {
@@ -1641,6 +1727,10 @@ func (c *containerMounter) mountCgroupSubmounts(ctx context.Context, spec *specs
 // mountSharedMaster mounts the master of a volume that is shared among
 // containers in a pod.
 func (c *containerMounter) mountSharedMaster(ctx context.Context, spec *specs.Spec, conf *config.Config, mntInfo *mountInfo, creds *auth.Credentials) (*vfs.Mount, error) {
+	// mountSharedMaster never mounts an overlay on top of the master.
+	if err := c.checkDirectFSMountAllowed(conf, mntInfo, false /* overlaid */); err != nil {
+		return nil, err
+	}
 	// Mount the master using the options from the hint (mount annotations).
 	origOpts := mntInfo.mount.Options
 	mntInfo.mount.Options = mntInfo.hint.Mount.Options
@@ -1783,7 +1873,7 @@ func (c *containerMounter) configureRestore(restoreMnts *restoreMounts) error {
 		}
 	}
 	// prepareMounts() consumes the remaining FDs for submounts.
-	mounts, err := c.prepareMounts()
+	mounts, err := c.prepareMounts(c.conf)
 	if err != nil {
 		return err
 	}
@@ -1849,6 +1939,9 @@ func createDeviceFiles(ctx context.Context, creds *auth.Credentials, info *conta
 		}
 	}
 	if specutils.GPUFunctionalityRequestedViaHook(info.spec, info.conf) {
+		if info.nvproxyDevInfo == nil {
+			return fmt.Errorf("container requests GPU functionality via the NVIDIA hook, but nvproxy is not enabled in the sandbox")
+		}
 		// When using nvidia-container-runtime-hook, devices are not injected into
 		// spec.Linux.Devices. So manually create appropriate device files.
 		nvidiaDevs := []specs.LinuxDevice{
@@ -1923,19 +2016,18 @@ func createDeviceFile(ctx context.Context, creds *auth.Credentials, info *contai
 			}
 			log.Infof("Switching %v device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
-	} else if devSpec.Path == "/dev/nvidia-uvm" || devSpec.Path == "/dev/nvidia-uvm-tools" {
-		if info.nvproxyDevInfo.UVMDevMajor != 0 && major != info.nvproxyDevInfo.UVMDevMajor {
-			major = info.nvproxyDevInfo.UVMDevMajor
-			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
+	} else if nvInfo := info.nvproxyDevInfo; nvInfo != nil {
+		var nvMajor uint32
+		switch {
+		case devSpec.Path == "/dev/nvidia-uvm" || devSpec.Path == "/dev/nvidia-uvm-tools":
+			nvMajor = nvInfo.UVMDevMajor
+		case strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps/"):
+			nvMajor = nvInfo.CapsDevMajor
+		case strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/"):
+			nvMajor = nvInfo.CapsIMEXChannelsDevMajor
 		}
-	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps/") {
-		if info.nvproxyDevInfo.CapsDevMajor != 0 && major != info.nvproxyDevInfo.CapsDevMajor {
-			major = info.nvproxyDevInfo.CapsDevMajor
-			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
-		}
-	} else if strings.HasPrefix(devSpec.Path, "/dev/nvidia-caps-imex-channels/") {
-		if info.nvproxyDevInfo.CapsIMEXChannelsDevMajor != 0 && major != info.nvproxyDevInfo.CapsIMEXChannelsDevMajor {
-			major = info.nvproxyDevInfo.CapsIMEXChannelsDevMajor
+		if nvMajor != 0 && major != nvMajor {
+			major = nvMajor
 			log.Infof("Switching %s device major number from %d to %d", devSpec.Path, devSpec.Major, major)
 		}
 	}

@@ -57,6 +57,10 @@ type ResolvingPath struct {
 	nextStart        *Dentry // ref held if not nil
 	absSymlinkTarget fspath.Path
 
+	// deferred holds references that FilesystemImpl methods hand to rp while
+	// they may hold filesystem locks. Release drops them.
+	deferred DeferredDecRefs `state:"nosave"`
+
 	// ResolvingPath tracks relative paths, which is updated whenever a relative
 	// symlink is encountered.
 	parts [1 + linux.MaxSymlinkTraversals]fspath.Iterator
@@ -87,7 +91,7 @@ type ResolvingPath struct {
 const (
 	rpflagsHaveMountRef       = 1 << iota // do we hold a reference on mount?
 	rpflagsHaveStartRef                   // do we hold a reference on start?
-	rpflagsFollowFinalSymlink             // same as PathOperation.FollowFinalSymlink
+	rpflagsFollowFinalSymlink             // FollowFinalSymlink or a trailing '/'
 	rpflagsBeneath                        // same as RESOLVE_BENEATH
 	rpflagsInRoot                         // same as RESOLVE_IN_ROOT
 	rpflagsNoMagicLinks                   // same as RESOLVE_NO_MAGICLINKS
@@ -165,7 +169,7 @@ func (vfs *VirtualFilesystem) getResolvingPath(creds *auth.Credentials, pop *Pat
 	rp.start = pop.Start.dentry
 	rp.pit = pop.Path.Begin
 	rp.flags = 0
-	if pop.FollowFinalSymlink {
+	if pop.FollowFinalSymlink || pop.Path.Dir {
 		rp.flags |= rpflagsFollowFinalSymlink
 	}
 	if resolveBeneath {
@@ -215,11 +219,13 @@ func (rp *ResolvingPath) Copy() *ResolvingPath {
 	// Reset error state.
 	copy.nextStart = nil
 	copy.nextMount = nil
+	copy.deferred = DeferredDecRefs{}
 	return copy
 }
 
 // Release decrements references if needed and returns the object to the pool.
 func (rp *ResolvingPath) Release(ctx context.Context) {
+	rp.deferred.Release(ctx)
 	rp.root = VirtualDentry{}
 	rp.decRefStartAndMount(ctx)
 	rp.mount = nil
@@ -263,6 +269,13 @@ func (rp *ResolvingPath) checkDotDotRace() bool {
 		return false
 	}
 	return true
+}
+
+// DeferredDecRefs returns the DeferredDecRefs that rp owns. Release drops the
+// references in it after the FilesystemImpl method that uses rp returns, when
+// the caller holds no filesystem locks.
+func (rp *ResolvingPath) DeferredDecRefs() *DeferredDecRefs {
+	return &rp.deferred
 }
 
 // VirtualFilesystem returns the containing VirtualFilesystem.
@@ -382,7 +395,7 @@ func (rp *ResolvingPath) checkRoot(ctx context.Context, d *Dentry) (bool, error)
 		return true, nil
 	} else if d == rp.mount.root {
 		// At mount root ...
-		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root)
+		vd := rp.vfs.getMountpointAt(ctx, rp.mount, rp.root, nil /* deferred */)
 		if vd.Ok() {
 			// ... of non-root mount.
 			if rp.flags&rpflagsNoXDev != 0 {
@@ -470,9 +483,8 @@ func (rp *ResolvingPath) CheckMount(ctx context.Context, d *Dentry) error {
 //
 // Preconditions: !rp.Done().
 func (rp *ResolvingPath) ShouldFollowSymlink() bool {
-	// Non-final symlinks are always followed. Paths terminated with '/' are also
-	// always followed.
-	return rp.flags&rpflagsFollowFinalSymlink != 0 || !rp.Final() || rp.MustBeDir()
+	// Non-final symlinks are always followed.
+	return rp.flags&rpflagsFollowFinalSymlink != 0 || !rp.Final()
 }
 
 // HandleSymlink is called when the current path component is a symbolic link

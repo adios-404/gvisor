@@ -507,6 +507,9 @@ func PivotRoot(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintp
 	if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, t.MountNamespace().Owner) {
 		return 0, nil, linuxerr.EPERM
 	}
+	if err := t.LandlockDomain().CheckMountChange(); err != nil {
+		return 0, nil, err
+	}
 
 	newRootPath, err := copyInPath(t, addr1)
 	if err != nil {
@@ -922,6 +925,9 @@ func posixTestLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDes
 	}
 	uid := lock.UniqueID(t.FDTable())
 	if ofd {
+		if flock.PID != 0 {
+			return linuxerr.EINVAL
+		}
 		uid = lock.UniqueID(file)
 	}
 
@@ -929,7 +935,7 @@ func posixTestLock(t *kernel.Task, args arch.SyscallArguments, file *vfs.FileDes
 	if err != nil {
 		return err
 	}
-	if !ofd {
+	if newFlock.PID > 0 {
 		newFlock.PID = translatePID(t.PIDNamespace().Root(), t.PIDNamespace(), newFlock.PID)
 	}
 	if _, err = newFlock.CopyOut(t, flockAddr); err != nil {

@@ -25,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/rand"
@@ -53,7 +52,7 @@ func (fs *filesystem) PrepareSave(ctx context.Context, opts vfs.PrepareSaveOptio
 	// Purge cached dentries, which may not be reopenable after restore due to
 	// permission changes.
 	fs.renameMu.Lock()
-	fs.evictAllCachedDentriesLocked(ctx)
+	fs.evictAllCachedDentriesLocked(ctx, false /* keepRenameMu */)
 	fs.renameMu.Unlock()
 	fs.savedDentryRW = make(map[*dentry]savedDentryRW)
 
@@ -268,6 +267,11 @@ func (d *dentry) loadParent(_ goContext.Context, parent *dentry) {
 // CompleteRestore implements
 // vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
 func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRestoreOptions) error {
+	fs.renameMu.Lock()
+	defer fs.renameMu.Unlock()
+	if fs.opts.directfs.enabled && procSelfFD < 0 {
+		return fmt.Errorf("directfs requires SetProcSelfFD()")
+	}
 	fdmap := vfs.RestoreFilesystemFDMapFromContext(ctx)
 	if fdmap == nil {
 		return fmt.Errorf("no server FD map available")
@@ -287,7 +291,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	}
 
 	// Restore remaining dentries.
-	if err := fs.root.restoreDescendantsRecursive(ctx, &opts); err != nil {
+	if err := fs.root.restoreDescendantsRecursive(ctx, &opts); err != nil { // +checklocksforce: fs.renameMu is locked; fs.root belongs to fs.
 		return err
 	}
 
@@ -295,7 +299,7 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	filesToDelete := make(map[*dentry]string)
 	dirsToDelete := make(map[*dentry]string)
 	for d := range fs.savedDeletedOpenDentries {
-		if err := d.restoreDeleted(ctx, &opts, filesToDelete, dirsToDelete); err != nil {
+		if err := d.restoreDeleted(ctx, &opts, filesToDelete, dirsToDelete); err != nil { // +checklocksforce: fs.renameMu is locked; d belongs to fs.
 			return err
 		}
 	}
@@ -361,7 +365,27 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	return nil
 }
 
+// validateRestoredFileType returns an error if the remote file with the given
+// mode and device number cannot be the file that i represented at checkpoint
+// time. The remote filesystem may have changed between checkpoint and restore,
+// so restore must not back i with a file of an unsupported or different type,
+// or with a different device.
+func (i *inode) validateRestoredFileType(mode, rdevMajor, rdevMinor uint32, d *dentry) error {
+	if err := checkSupportedFileType(mode); err != nil {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file type validation failed: unsupported file type %#o", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, mode&linux.S_IFMT)}
+	}
+	if got, want := mode&linux.S_IFMT, i.fileType(); got != want {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file type validation failed: file type changed from %#o to %#o", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, want, got)}
+	}
+	if i.fileType() == linux.S_IFCHR && (rdevMajor != i.rdevMajor || rdevMinor != i.rdevMinor) {
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: device number validation failed: device number changed from %d:%d to %d:%d", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID, i.rdevMajor, i.rdevMinor, rdevMajor, rdevMinor)}
+	}
+	return nil
+}
+
 // Preconditions: d is not synthetic.
+//
+// +checklocksread:d.inode.fs.renameMu
 func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.CompleteRestoreOptions) error {
 	d.childrenMu.Lock()
 	defer d.childrenMu.Unlock()
@@ -372,10 +396,10 @@ func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.Comp
 		if child.inode.isSynthetic() {
 			continue
 		}
-		if err := child.restoreFile(ctx, opts); err != nil {
+		if err := child.restoreFile(ctx, opts); err != nil { // +checklocksforce: child shares fs.
 			return err
 		}
-		if err := child.restoreDescendantsRecursive(ctx, opts); err != nil {
+		if err := child.restoreDescendantsRecursive(ctx, opts); err != nil { // +checklocksforce: child shares fs.
 			return err
 		}
 	}
@@ -387,11 +411,13 @@ func (d *dentry) restoreDescendantsRecursive(ctx context.Context, opts *vfs.Comp
 // Preconditions:
 //   - d.isRegularFile() || d.isDir()
 //   - d.savedDeletedData != nil iff d.isRegularFile()
+//
+// +checklocks:d.inode.fs.renameMu
 func (d *dentry) restoreDeleted(ctx context.Context, opts *vfs.CompleteRestoreOptions, filesToDelete, dirsToDelete map[*dentry]string) error {
 	parent := d.parent.Load()
 	if _, ok := d.inode.fs.savedDeletedOpenDentries[parent]; ok {
 		// Recursively restore the parent first if the parent is also deleted.
-		if err := parent.restoreDeleted(ctx, opts, filesToDelete, dirsToDelete); err != nil {
+		if err := parent.restoreDeleted(ctx, opts, filesToDelete, dirsToDelete); err != nil { // +checklocksforce: parent shares fs.
 			return err
 		}
 	}
@@ -411,6 +437,7 @@ func randomNameForDeleted(name string) string {
 	return fmt.Sprintf("%s.tmp-gvisor-restore-%s", name, hex.EncodeToString(randBuf[:]))
 }
 
+// +checklocks:d.inode.fs.renameMu
 func (d *dentry) restoreDeletedDirectory(ctx context.Context, opts *vfs.CompleteRestoreOptions, dirsToDelete map[*dentry]string) error {
 	// Recreate the directory on the host filesystem. This will be deleted later.
 	parent := d.parent.Load()
@@ -418,10 +445,8 @@ func (d *dentry) restoreDeletedDirectory(ctx context.Context, opts *vfs.Complete
 	if linuxerr.Equals(linuxerr.EEXIST, err) {
 		// Change d.name for the remainder of this function.
 		origName := d.name
-		d.name = randomNameForDeleted(d.name)
-		defer func() {
-			d.name = origName
-		}()
+		genericSetParentAndName(d.inode.fs, d, parent, randomNameForDeleted(origName))
+		defer genericSetParentAndName(d.inode.fs, d, parent, origName)
 		log.Warningf("Deleted directory %q was replaced with a new directory at the same path, using new name %q", genericDebugPathname(d.inode.fs, d), d.name)
 		_, err = parent.mkdir(ctx, d.name, linux.FileMode(d.inode.mode.Load()), auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load()), false /* createDentry */)
 	}
@@ -442,6 +467,7 @@ func (d *dentry) restoreDeletedDirectory(ctx context.Context, opts *vfs.Complete
 	return nil
 }
 
+// +checklocks:d.inode.fs.renameMu
 func (d *dentry) restoreDeletedRegularFile(ctx context.Context, opts *vfs.CompleteRestoreOptions, filesToDelete map[*dentry]string) error {
 	// Recreate the file on the host filesystem (this is temporary).
 	parent := d.parent.Load()
@@ -449,10 +475,8 @@ func (d *dentry) restoreDeletedRegularFile(ctx context.Context, opts *vfs.Comple
 	if linuxerr.Equals(linuxerr.EEXIST, err) {
 		// Change d.name for the remainder of this function.
 		origName := d.name
-		d.name = randomNameForDeleted(d.name)
-		defer func() {
-			d.name = origName
-		}()
+		genericSetParentAndName(d.inode.fs, d, parent, randomNameForDeleted(origName))
+		defer genericSetParentAndName(d.inode.fs, d, parent, origName)
 		log.Warningf("Deleted file %q was replaced with a new file at the same path, using new name %q", genericDebugPathname(d.inode.fs, d), d.name)
 		_, h, err = parent.openCreate(ctx, d.name, linux.O_WRONLY, linux.FileMode(d.inode.mode.Load()), auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load()), false /* createDentry */)
 	}
@@ -461,8 +485,9 @@ func (d *dentry) restoreDeletedRegularFile(ctx context.Context, opts *vfs.Comple
 	}
 	defer h.close(ctx)
 	// In case of errors, clean up the recreated file.
+	name := d.name
 	unlinkCU := cleanup.Make(func() {
-		if err := parent.inode.unlink(ctx, d.name, 0 /* flags */); err != nil {
+		if err := parent.inode.unlink(ctx, name, 0 /* flags */); err != nil {
 			log.Warningf("failed to clean up recreated deleted file %q: %v", genericDebugPathname(d.inode.fs, d), err)
 		}
 	})
@@ -485,7 +510,7 @@ func (d *dentry) restoreDeletedRegularFile(ctx context.Context, opts *vfs.Comple
 	}
 	// We will delete the file later.
 	unlinkCU.Release()
-	filesToDelete[d] = d.name
+	filesToDelete[d] = name
 	delete(d.inode.fs.savedDeletedOpenDentries, d)
 	return nil
 }
@@ -499,12 +524,11 @@ func (fd *specialFileFD) completeRestore(ctx context.Context) error {
 	fd.handle = h
 	fd.mmapFile.SetFD(int(h.fd))
 
-	ftype := d.inode.fileType()
-	fd.haveQueue = (ftype == linux.S_IFIFO || ftype == linux.S_IFSOCK) && fd.handle.fd >= 0
-	if fd.haveQueue {
-		if err := fdnotifier.AddFD(fd.handle.fd, &fd.queue); err != nil {
-			return fmt.Errorf("failed to add FD to fdnotified for %q: %w", genericDebugPathname(d.inode.fs, d), err)
-		}
+	if h.fd < 0 && !fd.queue.IsEmpty() {
+		return fmt.Errorf("cannot restore waiters for %q: gofer did not donate a host file descriptor", genericDebugPathname(d.inode.fs, d))
+	}
+	if err := fd.initWaitQueue(d.inode.fileType()); err != nil {
+		return fmt.Errorf("restoring wait queue for %q: %w", genericDebugPathname(d.inode.fs, d), err)
 	}
 
 	return nil

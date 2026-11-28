@@ -53,6 +53,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/devices/rdmaproxy/genericproxy"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
 	cgroup2fs "gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
@@ -228,12 +229,16 @@ type Loader struct {
 	startupTimer *timing.Timer
 
 	// PreSeccompCallback is called right before installing seccomp filters.
-	PreSeccompCallback func()
+	// procSelfFD is the open /proc/self/fd descriptor, or -1 if none is open.
+	PreSeccompCallback func(procSelfFD int)
 
 	// PostStartCallback, if set, is called once Run has successfully started
 	// the sandbox, right before the result is reported to the controller (and
 	// thus before `runsc start` returns).
 	PostStartCallback func()
+
+	// procSelfFD is initialized from Args.ProcSelfFD, or -1 once closed.
+	procSelfFD int
 
 	// restoreDone is used to wait for restore to complete. Note that this may be
 	// much after the sandbox has started because under some configurations, the
@@ -334,6 +339,12 @@ type Loader struct {
 	//
 	// +checklocks:mu
 	failedToStart map[string]struct{}
+
+	// hostFS is the access to the host filesystem that the seccomp filters
+	// allow.
+	//
+	// +checklocks:mu
+	hostFS filter.HostFSAccess
 
 	// portForwardProxies is a list of active port forwarding connections.
 	//
@@ -507,6 +518,10 @@ type Args struct {
 	PassFDs []sentryapi.FDMapping
 	// ExecFD is the host file descriptor used for program execution.
 	ExecFD int
+	// ProcSelfFD is a directory FD to procfs' self/fd. Required with directfs,
+	// -1 otherwise. It must stay open for the lifetime of the sandbox unless
+	// the Loader closes it when no directfs access is needed.
+	ProcSelfFD int
 	// GoferFilestoreFDs are FDs to the regular files that will back the tmpfs or
 	// overlayfs mount for certain gofer mounts.
 	GoferFilestoreFDs []int
@@ -797,6 +812,13 @@ func New(args Args) (*Loader, error) {
 	if args.ExecFD >= 0 {
 		l.root.execFD = fd.New(args.ExecFD)
 	}
+	if args.Conf.DirectFS {
+		if args.ProcSelfFD < 0 {
+			return nil, fmt.Errorf("directfs requires ProcSelfFD")
+		}
+		gofer.SetProcSelfFD(args.ProcSelfFD)
+	}
+	l.procSelfFD = args.ProcSelfFD
 
 	for _, customFD := range args.PassFDs {
 		l.root.passFDs = append(l.root.passFDs, fdMapping{
@@ -819,7 +841,7 @@ func New(args Args) (*Loader, error) {
 		if l.pinRing.Exists() {
 			l.pinRing.Add(args.CPUDMALatencyFD)
 		} else {
-			log.Infof("No pin ring to hold /dev/cpu_dma_latency; not capping host CPU idle states")
+			log.Infof("PERF: No pin ring to hold /dev/cpu_dma_latency; not capping host CPU idle states")
 		}
 		unix.Close(args.CPUDMALatencyFD)
 	}
@@ -838,6 +860,7 @@ func New(args Args) (*Loader, error) {
 		NvidiaDriverVersion: args.NvidiaDriverVersion,
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
+		LandlockEnabled:     args.Conf.Landlock == config.LandlockEnabled,
 	}
 
 	// Create memory file.
@@ -859,7 +882,7 @@ func New(args Args) (*Loader, error) {
 
 	// Create timekeeper.
 	tk := kernel.NewTimekeeper()
-	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamPage.FileRange())
+	params := kernel.NewVDSOParamPage(l.k.MemoryFile(), vdso.ParamsFileRange())
 	tk.SetClocks(time.NewCalibratedClocks(shouldEnableClockMonotonicRaw(args.Spec, args.Conf)), params)
 	args.StartupTimer.Reached("timekeeper configured")
 
@@ -1011,7 +1034,7 @@ func New(args Args) (*Loader, error) {
 		return nil, fmt.Errorf("failed to create hostfs filesystem: %w", err)
 	}
 	defer hostFilesystem.DecRef(l.k.SupervisorContext())
-	l.k.SetHostMount(l.k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{}))
+	l.k.SetHostMount(l.k.VFS().NewDisconnectedMount(hostFilesystem, nil, &vfs.MountOptions{Internal: true}))
 	args.StartupTimer.Reached("host FS mount created")
 
 	if args.PodInitConfigFD >= 0 {
@@ -1072,6 +1095,14 @@ func (l *Loader) ConfigureNetwork(s inet.Stack) error {
 			l.hostinetPortRange = nil
 		}
 		return nil
+	}
+
+	if eps, ok := s.(*netstack.Stack); ok {
+		// A stack restored from a checkpoint has the setting it was saved
+		// with.
+		if err := setTCPDelayedACK(eps.Stack, l.root.conf.TCPDelayedACK); err != nil {
+			return err
+		}
 	}
 
 	if l.networkArgs == nil {
@@ -1272,13 +1303,13 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	if appHugePages {
 		switch hostTHP.ShmemEnabled {
 		case "":
-			log.Infof("Disabling application huge pages: host shmem_enabled is unknown")
+			log.Infof("PERF: Disabling application huge pages: host shmem_enabled is unknown")
 		case "never", "deny":
-			log.Infof("Disabling application huge pages: host shmem_enabled is %q", hostTHP.ShmemEnabled)
+			log.Infof("PERF: Disabling application huge pages: host shmem_enabled is %q", hostTHP.ShmemEnabled)
 		case "advise":
 			switch hostTHP.Defrag {
 			case "":
-				log.Infof("Disabling application huge pages: host shmem_enabled is %q, host defrag is unknown", hostTHP.ShmemEnabled)
+				log.Infof("PERF: Disabling application huge pages: host shmem_enabled is %q, host defrag is unknown", hostTHP.ShmemEnabled)
 			case "always", "defer", "never":
 				// Allocations on MADV_HUGEPAGE pages will invoke direct
 				// compaction ("always"), wake kcompactd ("defer"), or do
@@ -1293,9 +1324,9 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 				// compaction whereas allocations on host private anonymous
 				// memory mappings will not, so using MADV_HUGEPAGE may degrade
 				// performance.
-				log.Infof("Disabling application huge pages: host shmem_enabled is %q, host defrag is %q", hostTHP.ShmemEnabled, hostTHP.Defrag)
+				log.Infof("PERF: Disabling application huge pages: host shmem_enabled is %q, host defrag is %q", hostTHP.ShmemEnabled, hostTHP.Defrag)
 			default:
-				log.Warningf("Disabling application huge pages: host shmem_enabled is %q, host defrag is unknown value %q", hostTHP.ShmemEnabled, hostTHP.Defrag)
+				log.Warningf("PERF: Disabling application huge pages: host shmem_enabled is %q, host defrag is unknown value %q", hostTHP.ShmemEnabled, hostTHP.Defrag)
 			}
 		case "always", "within_size":
 			log.Infof("Enabling application huge pages: host shmem_enabled is %q", hostTHP.ShmemEnabled)
@@ -1308,7 +1339,7 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 			// The kernel will ignore MADV_NOHUGEPAGE, so don't bother.
 			mfopts.ExpectHugepages = true
 		default:
-			log.Warningf("Disabling application huge pages: host shmem_enabled is unknown value %q", hostTHP.ShmemEnabled)
+			log.Warningf("PERF: Disabling application huge pages: host shmem_enabled is unknown value %q", hostTHP.ShmemEnabled)
 		}
 	}
 
@@ -1320,11 +1351,158 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP) (*pgalloc.MemoryFile, 
 	return mf, nil
 }
 
-// installSeccompFilters installs sandbox seccomp filters with the host.
-func (l *Loader) installSeccompFilters() error {
+func (l *Loader) rootHostFSAccess() filter.HostFSAccess {
+	if !l.root.conf.DirectFS {
+		return filter.HostFSNone
+	}
+	return filter.HostFSReadWrite
+}
+
+func (l *Loader) restoreHostFSAccess() filter.HostFSAccess {
+	if !l.root.conf.DirectFS {
+		return filter.HostFSNone
+	}
+	// The restored mounts are those of the checkpointed sandbox, which can
+	// need more access than the mounts of the restore configuration.
+	return filter.HostFSReadWrite
+}
+
+// +checklocksexclude:l.mu
+func (l *Loader) checkDirectFSMount() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.root.conf.DisableSeccomp && l.hostFS < filter.HostFSReadWrite {
+		return fmt.Errorf("cannot mount a directfs filesystem: the seccomp filters of the sandbox only allow %v access to the host filesystem", l.hostFS)
+	}
+	return nil
+}
+
+func subcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, mountHints *sentryapi.PodMountHints, hasDevGofer bool) (filter.HostFSAccess, error) {
+	if !conf.DirectFS {
+		return filter.HostFSNone, nil
+	}
+	if len(mountConfs) == 0 {
+		return filter.HostFSNone, fmt.Errorf("missing root gofer mount config")
+	}
+	if hasDevGofer {
+		return filter.HostFSReadWrite, nil
+	}
+	need := filter.HostFSNone
+	if mountConfs[0].ShouldUseLisafs() {
+		var suppressDirectFS bool
+		if spec != nil {
+			rootfsHint, err := sentryapi.NewRootfsHint(spec)
+			if err != nil {
+				return filter.HostFSNone, fmt.Errorf("parsing rootfs hint: %w", err)
+			}
+			suppressDirectFS = rootfsHint != nil && rootfsHint.SuppressDirectFS
+		}
+		if !suppressDirectFS {
+			if mountConfs[0].ShouldUseOverlayfs() {
+				need = max(need, filter.HostFSReadOnly)
+			} else {
+				return filter.HostFSReadWrite, nil
+			}
+		}
+	}
+	mountIdx := 1 // First mount config is the root.
+	if spec != nil {
+		for _, m := range spec.Mounts {
+			isErofs := specutils.IsErofsMount(m)
+			if !isErofs {
+				specutils.MaybeConvertToBindMount(&m)
+			}
+			if !specutils.HasMountConfig(m) {
+				continue
+			}
+			if mountIdx >= len(mountConfs) {
+				return filter.HostFSNone, fmt.Errorf("missing gofer mount config for mount %q (dest: %q)", m.Source, m.Destination)
+			}
+			mc := mountConfs[mountIdx]
+			mountIdx++
+			if !mc.ShouldUseTmpfs() && mc.ShouldUseErofs() != isErofs {
+				return filter.HostFSNone, fmt.Errorf("mount %q (dest: %q, type: %q) does not match gofer mount config %v", m.Source, m.Destination, m.Type, mc)
+			}
+			if !mc.ShouldUseLisafs() {
+				continue
+			}
+			var hint *sentryapi.MountHint
+			if mountHints != nil {
+				hint = mountHints.FindMount(m.Source)
+			}
+			if hint != nil && hint.SuppressDirectFS {
+				continue
+			}
+			if mc.ShouldUseOverlayfs() && (hint == nil || !hint.ShouldShareMount()) {
+				need = max(need, filter.HostFSReadOnly)
+			} else {
+				return filter.HostFSReadWrite, nil
+			}
+		}
+	}
+	for ; mountIdx < len(mountConfs); mountIdx++ {
+		if mountConfs[mountIdx].ShouldUseLisafs() {
+			if mountConfs[mountIdx].ShouldUseOverlayfs() {
+				need = max(need, filter.HostFSReadOnly)
+			} else {
+				return filter.HostFSReadWrite, nil
+			}
+		}
+	}
+	return need, nil
+}
+
+// +checklocks:l.mu
+func (l *Loader) checkSubcontainerHostFSAccess(conf *config.Config, spec *specs.Spec, mountConfs []specutils.GoferMountConf, hasDevGofer bool, cid string) error {
+	if l.root.conf.DisableSeccomp {
+		return nil
+	}
+	need, err := subcontainerHostFSAccess(conf, spec, mountConfs, l.mountHints, hasDevGofer)
+	if err != nil {
+		return err
+	}
+	if need <= l.hostFS {
+		return nil
+	}
+	if !l.root.conf.DirectFS {
+		return fmt.Errorf("container %q needs %v access to the host filesystem, but directfs is disabled for the sandbox", cid, need)
+	}
+	if !l.noRootContainer.enabled && specutils.SpecContainerType(l.root.spec) == specutils.ContainerTypeUnspecified {
+		return fmt.Errorf("container %q needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v (annotate the root container as a sandbox or use --no-root-container for multi-container sandboxes)", cid, need, l.hostFS)
+	}
+	return fmt.Errorf("container %q needs %v access to the host filesystem, but the seccomp filters of the sandbox only allow %v", cid, need, l.hostFS)
+}
+
+func (l *Loader) prepareSeccompFilters(hostFS filter.HostFSAccess) error {
+	if hostFS < filter.HostFSNone || hostFS > filter.HostFSReadWrite {
+		return fmt.Errorf("invalid host filesystem access level: %v", hostFS)
+	}
+	if l.procSelfFD == 0 {
+		return fmt.Errorf("invalid procSelfFD: 0")
+	}
+	if !l.root.conf.DisableSeccomp {
+		if hostFS == filter.HostFSNone {
+			if l.procSelfFD > 0 {
+				gofer.SetProcSelfFD(-1)
+				if err := unix.Close(l.procSelfFD); err != nil {
+					return fmt.Errorf("closing procSelfFD: %w", err)
+				}
+				l.procSelfFD = -1
+			}
+		} else if l.procSelfFD < 0 {
+			return fmt.Errorf("host filesystem access level %v requires procSelfFD", hostFS)
+		}
+	}
 	if l.PreSeccompCallback != nil {
-		l.PreSeccompCallback()
+		l.PreSeccompCallback(l.procSelfFD)
 		l.startupTimer.Reached("pre-seccomp callback done")
+	}
+	return nil
+}
+
+func (l *Loader) installSeccompFilters(hostFS filter.HostFSAccess) error {
+	if err := l.prepareSeccompFilters(hostFS); err != nil {
+		return err
 	}
 	if l.root.conf.DisableSeccomp {
 		log.Warningf("*** SECCOMP WARNING: syscall filter is DISABLED. Running in less secure mode.")
@@ -1348,7 +1526,8 @@ func (l *Loader) installSeccompFilters() error {
 			Platform:              l.k.Platform.SeccompInfo(),
 			HostNetwork:           hostnet,
 			HostNetworkRawSockets: hostnet && l.root.conf.EnableRaw,
-			HostFilesystem:        l.root.conf.DirectFS,
+			HostFS:                hostFS,
+			ProcSelfFD:            uint32(l.procSelfFD),
 			ProfileEnable:         l.root.conf.ProfileEnable,
 			NVProxy:               nvproxyEnabled,
 			NVProxyCaps:           nvproxyCaps,
@@ -1441,14 +1620,16 @@ func (l *Loader) run() error {
 		}
 
 		if err := l.pinRing.Finalize(); err != nil {
-			log.Warningf("Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
+			log.Warningf("PERF: Cannot pin files to the pin ring: %v. This slows down gVisor sandbox teardown.", err)
 		}
 
 		// Finally done with all configuration. Setup filters before user code
 		// is loaded.
-		if err := l.installSeccompFilters(); err != nil {
+		hostFS := l.rootHostFSAccess()
+		if err := l.installSeccompFilters(hostFS); err != nil {
 			return err
 		}
+		l.hostFS = hostFS
 		l.startupTimer.Reached("seccomp filters installed")
 
 		if !l.noRootContainer.enabled {
@@ -1598,6 +1779,10 @@ func (l *Loader) startSubcontainer(spec *specs.Spec, conf *config.Config, cid st
 	ep := l.processes[execID{cid: cid}]
 	if ep == nil {
 		return fmt.Errorf("trying to start a deleted container %q", cid)
+	}
+
+	if err := l.checkSubcontainerHostFSAccess(conf, spec, goferMountConfs, devGoferFD != nil, cid); err != nil {
+		return err
 	}
 
 	// Create credentials. We reuse the root user namespace because the
@@ -1805,6 +1990,14 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	}
 	info.procArgs.StartupTimeline.Reached("exec user home resolved")
 
+	if ttyFile != nil {
+		if exposed, err := fdimport.ExposeConsole(ctx, info.procArgs.MountNamespace, info.procArgs.FDTable, ttyFile); err != nil {
+			log.Warningf("Console is not exposed in devpts: %v", err)
+		} else {
+			ttyFile = exposed
+		}
+	}
+
 	// Create and start the new process.
 	tg, _, err := l.k.CreateProcess(info.procArgs)
 	if err != nil {
@@ -1814,14 +2007,14 @@ func (l *Loader) createContainerProcess(info *containerInfo) (*kernel.ThreadGrou
 	info.procArgs.FDTable.DecRef(ctx)
 
 	// Install seccomp filters with the new task if there are any.
-	program, err := buildOCISeccompProgram(info.conf, info.spec)
+	filter, err := buildOCISeccompFilter(info.conf, info.spec)
 	if err != nil {
 		return nil, nil, err
 	}
-	if program != nil {
+	if filter != nil {
 		task := tg.Leader()
 		// NOTE: It seems Flags are ignored by runc so we ignore them too.
-		if err := task.AppendSyscallFilter(*program, true); err != nil {
+		if err := task.AppendSyscallFilter(*filter, true); err != nil {
 			return nil, nil, fmt.Errorf("appending seccomp filters: %w", err)
 		}
 		info.procArgs.StartupTimeline.Reached("OCI seccomp filters applied")
@@ -1989,11 +2182,11 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 		return 0, fmt.Errorf("creating limits: %w", err)
 	}
 
-	seccompProgram, err := buildOCISeccompProgram(l.root.conf, spec)
+	seccompFilter, err := buildOCISeccompFilter(l.root.conf, spec)
 	if err != nil {
 		return 0, err
 	}
-	args.SeccompProgram = seccompProgram
+	args.SeccompFilter = seccompFilter
 
 	// Start the process.
 	proc := control.Proc{Kernel: l.k}
@@ -2182,16 +2375,17 @@ func newRootNetworkNamespace(conf *config.Config, clock tcpip.Clock, userns *aut
 		if conf.EnableRaw && !specutils.HasCapabilities(capability.CAP_NET_RAW) {
 			return nil, fmt.Errorf("configuring network=host with raw sockets requires CAP_NET_RAW capability")
 		}
-		// No network namespacing support for hostinet yet, hence creator is nil.
-		return inet.NewRootNamespace(hostinet.NewStack(), nil, userns), nil
+		// The root namespace is backed by the host network stack. A child
+		// network namespace (unshare(CLONE_NEWNET)) cannot share it, and with a
+		// nil creator it gets no stack at all: no loopback device and
+		// EAFNOSUPPORT from socket(AF_INET). Give children the same
+		// loopback-only netstack that network=none uses instead: a working
+		// 127.0.0.1, and no device that reaches the host network.
+		creator := newSandboxNetstackCreator(conf, clock, uid)
+		return inet.NewRootNamespace(hostinet.NewStack(), creator, userns), nil
 
 	case config.NetworkNone, config.NetworkSandbox:
-		creator := &sandboxNetstackCreator{
-			clock:                    clock,
-			allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
-			allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
-			uid:                      uid,
-		}
+		creator := newSandboxNetstackCreator(conf, clock, uid)
 		s, err := creator.newEmptySandboxNetworkStack()
 		if err != nil {
 			return nil, err
@@ -2259,21 +2453,75 @@ func (c *sandboxNetstackCreator) newEmptySandboxNetworkStack() (*netstack.Stack,
 		}
 	}
 
+	if err := setTCPDelayedACK(s.Stack, c.tcpDelayedACK); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 
-// sandboxNetstackCreator implements kernel.NetworkStackCreator.
+// setTCPDelayedACK sets tcpip.TCPDelayedACKEnabled on s.
+func setTCPDelayedACK(s *stack.Stack, mode config.TCPDelayedACK) error {
+	opt := tcpip.TCPDelayedACKEnabled(mode == config.TCPDelayedACKEnabled)
+	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt); err != nil {
+		return fmt.Errorf("SetTransportProtocolOption(%d, &%T(%t)): %s", tcp.ProtocolNumber, opt, opt, err)
+	}
+	return nil
+}
+
+// sandboxNetstackCreator implements inet.NetworkStackCreator and
+// inet.RestoreNetworkStackCreator.
 //
 // +stateify savable
 type sandboxNetstackCreator struct {
 	clock                    tcpip.Clock
 	allowPacketEndpointWrite bool
 	allowLiveTCPMigration    bool
+	tcpDelayedACK            config.TCPDelayedACK
 	uid                      uniqueid.Provider
 }
 
-// CreateStack implements kernel.NetworkStackCreator.CreateStack.
+var _ inet.RestoreNetworkStackCreator = (*sandboxNetstackCreator)(nil)
+
+func newSandboxNetstackCreator(conf *config.Config, clock tcpip.Clock, uid uniqueid.Provider) *sandboxNetstackCreator {
+	return &sandboxNetstackCreator{
+		clock:                    clock,
+		allowPacketEndpointWrite: conf.AllowPacketEndpointWrite,
+		allowLiveTCPMigration:    conf.AllowLiveTCPMigration,
+		tcpDelayedACK:            conf.TCPDelayedACK,
+		uid:                      uid,
+	}
+}
+
+// CreateStack implements inet.NetworkStackCreator.CreateStack.
+//
+// Like Linux, it creates the loopback interface administratively DOWN and with
+// no addresses. The application brings it up with RTM_NEWLINK (IFF_UP), at
+// which point netstack assigns the default loopback addresses, just as the
+// Linux kernel does. The initial network namespace is configured separately in
+// Network.CreateLinksAndRoutes and keeps its addresses and UP state.
+//
+// TODO(gvisor.dev/issue/15559): Support SIOCSIFFLAGS. Until then, applications
+// that bring the loopback interface up with ioctl(2), such as nsjail, fail.
 func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
+	return c.createStack(false /* loopbackUp */)
+}
+
+// CreateStackForRestore implements
+// inet.RestoreNetworkStackCreator.CreateStackForRestore.
+//
+// TODO(gvisor.dev/issue/4595): Restore non-root network namespaces from their
+// saved state. Until then, the loopback interface of a restored namespace is
+// UP and has the default loopback addresses, which is the state that
+// applications usually leave it in.
+func (c *sandboxNetstackCreator) CreateStackForRestore() (inet.Stack, error) {
+	return c.createStack(true /* loopbackUp */)
+}
+
+// createStack creates a network stack with a loopback interface. If loopbackUp
+// is true, the loopback interface is UP and has the default loopback
+// addresses. Otherwise, it is DOWN and has no addresses.
+func (c *sandboxNetstackCreator) createStack(loopbackUp bool) (inet.Stack, error) {
 	s, err := c.newEmptySandboxNetworkStack()
 	if err != nil {
 		return nil, err
@@ -2286,13 +2534,18 @@ func (c *sandboxNetstackCreator) CreateStack() (inet.Stack, error) {
 		return nil, fmt.Errorf("loopback device should always have index %d, got %d", linux.LOOPBACK_IFINDEX, nicID)
 	}
 	link := sentryapi.DefaultLoopbackLink
-	linkEP := ethernet.New(loopback.New())
+	linkEP := ethernet.NewWithNetworkMTU(loopback.New())
 	opts := stack.NICOptions{
 		Name:               link.Name,
 		DeliverLinkPackets: true,
+		Disabled:           !loopbackUp,
+	}
+	var addrs []sentryapi.IPWithPrefix
+	if loopbackUp {
+		addrs = link.Addresses
 	}
 
-	if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
+	if err := n.createNICWithAddrs(nicID, linkEP, opts, addrs); err != nil {
 		return nil, err
 	}
 

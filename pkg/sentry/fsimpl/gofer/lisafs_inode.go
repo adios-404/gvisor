@@ -109,12 +109,13 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 		fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
 		return nil, linuxerr.EIO
 	}
-	if ino.Stat.Mode&linux.FileTypeMask == linux.ModeRegular && ino.Stat.Mask&linux.STATX_SIZE == 0 {
+	fileType := uint32(ino.Stat.Mode) & linux.FileTypeMask
+	if fileType == linux.ModeRegular && ino.Stat.Mask&linux.STATX_SIZE == 0 {
 		ctx.Warningf("can't create regular file gofer.dentry without file size")
 		fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
 		return nil, linuxerr.EIO
 	}
-	isDir := ino.Stat.Mode&linux.FileTypeMask == linux.ModeDirectory
+	isDir := fileType == linux.ModeDirectory
 	inoKey := inoKeyFromStatx(&ino.Stat)
 	devMinor, err := fs.devMinorFromKey(inoKey)
 	if err != nil {
@@ -135,7 +136,7 @@ func (fs *filesystem) newLisafsDentry(ctx context.Context, ino *lisafs.Inode) (*
 	// different paths (e.g., /mnt/ and /mnt/a/b/c if /mnt/a/b/c is a bind mount of /mnt/)
 	// can return the same device ID and inode number from a stat call.
 	var cacheHit bool
-	temp.d.inode = fs.getOrCreateInode(inoKey /* dontCache = */, isDir,
+	temp.d.inode = fs.getOrCreateInode(inoKey, fileType, isDir, /* dontCache */
 		func() {
 			cacheHit = true
 			fs.client.CloseFD(ctx, ino.ControlFD, false /* flush */)
@@ -633,6 +634,14 @@ func (i *lisafsInode) statfs(ctx context.Context) (linux.Statfs, error) {
 }
 
 func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opts *vfs.CompleteRestoreOptions, d *dentry) error {
+	if inode.Stat.Mask&linux.STATX_TYPE == 0 {
+		i.fs.client.CloseFD(ctx, inode.ControlFD, false /* flush */)
+		return vfs.ErrCorruption{Err: fmt.Errorf("gofer.dentry(%q in mount %q).restoreFile: file type validation failed: file type not available", genericDebugPathname(i.fs, d), i.fs.iopts.UniqueID)}
+	}
+	if err := i.validateRestoredFileType(uint32(inode.Stat.Mode), inode.Stat.RdevMajor, inode.Stat.RdevMinor, d); err != nil {
+		i.fs.client.CloseFD(ctx, inode.ControlFD, false /* flush */)
+		return err
+	}
 	i.controlFD = i.fs.client.NewFD(inode.ControlFD)
 	if err := i.restoreInoKey(inoKeyFromStatx(&inode.Stat)); err != nil {
 		return err
@@ -678,6 +687,8 @@ func (i *lisafsInode) restoreInode(ctx context.Context, inode *lisafs.Inode, opt
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
+//
+// +checklocksread:state.start.inode.fs.renameMu
 func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, state *revalidateState, ds **[]*dentry) error {
 	start := state.start.inode.impl.(*lisafsInode)
 
@@ -687,7 +698,7 @@ func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, st
 		state.names = append(state.names, "")
 	}
 	for _, d := range state.dentries {
-		state.names = append(state.names, d.name)
+		state.names = append(state.names, d.name) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 	}
 
 	// Lock metadata on all dentries *before* getting attributes for them.
@@ -742,7 +753,7 @@ func doRevalidationLisafs(ctx context.Context, vfsObj *vfs.VirtualFilesystem, st
 			}
 			// The file at this path has changed or no longer exists. Mark the
 			// dentry invalidated.
-			d.invalidate(ctx, vfsObj, ds)
+			d.invalidate(ctx, vfsObj, ds) // +checklocksforce: state.start.inode.fs.renameMu is locked; d shares fs.
 			return nil
 		}
 

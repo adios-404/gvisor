@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
@@ -68,6 +69,10 @@ type kvmVcpuEvents struct {
 
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
+	// Initialize is idempotent; HWCAP_PACA must be read before any vCPU is
+	// bound (see disableHostPAC).
+	cpuid.Initialize()
+	hostAddressAuth = cpuid.HostFeatureSet().HasPointerAuth()
 	err := updateSystemValues(int(fd))
 
 	maxIPA, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(fd), KVM_CHECK_EXTENSION, _KVM_CAP_ARM_VM_IPA_SIZE)
@@ -85,7 +90,7 @@ func updateGlobalOnce(fd int) error {
 	excludeVvarRegion = vvarMemslotUnusable(fd)
 	if excludeVvarRegion {
 		// Not a warning to make tests pass that match on not getting any warnings.
-		log.Infof("[vvar] region will not be mapped into the KVM guest! Performance will suffer!")
+		log.Infof("PERF: [vvar] region will not be mapped into the KVM guest! Performance will suffer!")
 	}
 	physicalInit()
 

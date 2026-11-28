@@ -105,6 +105,10 @@ type Config struct {
 	// DO NOT call it directly, use GetOverlay2() instead.
 	Overlay2 Overlay2 `flag:"overlay2"`
 
+	// TarTimestampResolution is the resolution of modification times in tar
+	// archives of overlay upper layers and filesystem checkpoints.
+	TarTimestampResolution TarTimestampResolution `flag:"tar-timestamp-resolution"`
+
 	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
 
@@ -158,6 +162,9 @@ type Config struct {
 	// GVisorGRO enables gVisor's generic receive offload.
 	GVisorGRO bool `flag:"gvisor-gro"`
 
+	// TCPDelayedACK controls whether netstack TCP delays ACKs.
+	TCPDelayedACK TCPDelayedACK `flag:"tcp-delayed-ack"`
+
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
 
@@ -179,6 +186,11 @@ type Config struct {
 
 	// PCAP is a file to which network packets should be logged in PCAP format.
 	PCAP string `flag:"pcap-log"`
+
+	// Netgofer controls whether and how netgofer is used for networking via UDS.
+	// Note: It is experimental and currently only proxies outbound TCP and UDP
+	// traffic. Active connections cannot be preserved across save/restore.
+	Netgofer NetgoferMode `flag:"netgofer"`
 
 	// NetworkProxyPath, if set, is the path of an external UDS that the
 	// sentry attaches its primary network interface to instead of creating
@@ -302,6 +314,10 @@ type Config struct {
 	// duration of the container execution. Requires ProfileEnabled.
 	ProfileHeap string `flag:"profile-heap"`
 
+	// ProfileHeapRate sets the Sentry's heap sampling interval in bytes.
+	// Zero keeps the Go runtime default. Requires ProfileEnable when nonzero.
+	ProfileHeapRate int `flag:"profile-heap-rate"`
+
 	// ProfileMutex collects a mutex profile to the passed file for the
 	// duration of the container execution. Requires ProfileEnabled.
 	ProfileMutex string `flag:"profile-mutex"`
@@ -378,6 +394,10 @@ type Config struct {
 	// IOUring enables support for the IO_URING API calls to perform
 	// asynchronous I/O operations.
 	IOUring bool `flag:"iouring"`
+
+	// Landlock controls whether the Landlock syscalls are available. See
+	// LandlockMode.
+	Landlock LandlockMode `flag:"landlock"`
 
 	// DirectFS sets up the sandbox to directly access/mutate the filesystem from
 	// the sentry. Sentry runs with escalated privileges. Gofer process still
@@ -527,7 +547,7 @@ type Config struct {
 // UseNetworkProxy reports whether the primary sandbox network interface should
 // be attached to a unix domain socket instead of AF_PACKET socket.
 func (c *Config) UseNetworkProxy() bool {
-	return c.NetworkProxyPath != ""
+	return c.Netgofer.Enabled() || c.NetworkProxyPath != ""
 }
 
 // platformDevicePaths is the parsed value of --platform_device_path.
@@ -578,8 +598,8 @@ func (c *Config) PlatformDeviceFor(platform string) string {
 
 // Validate checks that the Config is in a consistent state, e.g. that no
 // interdependent or mutually-exclusive flag values conflict. Note that
-// Config.Override does not validate, so callers must call Validate once they
-// are done overriding.
+// Config.Override and Config.ApplyBundles do not validate, so callers must call
+// Validate once they are done overriding.
 func (c *Config) Validate() error {
 	paths, err := parsePlatformDevicePaths(c.PlatformDevicePath)
 	if err != nil {
@@ -602,7 +622,10 @@ func (c *Config) Validate() error {
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
-	if c.UseNetworkProxy() {
+	if c.RDMAProxy && c.UseNetworkProxy() {
+		return fmt.Errorf("rdmaproxy flag is incompatible with netgofer and network-proxy-path flags")
+	}
+	if c.NetworkProxyPath != "" {
 		if !filepath.IsAbs(c.NetworkProxyPath) {
 			return fmt.Errorf("network-proxy-path must be an absolute path, got %q", c.NetworkProxyPath)
 		}
@@ -611,6 +634,17 @@ func (c *Config) Validate() error {
 		}
 		if c.XDP.Mode != XDPModeOff {
 			return fmt.Errorf("network-proxy-path flag is incompatible with XDP")
+		}
+	}
+	if c.Netgofer.Enabled() {
+		if c.NetworkProxyPath != "" {
+			return fmt.Errorf("netgofer and network-proxy-path flags cannot both be set")
+		}
+		if c.Network != NetworkSandbox {
+			return fmt.Errorf("netgofer flag is only supported with sandbox networking")
+		}
+		if c.XDP.Mode != XDPModeOff {
+			return fmt.Errorf("netgofer flag is incompatible with XDP")
 		}
 	}
 	if c.TBFBurst > maxQDiscTBFBurst {
@@ -632,6 +666,12 @@ func (c *Config) Validate() error {
 	}
 	if c.ProfileCPU != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-cpu flag requires enabling profiling with profile flag")
+	}
+	if c.ProfileHeapRate < 0 {
+		return fmt.Errorf("profile-heap-rate must be >= 0")
+	}
+	if c.ProfileHeapRate != 0 && !c.ProfileEnable {
+		return fmt.Errorf("profile-heap-rate flag requires enabling profiling with profile flag")
 	}
 	if c.ProfileHeap != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-heap flag requires enabling profiling with profile flag")
@@ -1288,6 +1328,100 @@ func (n InodeNumbers) String() string {
 	}
 }
 
+// TCPDelayedACK controls whether netstack TCP delays ACKs.
+//
+// TODO: Remove this flag once delayed ACKs have run in production without
+// issues.
+type TCPDelayedACK int
+
+const (
+	// TCPDelayedACKEnabled delays ACKs like Linux.
+	TCPDelayedACKEnabled TCPDelayedACK = iota
+
+	// TCPDelayedACKDisabled sends every ACK immediately.
+	TCPDelayedACKDisabled
+)
+
+func tcpDelayedACKPtr(v TCPDelayedACK) *TCPDelayedACK {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (d *TCPDelayedACK) Set(v string) error {
+	switch v {
+	case "enabled":
+		*d = TCPDelayedACKEnabled
+	case "disabled":
+		*d = TCPDelayedACKDisabled
+	default:
+		return fmt.Errorf("invalid TCP delayed ACK mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (d *TCPDelayedACK) Get() any {
+	return *d
+}
+
+// String implements flag.Value.
+func (d TCPDelayedACK) String() string {
+	switch d {
+	case TCPDelayedACKEnabled:
+		return "enabled"
+	case TCPDelayedACKDisabled:
+		return "disabled"
+	default:
+		panic(fmt.Sprintf("Invalid TCP delayed ACK mode %d", d))
+	}
+}
+
+// TarTimestampResolution is the resolution of modification times in tar
+// archives of sandbox filesystems.
+type TarTimestampResolution int
+
+const (
+	// TarTimestampSeconds rounds modification times to whole seconds.
+	TarTimestampSeconds TarTimestampResolution = iota
+
+	// TarTimestampNanoseconds keeps nanosecond modification times. Each tar
+	// entry gets a PAX extended header, which adds about 1 KiB per entry.
+	TarTimestampNanoseconds
+)
+
+func tarTimestampResolutionPtr(v TarTimestampResolution) *TarTimestampResolution {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (r *TarTimestampResolution) Set(v string) error {
+	switch v {
+	case "seconds":
+		*r = TarTimestampSeconds
+	case "nanoseconds":
+		*r = TarTimestampNanoseconds
+	default:
+		return fmt.Errorf("invalid tar timestamp resolution %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (r *TarTimestampResolution) Get() any {
+	return *r
+}
+
+// String implements flag.Value.
+func (r TarTimestampResolution) String() string {
+	switch r {
+	case TarTimestampSeconds:
+		return "seconds"
+	case TarTimestampNanoseconds:
+		return "nanoseconds"
+	}
+	panic(fmt.Sprintf("Invalid tar timestamp resolution %d", r))
+}
+
 // OverlayMedium describes how overlay medium is configured.
 type OverlayMedium string
 
@@ -1853,6 +1987,57 @@ func (p SignalUnkillablePolicy) String() string {
 	}
 }
 
+// LandlockMode tells whether the Landlock syscalls are available in the
+// sandbox.
+type LandlockMode int
+
+// LandlockMode values.
+const (
+	// LandlockDisabled makes the Landlock syscalls fail with ENOSYS.
+	LandlockDisabled LandlockMode = iota
+
+	// LandlockEnabled makes the Landlock syscalls available. A task that has
+	// restricted itself fails the filesystem operations that the sentry does
+	// not check against its Landlock domain.
+	LandlockEnabled
+)
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (m *LandlockMode) Set(v string) error {
+	switch v {
+	case "disabled":
+		*m = LandlockDisabled
+	case "enabled":
+		*m = LandlockEnabled
+	default:
+		return fmt.Errorf("invalid landlock mode %q (must be one of: disabled, enabled)", v)
+	}
+	return nil
+}
+
+// Ptr returns a pointer to m.
+// Useful in flag declaration line.
+func (m LandlockMode) Ptr() *LandlockMode {
+	return &m
+}
+
+// Get implements flag.Getter.
+func (m *LandlockMode) Get() any {
+	return *m
+}
+
+// String implements flag.Value.
+func (m LandlockMode) String() string {
+	switch m {
+	case LandlockDisabled:
+		return "disabled"
+	case LandlockEnabled:
+		return "enabled"
+	default:
+		panic(fmt.Sprintf("invalid landlock mode %d", m))
+	}
+}
+
 // XDP holds configuration for whether and how to use XDP.
 type XDP struct {
 	Mode      XDPMode
@@ -1980,4 +2165,69 @@ func (p StateEnginePolicy) String() string {
 	default:
 		panic(fmt.Sprintf("invalid state engine policy %d", p))
 	}
+}
+
+// NetgoferMode specifies whether and how the netgofer UDS proxy is used.
+type NetgoferMode int
+
+const (
+	// NetgoferModeOff disables the netgofer UDS proxy.
+	NetgoferModeOff NetgoferMode = iota
+
+	// NetgoferModeProxy runs netgofer in user-space Netstack TCP/UDP proxy mode.
+	NetgoferModeProxy
+
+	// NetgoferModeProxyLoopback runs netgofer in user-space Netstack TCP/UDP proxy
+	// mode and allows loopback traffic (e.g. Docker Compose embedded DNS at
+	// 127.0.0.11:53 or local host resolvers) over the UDS proxy link.
+	NetgoferModeProxyLoopback
+)
+
+// Enabled reports whether UDS proxy networking is enabled.
+func (n NetgoferMode) Enabled() bool {
+	return n != NetgoferModeOff
+}
+
+// Ptr returns a pointer to n.
+func (n NetgoferMode) Ptr() *NetgoferMode {
+	return &n
+}
+
+// AllowLoopback reports whether loopback traffic is allowed over the UDS proxy.
+func (n NetgoferMode) AllowLoopback() bool {
+	return n == NetgoferModeProxyLoopback
+}
+
+// Get implements flag.Getter.
+func (n *NetgoferMode) Get() any {
+	return *n
+}
+
+// String implements flag.Getter.
+func (n NetgoferMode) String() string {
+	switch n {
+	case NetgoferModeOff:
+		return "off"
+	case NetgoferModeProxy:
+		return "proxy"
+	case NetgoferModeProxyLoopback:
+		return "proxy-loopback"
+	default:
+		panic(fmt.Sprintf("invalid netgofer mode %d", n))
+	}
+}
+
+// Set implements flag.Getter. Set(String()) should be idempotent.
+func (n *NetgoferMode) Set(v string) error {
+	switch v {
+	case "", "off":
+		*n = NetgoferModeOff
+	case "proxy":
+		*n = NetgoferModeProxy
+	case "proxy-loopback":
+		*n = NetgoferModeProxyLoopback
+	default:
+		return fmt.Errorf("invalid netgofer mode %q (must be one of: off, proxy, proxy-loopback)", v)
+	}
+	return nil
 }

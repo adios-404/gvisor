@@ -33,8 +33,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
-// The syscall message consists of sentry and stub messages.
-const syscallThreadMessageSize = hostarch.PageSize * 2
+// syscallThreadMessageSize is the size of the syscall message, which consists
+// of sentry and stub messages (one page each).
+var syscallThreadMessageSize = uintptr(hostarch.PageSize * 2)
 
 // syscallThread implements the process of calling syscalls in a stub process.
 //
@@ -87,7 +88,7 @@ func (t *syscallThread) init(seccompNotify bool) error {
 		Kind: usage.System,
 		Dir:  pgalloc.TopDown,
 	}
-	fr, err := t.subproc.memoryFile.Allocate(syscallThreadMessageSize, opts)
+	fr, err := t.subproc.memoryFile.Allocate(uint64(syscallThreadMessageSize), opts)
 	if err != nil {
 		t.subproc.sysmsgStackPool.Put(t.thread.sysmsgStackID)
 		return err
@@ -140,7 +141,7 @@ func (t *syscallThread) destroy() {
 	if t.stubAddr != 0 {
 		_, err := t.thread.syscallIgnoreInterrupt(&t.thread.initRegs, unix.SYS_MUNMAP,
 			arch.SyscallArgument{Value: t.stubAddr},
-			arch.SyscallArgument{Value: uintptr(syscallThreadMessageSize)})
+			arch.SyscallArgument{Value: syscallThreadMessageSize})
 		if err != nil {
 			t.thread.Warningf("munmap failed: %v", err)
 		}
@@ -157,9 +158,12 @@ func (t *syscallThread) installSeccompNotify() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := verifySeccompNotifyFD(fd); err != nil {
+		return nil, err
+	}
 	errno := hostsyscall.RawSyscallErrno(unix.SYS_IOCTL, fd, linux.SECCOMP_IOCTL_NOTIF_SET_FLAGS, linux.SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP)
 	if errno != 0 {
-		t.thread.Debugf("failed to set SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP")
+		t.thread.Debugf("PERF: failed to set SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP: %v", errno)
 	}
 	return os.NewFile(fd, "seccomp_notify"), nil
 }
@@ -184,7 +188,7 @@ func (t *syscallThread) mapMessageIntoStub() error {
 		arch.SyscallArgument{Value: uintptr(unix.PROT_READ | unix.PROT_WRITE)},
 		arch.SyscallArgument{Value: unix.MAP_SHARED | unix.MAP_FILE | unix.MAP_FIXED},
 		arch.SyscallArgument{Value: uintptr(t.subproc.memoryFile.FD())},
-		arch.SyscallArgument{Value: uintptr(t.stackRange.Start + hostarch.PageSize)})
+		arch.SyscallArgument{Value: uintptr(t.stackRange.Start + uint64(hostarch.PageSize))})
 	return err
 }
 

@@ -37,10 +37,8 @@
 #include <sys/un.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 
-#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -86,6 +84,18 @@
 
 #ifndef SYS_move_mount
 #define SYS_move_mount 429
+#endif
+
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+
+#ifndef OPEN_TREE_CLONE
+#define OPEN_TREE_CLONE 1
+#endif
+
+#ifndef AT_RECURSIVE
+#define AT_RECURSIVE 0x8000
 #endif
 
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
@@ -606,6 +616,23 @@ TEST(MountTest, ReadOnlyBindMountAllowsWriteOpenOfCharDevice) {
   FileDescriptor rwfd = ASSERT_NO_ERRNO_AND_VALUE(Open(nullPath, O_RDWR));
   EXPECT_THAT(write(rwfd.get(), msg, sizeof(msg)),
               SyscallSucceedsWithValue(sizeof(msg)));
+}
+
+// A bind mount of a file has a file as its root, which O_DIRECTORY and a
+// trailing slash refuse like any other file.
+TEST(MountTest, OpenDirectoryOnFileBindMount) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto const file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto const target = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount(file.path(), target.path(), "", MS_BIND, "", 0));
+
+  EXPECT_THAT(open(target.path().c_str(), O_RDONLY | O_DIRECTORY),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_THAT(open((target.path() + "/").c_str(), O_RDONLY),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_NO_ERRNO(Open(target.path(), O_RDONLY));
 }
 
 TEST(MountTest, ReadOnlyBindMountAllowsWriteOpenOfFIFO) {
@@ -2256,7 +2283,7 @@ TEST(MountTest, SlavePropagationEvent) {
   auto const child =
       ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(dst_master.path()));
 
-  const std::string master_child_path =
+  [[maybe_unused]] const std::string master_child_path =
       JoinPath(dst_master.path(), Basename(child.path()));
   const std::string slave_child_path =
       JoinPath(dst.path(), Basename(child.path()));
@@ -2663,6 +2690,253 @@ TEST(MountTest, MountNamespaceSetns) {
   ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+// A mount namespace file can be bind mounted only in an older mount namespace,
+// so that mount namespaces can't hold references to each other in a cycle.
+TEST(MountTest, BindMountNamespaceFile) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  // Mounts of mount namespace files are not propagated, so the mount point is
+  // on a private mount.
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "mode=0700", MNT_DETACH));
+  ASSERT_THAT(mount(nullptr, dir.path().c_str(), nullptr, MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+  auto const file_path = JoinPath(dir.path(), "ns");
+  ASSERT_NO_ERRNO(Open(file_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+
+  auto const shared_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const shared_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", shared_dir.path(), kTmpfs, 0, "mode=0700", MNT_DETACH));
+  ASSERT_THAT(
+      mount(nullptr, shared_dir.path().c_str(), nullptr, MS_SHARED, nullptr),
+      SyscallSucceeds());
+  auto const shared_file_path = JoinPath(shared_dir.path(), "ns");
+  ASSERT_NO_ERRNO(Open(shared_file_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+
+  // The caller's mount namespace.
+  EXPECT_THAT(mount("/proc/thread-self/ns/mnt", file_path.c_str(), nullptr,
+                    MS_BIND, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(mount("/proc/thread-self/ns/mnt", file_path.c_str(), nullptr,
+                    MS_BIND | MS_REC, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(mount("/proc/thread-self/ns/mnt", dir.path().c_str(), nullptr,
+                    MS_BIND, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+
+  // Non-mount namespace files are not rejected by the mount namespace loop
+  // check.
+  EXPECT_THAT(mount("/proc/thread-self/ns/uts", dir.path().c_str(), nullptr,
+                    MS_BIND, nullptr),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_NO_ERRNO(Mount("/proc/thread-self/ns/uts", file_path, "", MS_BIND, "",
+                        MNT_DETACH));
+  EXPECT_NO_ERRNO(Mount("/proc/thread-self/ns/uts", file_path, "",
+                        MS_BIND | MS_REC, "", MNT_DETACH));
+
+  const FileDescriptor nsfd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open("/proc/thread-self/ns/mnt", O_RDONLY | O_CLOEXEC));
+  const std::string parent_ns_path = absl::StrCat("/proc/self/fd/", nsfd.get());
+  int pipe_fds[2];
+  ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
+  FileDescriptor child_ready_rfd(pipe_fds[0]);
+  FileDescriptor child_ready_wfd(pipe_fds[1]);
+  ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
+  FileDescriptor child_exit_rfd(pipe_fds[0]);
+  FileDescriptor child_exit_wfd(pipe_fds[1]);
+
+  pid_t child = fork();
+  if (child == 0) {
+    child_ready_rfd.reset();
+    child_exit_wfd.reset();
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    // An older mount namespace.
+    TEST_CHECK_ERRNO(mount(parent_ns_path.c_str(), file_path.c_str(), nullptr,
+                           MS_BIND, nullptr),
+                     EINVAL);
+    TEST_CHECK_ERRNO(mount(parent_ns_path.c_str(), file_path.c_str(), nullptr,
+                           MS_BIND | MS_REC, nullptr),
+                     EINVAL);
+    char c = 0;
+    TEST_PCHECK(write(child_ready_wfd.get(), &c, 1) == 1);
+    // Stay in the new mount namespace until the parent is done.
+    TEST_PCHECK(read(child_exit_rfd.get(), &c, 1) == 0);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  child_ready_wfd.reset();
+  child_exit_rfd.reset();
+  auto cleanup_child = Cleanup([&] {
+    child_exit_wfd.reset();
+    int status = 0;
+    EXPECT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  });
+
+  char c = 0;
+  ASSERT_THAT(read(child_ready_rfd.get(), &c, 1), SyscallSucceedsWithValue(1));
+
+  // A newer mount namespace.
+  const std::string child_ns_path = absl::StrCat("/proc/", child, "/ns/mnt");
+  struct stat child_ns_st;
+  ASSERT_THAT(stat(child_ns_path.c_str(), &child_ns_st), SyscallSucceeds());
+
+  EXPECT_THAT(mount(child_ns_path.c_str(), dir.path().c_str(), nullptr, MS_BIND,
+                    nullptr),
+              SyscallFailsWithErrno(ENOTDIR));
+  EXPECT_THAT(mount(child_ns_path.c_str(), shared_file_path.c_str(), nullptr,
+                    MS_BIND, nullptr),
+              SyscallFailsWithErrno(EINVAL));
+
+  for (const int flags : {static_cast<int>(MS_BIND), MS_BIND | MS_REC}) {
+    auto const bind_mnt = ASSERT_NO_ERRNO_AND_VALUE(
+        Mount(child_ns_path, file_path, "", flags, "", MNT_DETACH));
+    struct stat bind_st;
+    ASSERT_THAT(stat(file_path.c_str(), &bind_st), SyscallSucceeds());
+    EXPECT_EQ(bind_st.st_dev, child_ns_st.st_dev);
+    EXPECT_EQ(bind_st.st_ino, child_ns_st.st_ino);
+  }
+}
+
+// A mount of a mount namespace file is copied by a recursive bind mount and by
+// a recursive open_tree(2) clone. It is not copied to a new mount namespace or
+// to the peers of the target mount.
+TEST(MountTest, BindMountNamespaceFileInTree) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  // All mounts of this test are in the tree of mnt.
+  auto const dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto const mnt = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("", dir.path(), kTmpfs, 0, "mode=0700", MNT_DETACH));
+  ASSERT_THAT(mount(nullptr, dir.path().c_str(), nullptr, MS_PRIVATE, nullptr),
+              SyscallSucceeds());
+  auto const src = JoinPath(dir.path(), "src");
+  auto const dst = JoinPath(dir.path(), "dst");
+  auto const shared = JoinPath(dir.path(), "shared");
+  auto const peer = JoinPath(dir.path(), "peer");
+  for (auto const& path : {src, dst, shared, peer}) {
+    ASSERT_THAT(mkdir(path.c_str(), 0700), SyscallSucceeds());
+  }
+  auto const src_file = JoinPath(src, "ns");
+  auto const dst_file = JoinPath(dst, "ns");
+  ASSERT_NO_ERRNO(Open(src_file, O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+
+  int pipe_fds[2];
+  ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
+  FileDescriptor child_ready_rfd(pipe_fds[0]);
+  FileDescriptor child_ready_wfd(pipe_fds[1]);
+  ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
+  FileDescriptor child_exit_rfd(pipe_fds[0]);
+  FileDescriptor child_exit_wfd(pipe_fds[1]);
+
+  pid_t child = fork();
+  if (child == 0) {
+    child_ready_rfd.reset();
+    child_exit_wfd.reset();
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    char c = 0;
+    TEST_PCHECK(write(child_ready_wfd.get(), &c, 1) == 1);
+    // Stay in the new mount namespace until the parent is done.
+    TEST_PCHECK(read(child_exit_rfd.get(), &c, 1) == 0);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  child_ready_wfd.reset();
+  child_exit_rfd.reset();
+  auto cleanup_child = Cleanup([&] {
+    child_exit_wfd.reset();
+    int status = 0;
+    EXPECT_THAT(waitpid(child, &status, 0), SyscallSucceedsWithValue(child));
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  });
+  char c = 0;
+  ASSERT_THAT(read(child_ready_rfd.get(), &c, 1), SyscallSucceedsWithValue(1));
+
+  // A newer mount namespace.
+  const std::string child_ns_path = absl::StrCat("/proc/", child, "/ns/mnt");
+  struct stat ns_st;
+  ASSERT_THAT(stat(child_ns_path.c_str(), &ns_st), SyscallSucceeds());
+  auto is_ns_file = [&ns_st](const struct stat& st) {
+    return st.st_dev == ns_st.st_dev && st.st_ino == ns_st.st_ino;
+  };
+  ASSERT_THAT(
+      mount(child_ns_path.c_str(), src_file.c_str(), nullptr, MS_BIND, nullptr),
+      SyscallSucceeds());
+
+  // A recursive bind mount copies the mount.
+  struct stat st;
+  ASSERT_THAT(
+      mount(src.c_str(), dst.c_str(), nullptr, MS_BIND | MS_REC, nullptr),
+      SyscallSucceeds());
+  ASSERT_THAT(stat(dst_file.c_str(), &st), SyscallSucceeds());
+  EXPECT_TRUE(is_ns_file(st));
+
+  // A recursive open_tree(2) clone copies the mount.
+  {
+    int raw_treefd = syscall(SYS_open_tree, AT_FDCWD, src.c_str(),
+                             OPEN_TREE_CLONE | O_CLOEXEC | AT_RECURSIVE);
+    ASSERT_THAT(raw_treefd, SyscallSucceeds());
+    FileDescriptor treefd(raw_treefd);
+    ASSERT_THAT(fstatat(treefd.get(), "ns", &st, 0), SyscallSucceeds());
+    EXPECT_TRUE(is_ns_file(st));
+  }
+
+  // A new mount namespace does not get the mounts.
+  pid_t unshare_child = fork();
+  if (unshare_child == 0) {
+    TEST_CHECK_SUCCESS(unshare(CLONE_NEWNS));
+    struct stat child_st;
+    TEST_CHECK_SUCCESS(stat(src_file.c_str(), &child_st));
+    TEST_CHECK(!is_ns_file(child_st));
+    TEST_CHECK_SUCCESS(stat(dst_file.c_str(), &child_st));
+    TEST_CHECK(!is_ns_file(child_st));
+    _exit(0);
+  }
+  ASSERT_THAT(unshare_child, SyscallSucceeds());
+  int status = 0;
+  ASSERT_THAT(waitpid(unshare_child, &status, 0),
+              SyscallSucceedsWithValue(unshare_child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+  // A recursive bind mount on a shared mount copies the mount. The copy of
+  // the tree that the peer receives does not have the mount.
+  ASSERT_THAT(mount("", shared.c_str(), kTmpfs, 0, "mode=0700"),
+              SyscallSucceeds());
+  ASSERT_THAT(mount(nullptr, shared.c_str(), nullptr, MS_SHARED, nullptr),
+              SyscallSucceeds());
+  ASSERT_THAT(mount(shared.c_str(), peer.c_str(), nullptr, MS_BIND, nullptr),
+              SyscallSucceeds());
+  auto const shared_tree = JoinPath(shared, "tree");
+  ASSERT_THAT(mkdir(shared_tree.c_str(), 0700), SyscallSucceeds());
+  ASSERT_THAT(mount(src.c_str(), shared_tree.c_str(), nullptr, MS_BIND | MS_REC,
+                    nullptr),
+              SyscallSucceeds());
+  ASSERT_THAT(stat(JoinPath(shared_tree, "ns").c_str(), &st),
+              SyscallSucceeds());
+  EXPECT_TRUE(is_ns_file(st));
+  ASSERT_THAT(stat(JoinPath(peer, "tree", "ns").c_str(), &st),
+              SyscallSucceeds());
+  EXPECT_FALSE(is_ns_file(st));
+
+  // The mount cannot move to a shared mount that has a peer.
+  auto const shared_file = JoinPath(shared, "ns");
+  ASSERT_NO_ERRNO(Open(shared_file, O_CREAT | O_RDWR | O_CLOEXEC, 0600));
+  EXPECT_THAT(
+      mount(src_file.c_str(), shared_file.c_str(), nullptr, MS_MOVE, nullptr),
+      SyscallFailsWithErrno(EINVAL));
+
+  // A mount of a file of a different namespace type is copied to the peer.
+  struct stat uts_st;
+  ASSERT_THAT(stat("/proc/thread-self/ns/uts", &uts_st), SyscallSucceeds());
+  ASSERT_THAT(mount("/proc/thread-self/ns/uts", shared_file.c_str(), nullptr,
+                    MS_BIND | MS_REC, nullptr),
+              SyscallSucceeds());
+  ASSERT_THAT(stat(JoinPath(peer, "ns").c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_dev, uts_st.st_dev);
+  EXPECT_EQ(st.st_ino, uts_st.st_ino);
+}
+
 TEST(MountTest, MountNamespacePropagation) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
@@ -2957,134 +3231,6 @@ TEST(MountTest, LockedMountFlagsAreInheritedByBind) {
               IsPosixErrorOkAndHolds(0));
 }
 
-// Linux's clone_private_mount() refuses an overlay layer that has a locked
-// mount at or below it, or whose mount is in another mount namespace. See
-// https://github.com/torvalds/linux/commit/427215d85e8d, which first
-// appears in Linux 5.14.
-TEST(MountTest, LockedMountStopsOverlayLowerdir) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  if (!IsRunningOnGvisor()) {
-    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
-    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
-  }
-
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
-  const std::string layer = JoinPath(dir.path(), "layer");
-  const std::string hidden = JoinPath(layer, "hidden");
-  const std::string other = JoinPath(dir.path(), "other");
-  const std::string merged = JoinPath(dir.path(), "merged");
-  for (const std::string& path : {layer, hidden, other, merged}) {
-    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
-  }
-  const Cleanup hidden_mount =
-      ASSERT_NO_ERRNO_AND_VALUE(Mount("", hidden, kTmpfs, 0, "", MNT_DETACH));
-  const std::string refused_opts = "lowerdir=" + layer + ":" + other;
-  const std::string admitted_opts = "lowerdir=" + hidden + ":" + other;
-
-  const std::function<void()> child = [&] {
-    TEST_CHECK_ERRNO(
-        mount("overlay", merged.c_str(), "overlay", 0, refused_opts.c_str()),
-        EINVAL);
-    TEST_CHECK_SUCCESS(
-        mount("overlay", merged.c_str(), "overlay", 0, admitted_opts.c_str()));
-    TEST_CHECK_SUCCESS(umount2(merged.c_str(), 0));
-  };
-  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
-              IsPosixErrorOkAndHolds(0));
-}
-
-TEST(MountTest, LockedMountStopsOverlayUpperdir) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  if (!IsRunningOnGvisor()) {
-    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
-    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
-  }
-
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
-  const std::string lower = JoinPath(dir.path(), "lower");
-  const std::string upper = JoinPath(dir.path(), "upper");
-  const std::string hidden = JoinPath(upper, "hidden");
-  const std::string work = JoinPath(dir.path(), "work");
-  const std::string merged = JoinPath(dir.path(), "merged");
-  for (const std::string& path : {lower, upper, hidden, work, merged}) {
-    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
-  }
-  const Cleanup hidden_mount =
-      ASSERT_NO_ERRNO_AND_VALUE(Mount("", hidden, kTmpfs, 0, "", MNT_DETACH));
-  const std::string opts = "lowerdir=" + lower + ",upperdir=" + upper +
-                           ",workdir=" + work + ",userxattr";
-
-  const std::function<void()> child = [&] {
-    TEST_CHECK_ERRNO(
-        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
-  };
-  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
-              IsPosixErrorOkAndHolds(0));
-}
-
-TEST(MountTest, LockedMountStopsOverlayOfSysfs) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  if (!IsRunningOnGvisor()) {
-    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
-    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
-  }
-
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
-  const std::string sys = JoinPath(dir.path(), "sys");
-  const std::string other = JoinPath(dir.path(), "other");
-  const std::string merged = JoinPath(dir.path(), "merged");
-  for (const std::string& path : {sys, other, merged}) {
-    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
-  }
-  const Cleanup sys_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("sysfs", sys, "sysfs", 0, "", MNT_DETACH));
-  const Cleanup kernel_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", JoinPath(sys, "kernel"), kTmpfs, 0, "", MNT_DETACH));
-  const std::string opts = "lowerdir=" + sys + ":" + other;
-
-  const std::function<void()> child = [&] {
-    TEST_CHECK_ERRNO(
-        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
-  };
-  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
-              IsPosixErrorOkAndHolds(0));
-}
-
-TEST(MountTest, OverlayRefusesLayerFromAnotherMountNamespace) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  if (!IsRunningOnGvisor()) {
-    auto version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
-    SKIP_IF(version.major < 5 || (version.major == 5 && version.minor < 14));
-  }
-
-  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("", dir.path(), kTmpfs, 0, "", MNT_DETACH));
-  const std::string layer = JoinPath(dir.path(), "layer");
-  const std::string other = JoinPath(dir.path(), "other");
-  const std::string merged = JoinPath(dir.path(), "merged");
-  for (const std::string& path : {layer, other, merged}) {
-    ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
-  }
-  const FileDescriptor layer_fd =
-      ASSERT_NO_ERRNO_AND_VALUE(Open(layer, O_RDONLY | O_DIRECTORY));
-  const std::string opts =
-      absl::StrCat("lowerdir=/proc/self/fd/", layer_fd.get(), ":", other);
-
-  const std::function<void()> child = [&] {
-    TEST_CHECK_ERRNO(
-        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()), EINVAL);
-  };
-  EXPECT_THAT(InForkedUserMountNamespace([] {}, child),
-              IsPosixErrorOkAndHolds(0));
-}
-
 TEST(MountTest, RemountUnmounted) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
@@ -3213,9 +3359,14 @@ TEST(MountTest, UserNamespaceProcMount) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
 
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  const std::function<void()> fn = [&dir] {
+  const std::string boot_id =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/random/boot_id"));
+  const std::function<void()> fn = [&] {
     TEST_CHECK_SUCCESS(mount("proc", dir.path().c_str(), "proc",
                              kUserNamespaceMountFlags, nullptr));
+    const std::string mounted_id = TEST_CHECK_NO_ERRNO_AND_VALUE(
+        GetContents(JoinPath(dir.path(), "sys/kernel/random/boot_id")));
+    TEST_CHECK(mounted_id == boot_id);
   };
   EXPECT_THAT(InUserNamespaceAfterSetup([] {}, CLONE_NEWPID, fn),
               IsPosixErrorOkAndHolds(0));
@@ -3417,559 +3568,6 @@ TEST(MountTest, InitUserNamespaceProcMountWithoutVisibleProc) {
     TEST_CHECK_SUCCESS(mount("proc", dir.path().c_str(), "proc", 0, nullptr));
   };
   EXPECT_THAT(InForkedProcess(fn), IsPosixErrorOkAndHolds(0));
-}
-
-TEST(MountTest, OverlayfsSgidBitIsCopiedUp) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-
-  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  // Overlayfs can not be used as upper layer for another overlayfs mount. If
-  // running in overlayfs, create a tmpfs mount to use as the upper layer.
-  //
-  // In Linux, mounting overlayfs in a user namespace can fail with
-  // EACCES when the layers are on TEST_TMPDIR's filesystem.
-  bool in_overlayfs = ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()));
-  bool use_tmpfs = in_overlayfs || GvisorPlatform() == Platform::kNative;
-  if (use_tmpfs) {
-    ASSERT_THAT(
-        mount("tmpfs", base_dir.path().c_str(), "tmpfs", 0, "mode=1777"),
-        SyscallSucceeds());
-  }
-  auto tmpfs_cleanup = Cleanup([&base_dir, use_tmpfs] {
-    if (use_tmpfs) {
-      ASSERT_THAT(umount2(base_dir.path().c_str(), MNT_DETACH),
-                  SyscallSucceeds());
-    }
-  });
-
-  // Create the files under test in `lower` and set the S_ISGID bit on them.
-  auto lower =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  struct FileUT {
-    absl::string_view name;
-    void (*create)(const std::string& path);
-  };
-  static constexpr std::array kFilesUnderTest = {
-      FileUT{"setgid_dir",
-             [](const std::string& path) {
-               ASSERT_THAT(mkdir(path.c_str(), 0755), SyscallSucceeds());
-             }},
-      FileUT{"setgid_empty_file",
-             [](const std::string& path) {
-               ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_CREAT | O_RDWR, 0755));
-             }},
-      FileUT{"setgid_nonempty_file",
-             [](const std::string& path) {
-               ASSERT_NO_ERRNO(CreateWithContents(path, "junk", 0755));
-             }},
-  };
-  for (const auto& file_ut : kFilesUnderTest) {
-    std::string lower_target = lower.path() + "/" + std::string(file_ut.name);
-    file_ut.create(lower_target);
-
-    struct stat st_lower;
-    ASSERT_THAT(stat(lower_target.c_str(), &st_lower), SyscallSucceeds());
-    ASSERT_THAT(chmod(lower_target.c_str(), st_lower.st_mode | S_ISGID),
-                SyscallSucceeds());
-    ASSERT_THAT(stat(lower_target.c_str(), &st_lower), SyscallSucceeds());
-    ASSERT_TRUE(st_lower.st_mode & S_ISGID);
-  }
-
-  // Mount the overlayfs.
-  auto upper =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto merged =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  std::string opts = "lowerdir=" + lower.path() + ",upperdir=" + upper.path() +
-                     ",workdir=" + work.path();
-  ASSERT_THAT(
-      mount("overlay", merged.path().c_str(), "overlay", 0, opts.c_str()),
-      SyscallSucceeds());
-  auto overlayfs_cleanup =
-      Cleanup([&merged] { umount2(merged.path().c_str(), MNT_DETACH); });
-
-  for (const auto& file_ut : kFilesUnderTest) {
-    SCOPED_TRACE(file_ut.name);
-
-    // The S_ISGID bit is visible before any copy-up took place.
-    std::string merged_target = merged.path() + "/" + std::string(file_ut.name);
-    struct stat st_merged;
-    ASSERT_THAT(stat(merged_target.c_str(), &st_merged), SyscallSucceeds());
-    ASSERT_TRUE(st_merged.st_mode & S_ISGID);
-
-    // Touch the target to force a copy-up to `upper`.
-    ASSERT_THAT(utimensat(AT_FDCWD, merged_target.c_str(), nullptr, 0),
-                SyscallSucceeds());
-
-    // The S_ISGID bit must also be copied up.
-    std::string upper_target = upper.path() + "/" + std::string(file_ut.name);
-    struct stat upper_st_after_touch;
-    ASSERT_THAT(stat(upper_target.c_str(), &upper_st_after_touch),
-                SyscallSucceeds());
-    EXPECT_TRUE(upper_st_after_touch.st_mode & S_ISGID);
-    struct stat merged_st_after_touch;
-    ASSERT_THAT(stat(merged_target.c_str(), &merged_st_after_touch),
-                SyscallSucceeds());
-    EXPECT_TRUE(merged_st_after_touch.st_mode & S_ISGID);
-  }
-}
-
-TEST(MountTest, OverlayfsSecurityCapabilityRequiresSetFcap) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
-
-  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("tmpfs", base_dir.path(), "tmpfs", 0, "", MNT_DETACH));
-
-  auto lower =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto upper =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto merged =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-
-  // Mount the overlayfs.
-  std::string opts = "lowerdir=" + lower.path() + ",upperdir=" + upper.path() +
-                     ",workdir=" + work.path();
-  auto overlay_mount =
-      ASSERT_NO_ERRNO_AND_VALUE(Mount("overlay", merged.path().c_str(),
-                                      "overlay", 0, opts.c_str(), MNT_DETACH));
-
-  struct {
-    uint32_t magic_etc;
-    uint32_t permitted_lo;
-    uint32_t inheritable_lo;
-    uint32_t permitted_hi;
-    uint32_t inheritable_hi;
-  } cap_data = {};
-  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
-  cap_data.permitted_lo = 1 << CAP_SETUID;
-
-  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(merged.path()));
-
-  // Setting security.capability with CAP_SETFCAP should succeed
-  ASSERT_THAT(setxattr(file.path().c_str(), "security.capability", &cap_data,
-                       sizeof(cap_data), 0),
-              SyscallSucceeds());
-
-  // Setting security.capability without CAP_SETFCAP should fail
-  AutoCapability set_fcap(CAP_SETFCAP, false);
-  ASSERT_THAT(setxattr(file.path().c_str(), "security.capability", &cap_data,
-                       sizeof(cap_data), 0),
-              SyscallFailsWithErrno(EPERM));
-}
-
-TEST(MountTest, OverlayfsSecurityCapabilityTranslatesRootID) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
-
-  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  auto tmpfs_mount = ASSERT_NO_ERRNO_AND_VALUE(
-      Mount("tmpfs", base_dir.path(), "tmpfs", 0, "", MNT_DETACH));
-
-  auto lower =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto upper =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto merged =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-
-  // Mount the overlayfs.
-  std::string opts = "lowerdir=" + lower.path() + ",upperdir=" + upper.path() +
-                     ",workdir=" + work.path();
-  auto overlay_mount =
-      ASSERT_NO_ERRNO_AND_VALUE(Mount("overlay", merged.path().c_str(),
-                                      "overlay", 0, opts.c_str(), MNT_DETACH));
-
-  struct {
-    uint32_t magic_etc;
-    uint32_t permitted_lo;
-    uint32_t inheritable_lo;
-    uint32_t permitted_hi;
-    uint32_t inheritable_hi;
-  } cap_data = {};
-  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
-  cap_data.permitted_lo = 1 << CAP_SETUID;
-
-  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(merged.path()));
-
-  ASSERT_THAT(setxattr(file.path().c_str(), "security.capability", &cap_data,
-                       sizeof(cap_data), 0),
-              SyscallSucceeds());
-
-  constexpr uint32_t kChildUID = 1000;
-  const uint32_t parent_uid = geteuid();
-  const uint32_t parent_gid = getegid();
-  EXPECT_THAT(
-      InForkedProcess([&] {
-        TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
-
-        int fd = open("/proc/self/uid_map", O_WRONLY);
-        TEST_PCHECK(fd >= 0);
-        std::string map = absl::StrCat(kChildUID, " ", parent_uid, " 1");
-        TEST_PCHECK(write(fd, map.data(), map.size()) ==
-                    static_cast<ssize_t>(map.size()));
-        TEST_PCHECK(close(fd) == 0);
-
-        // Denying setgroups is a prerequisite for writing gid_map without
-        // CAP_SETGID in the parent user namespace.
-        int setgroups_fd = open("/proc/self/setgroups", O_WRONLY);
-        if (setgroups_fd >= 0) {
-          TEST_PCHECK(write(setgroups_fd, "deny", 4) == 4);
-          TEST_PCHECK(close(setgroups_fd) == 0);
-        }
-        int gid_fd = open("/proc/self/gid_map", O_WRONLY);
-        if (gid_fd >= 0) {
-          std::string gid_map = absl::StrCat(kChildUID, " ", parent_gid, " 1");
-          TEST_PCHECK(write(gid_fd, gid_map.data(), gid_map.size()) ==
-                      static_cast<ssize_t>(gid_map.size()));
-          TEST_PCHECK(close(gid_fd) == 0);
-        }
-
-        struct {
-          uint32_t magic_etc;
-          uint32_t permitted_lo;
-          uint32_t inheritable_lo;
-          uint32_t permitted_hi;
-          uint32_t inheritable_hi;
-          uint32_t rootid;
-        } cap_data_v3 = {};
-
-        ssize_t ret = getxattr(file.path().c_str(), "security.capability",
-                               &cap_data_v3, sizeof(cap_data_v3));
-        TEST_CHECK_SUCCESS(ret);
-        TEST_CHECK_MSG(ret == sizeof(cap_data_v3), "wrong size returned");
-        TEST_CHECK_MSG((cap_data_v3.magic_etc & VFS_CAP_REVISION_MASK) ==
-                           VFS_CAP_REVISION_3,
-                       "wrong revision");
-        TEST_CHECK_MSG(cap_data_v3.rootid == kChildUID, "wrong rootid");
-      }),
-      IsPosixErrorOkAndHolds(0));
-}
-
-// Renaming a directory on an overlay inside a user namespace requires
-// user.overlay.* xattrs to mark the directory opaque.
-TEST(MountTest, OverlayfsDirectoryRenameInUserNamespace) {
-  // Test fails in gVisor running on <6.0 due to fsgofer getting permission
-  // errors on `mknod`.
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
-  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  bool in_overlayfs = ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path()));
-  // Before Linux 6.6, tmpfs doesn't support the user.* xattrs needed.
-  KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
-  bool use_tmpfs =
-      in_overlayfs ||
-      (GvisorPlatform() == Platform::kNative &&
-       (version.major > 6 || (version.major == 6 && version.minor >= 6)));
-
-  const std::function<void()> parent = [] {};
-  const std::function<void()> child = [&base_dir, use_tmpfs] {
-    // Overlayfs can not be used as upper layer for another overlayfs mount. If
-    // running in overlayfs or on Linux 6.6 or later, create a tmpfs mount to
-    // use as the upper layer.
-    if (use_tmpfs) {
-      TEST_CHECK_SUCCESS(mount("tmpfs", base_dir.path().c_str(), "tmpfs", 0,
-                               "mode=1777,size=10m"));
-    }
-    auto tmpfs_cleanup = Cleanup([&base_dir, use_tmpfs] {
-      if (use_tmpfs) {
-        TEST_CHECK_SUCCESS(umount2(base_dir.path().c_str(), 0));
-      }
-    });
-
-    auto lower = JoinPath(base_dir.path(), "lower");
-    auto upper = JoinPath(base_dir.path(), "upper");
-    auto work = JoinPath(base_dir.path(), "work");
-    auto merged = JoinPath(base_dir.path(), "merged");
-    TEST_CHECK_SUCCESS(mkdir(lower.c_str(), 0755));
-    TEST_CHECK_SUCCESS(mkdir(upper.c_str(), 0755));
-    TEST_CHECK_SUCCESS(mkdir(work.c_str(), 0755));
-    TEST_CHECK_SUCCESS(mkdir(merged.c_str(), 0755));
-
-    // 1. Create the DESTINATION directory in lower.
-    // (It must be empty so standard POSIX rename allows overwriting it).
-    {
-      auto lower_renamed = JoinPath(lower, "renamed");
-      TEST_CHECK_SUCCESS(mkdir(lower_renamed.c_str(), 0755));
-    }
-
-    std::string opts = "lowerdir=" + lower + ",upperdir=" + upper +
-                       ",workdir=" + work + ",userxattr";
-    TEST_CHECK_SUCCESS(
-        mount("overlay", merged.c_str(), "overlay", 0, opts.c_str()));
-    auto overlayfs_cleanup =
-        Cleanup([&merged] { TEST_CHECK_SUCCESS(umount2(merged.c_str(), 0)); });
-
-    // 2. Create the SOURCE directory directly in merged.
-    // Because it doesn't exist in lower, it is a "pure upper" directory.
-    auto mydir = JoinPath(merged, "mydir");
-    TEST_CHECK_SUCCESS(mkdir(mydir.c_str(), 0755));
-
-    int fd =
-        open(JoinPath(mydir, "file.txt").c_str(), O_WRONLY | O_CREAT, 0644);
-    TEST_CHECK(fd >= 0);
-    TEST_CHECK_SUCCESS(close(fd));
-
-    // 3. Rename the pure upper directory over the existing lower directory.
-    // - This avoids EXDEV on Linux because 'mydir' is pure upper.
-    // - This forces the kernel to apply user.overlay.opaque="y" to 'renamed'
-    //   so that 'lower/renamed' is hidden.
-    auto renamed = JoinPath(merged, "renamed");
-    TEST_CHECK_SUCCESS(rename(mydir.c_str(), renamed.c_str()));
-
-    // 4. Verify the rename succeeded and contents are correct
-    struct stat st;
-    TEST_CHECK_SUCCESS(stat(renamed.c_str(), &st));
-    TEST_CHECK(S_ISDIR(st.st_mode));
-
-    // Original directory should be gone
-    TEST_CHECK(stat(mydir.c_str(), &st) == -1 && errno == ENOENT);
-
-    // File inside should have moved with the directory
-    TEST_CHECK_SUCCESS(stat(JoinPath(renamed, "file.txt").c_str(), &st));
-    TEST_CHECK(S_ISREG(st.st_mode));
-  };
-
-  EXPECT_THAT(InForkedUserMountNamespace(parent, child),
-              IsPosixErrorOkAndHolds(0));
-}
-
-// Test that overlay can be mounted with a gofer upper layer. Runs some basic
-// overlayfs tests to confirm basic functionality.
-TEST(MountTest, OverlayfsOnGoferBehavior) {
-  // Test fails in gVisor running on <6.0 due to fsgofer getting permission
-  // errors on `mknod`.
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(GetHostKernelVersion()).major < 6);
-
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-
-  auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  // We only want to test overlayfs on gofer.
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(IsGoferfs(base_dir.path())));
-
-  // Create directories for overlayfs mount.
-  auto lower =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto upper =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto work = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-  auto merged =
-      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(base_dir.path()));
-
-  // Set up lower layer with some content.
-  const std::string kTestFile = "testfile";
-  const std::string kTestFileContent = "lower_content";
-  std::string lower_file = JoinPath(lower.path(), kTestFile);
-  ASSERT_NO_ERRNO(CreateWithContents(lower_file, kTestFileContent, 0644));
-  const std::string kTestDirName = "testdir";
-  std::string lower_dir = JoinPath(lower.path(), kTestDirName);
-  ASSERT_THAT(mkdir(lower_dir.c_str(), 0755), SyscallSucceeds());
-  const std::string kCopyUpFile = "copyupfile";
-  std::string lower_copyup_file = JoinPath(lower.path(), kCopyUpFile);
-  ASSERT_NO_ERRNO(CreateWithContents(lower_copyup_file, "initial", 0644));
-  bool xattr_supported = true;
-  if (setxattr(lower_copyup_file.c_str(), "user.test", "value", 5, 0) < 0) {
-    if (errno == EOPNOTSUPP) {
-      xattr_supported = false;
-    } else {
-      ASSERT_NO_ERRNO(PosixError(errno, "setxattr failed"));
-    }
-  }
-
-  // Mount the overlay.
-  std::string opts = "lowerdir=" + lower.path() + ",upperdir=" + upper.path() +
-                     ",workdir=" + work.path() + ",userxattr";
-  ASSERT_THAT(
-      mount("overlay", merged.path().c_str(), "overlay", 0, opts.c_str()),
-      SyscallSucceeds());
-  auto cleanup = Cleanup([&merged] { umount2(merged.path().c_str(), 0); });
-
-  // Read the lower layer file through the overlay.
-  std::string merged_file = JoinPath(merged.path(), kTestFile);
-  std::string merged_content;
-  ASSERT_NO_ERRNO(GetContents(merged_file, &merged_content));
-  EXPECT_EQ(merged_content, kTestFileContent);
-
-  // Write a new file through the overlay and confirm it appears in the upper.
-  const std::string kNewFile = "newfile";
-  const std::string kNewFileContent = "new";
-  std::string new_file = JoinPath(merged.path(), kNewFile);
-  ASSERT_NO_ERRNO(CreateWithContents(new_file, kNewFileContent, 0644));
-  std::string upper_new_file = JoinPath(upper.path(), kNewFile);
-  std::string upper_new_content;
-  ASSERT_NO_ERRNO(GetContents(upper_new_file, &upper_new_content));
-  EXPECT_EQ(upper_new_content, kNewFileContent);
-
-  // Delete the lower layer file through the overlay and confirm it creates a
-  // whiteout in the upper.
-  ASSERT_THAT(unlink(merged_file.c_str()), SyscallSucceeds());
-  std::string whiteout = JoinPath(upper.path(), kTestFile);
-  struct stat st;
-  ASSERT_THAT(stat(whiteout.c_str(), &st), SyscallSucceeds());
-  EXPECT_TRUE(S_ISCHR(st.st_mode));
-  EXPECT_EQ(major(st.st_rdev), 0);
-  EXPECT_EQ(minor(st.st_rdev), 0);
-
-  // Delete the lower layer directory through the overlay and recreate it. This
-  // should mark it opaque in the upper layer.
-  std::string merged_dir = JoinPath(merged.path(), kTestDirName);
-  ASSERT_THAT(rmdir(merged_dir.c_str()), SyscallSucceeds());
-  ASSERT_THAT(mkdir(merged_dir.c_str(), 0755), SyscallSucceeds());
-
-  std::string upper_dir = JoinPath(upper.path(), kTestDirName);
-  char opaque_buf[16] = {};
-  ASSERT_THAT(getxattr(upper_dir.c_str(), "user.overlay.opaque", opaque_buf,
-                       sizeof(opaque_buf)),
-              SyscallSucceeds());
-  EXPECT_EQ(opaque_buf[0], 'y');
-
-  // Test copy up on regular file.
-  std::string merged_copyup_file = JoinPath(merged.path(), kCopyUpFile);
-  ASSERT_NO_ERRNO(SetContents(merged_copyup_file, "modified"));
-  if (xattr_supported) {
-    // Confirm that the xattr is copied up with the file.
-    char xattr_buf[16] = {};
-    ASSERT_THAT(getxattr(merged_copyup_file.c_str(), "user.test", xattr_buf,
-                         sizeof(xattr_buf)),
-                SyscallSucceeds());
-    EXPECT_STREQ(xattr_buf, "value");
-  }
-}
-
-// OverlayOnTmpfs is a tmpfs mount holding lower, upper, work, and merged
-// directories. MountOverlay mounts an overlay of lower and upper at merged.
-struct OverlayOnTmpfs {
-  TempPath base;
-  Cleanup tmpfs_mount;
-  std::string lower;
-  std::string upper;
-  std::string work;
-  std::string merged;
-  Cleanup overlay_mount;
-
-  PosixError MountOverlay() {
-    ASSIGN_OR_RETURN_ERRNO(
-        overlay_mount,
-        Mount("overlay", merged, "overlay", 0,
-              absl::StrCat("lowerdir=", lower, ",upperdir=", upper,
-                           ",workdir=", work, ",userxattr"),
-              MNT_DETACH));
-    return NoError();
-  }
-};
-
-// CreateOverlayOnTmpfs mounts a tmpfs and creates the overlay directories in
-// it. The overlay itself is not mounted yet, so that the caller can populate
-// lower first.
-PosixErrorOr<OverlayOnTmpfs> CreateOverlayOnTmpfs() {
-  OverlayOnTmpfs o;
-  ASSIGN_OR_RETURN_ERRNO(o.base, TempPath::CreateDir());
-  ASSIGN_OR_RETURN_ERRNO(
-      o.tmpfs_mount, Mount("tmpfs", o.base.path(), "tmpfs", 0, "", MNT_DETACH));
-  o.lower = JoinPath(o.base.path(), "lower");
-  o.upper = JoinPath(o.base.path(), "upper");
-  o.work = JoinPath(o.base.path(), "work");
-  o.merged = JoinPath(o.base.path(), "merged");
-  for (const std::string* dir : {&o.lower, &o.upper, &o.work, &o.merged}) {
-    if (mkdir(dir->c_str(), 0755) != 0) {
-      return PosixError(errno, absl::StrCat("mkdir ", *dir));
-    }
-  }
-  return o;
-}
-
-// Renaming a file only leaves a whiteout at its origin if the file also
-// exists on the lower layer.
-TEST(MountTest, OverlayfsRenameWhiteoutOnlyWhenLowerExists) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-
-  OverlayOnTmpfs o = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
-  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(o.lower, "lower_file"), ""));
-  ASSERT_NO_ERRNO(o.MountOverlay());
-
-  // Rename a pure-upper file; no whiteout should be created at its origin.
-  ASSERT_NO_ERRNO(CreateWithContents(JoinPath(o.merged, "upper_only"), ""));
-  ASSERT_THAT(rename(JoinPath(o.merged, "upper_only").c_str(),
-                     JoinPath(o.merged, "upper_renamed").c_str()),
-              SyscallSucceeds());
-  struct stat st;
-  EXPECT_THAT(stat(JoinPath(o.upper, "upper_only").c_str(), &st),
-              SyscallFailsWithErrno(ENOENT));
-
-  // Rename the file that exists on the lower layer; a whiteout must be
-  // created.
-  ASSERT_THAT(rename(JoinPath(o.merged, "lower_file").c_str(),
-                     JoinPath(o.merged, "lower_renamed").c_str()),
-              SyscallSucceeds());
-  ASSERT_THAT(stat(JoinPath(o.upper, "lower_file").c_str(), &st),
-              SyscallSucceeds());
-  EXPECT_TRUE(S_ISCHR(st.st_mode));
-  EXPECT_EQ(major(st.st_rdev), 0);
-  EXPECT_EQ(minor(st.st_rdev), 0);
-}
-
-// OpenDeletedOverlayDirWithLowerFile creates dir/file on the lower layer of
-// o, which must not be mounted yet, and mounts the overlay. It then removes
-// dir through the overlay while holding an FD to it, and returns the FD.
-// Removing dir deletes its upper copy, which makes dir/file from the lower
-// layer visible again through the deleted overlay directory.
-PosixErrorOr<FileDescriptor> OpenDeletedOverlayDirWithLowerFile(
-    OverlayOnTmpfs& o) {
-  if (mkdir(JoinPath(o.lower, "dir").c_str(), 0755) != 0) {
-    return PosixError(errno, "mkdir lower/dir");
-  }
-  if (PosixError err = CreateWithContents(JoinPath(o.lower, "dir/file"), "");
-      !err.ok()) {
-    return err;
-  }
-  if (PosixError err = o.MountOverlay(); !err.ok()) {
-    return err;
-  }
-
-  const std::string dir = JoinPath(o.merged, "dir");
-  FileDescriptor dirfd;
-  ASSIGN_OR_RETURN_ERRNO(dirfd, Open(dir, O_RDONLY | O_DIRECTORY));
-  if (unlink(JoinPath(dir, "file").c_str()) != 0) {
-    return PosixError(errno, "unlink merged/dir/file");
-  }
-  if (rmdir(dir.c_str()) != 0) {
-    return PosixError(errno, "rmdir merged/dir");
-  }
-  return dirfd;
-}
-
-TEST(MountTest, OverlayfsRenameFromDeletedDirFails) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-
-  OverlayOnTmpfs o = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
-  const FileDescriptor dirfd =
-      ASSERT_NO_ERRNO_AND_VALUE(OpenDeletedOverlayDirWithLowerFile(o));
-
-  const std::string dst = JoinPath(o.merged, "dst");
-  EXPECT_THAT(renameat(dirfd.get(), "file", AT_FDCWD, dst.c_str()),
-              SyscallFailsWithErrno(ENOENT));
-  struct stat st;
-  EXPECT_THAT(stat(dst.c_str(), &st), SyscallFailsWithErrno(ENOENT));
-}
-
-TEST(MountTest, OverlayfsUnlinkInDeletedDirFails) {
-  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-
-  OverlayOnTmpfs o = ASSERT_NO_ERRNO_AND_VALUE(CreateOverlayOnTmpfs());
-  const FileDescriptor dirfd =
-      ASSERT_NO_ERRNO_AND_VALUE(OpenDeletedOverlayDirWithLowerFile(o));
-
-  // Opening the lower file for writing would copy it up into the deleted
-  // directory's upper copy.
-  EXPECT_THAT(openat(dirfd.get(), "file", O_RDWR),
-              SyscallFailsWithErrno(ENOENT));
-  EXPECT_THAT(unlinkat(dirfd.get(), "file", 0), SyscallFailsWithErrno(ENOENT));
 }
 
 TEST(MountTest, PollMountInfo) {

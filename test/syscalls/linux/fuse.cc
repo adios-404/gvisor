@@ -38,6 +38,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -68,6 +69,7 @@
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
+using ::testing::AnyOf;
 using ::testing::Ge;
 
 // Old versions of glibc do not define this flag.
@@ -533,6 +535,136 @@ TEST(FuseTest, AccessUnsupported) {
   // The cached capability applies to another inode and a different mask.
   const std::string file_path = JoinPath(mount_point.path(), "testfile");
   EXPECT_THAT(access(file_path.c_str(), W_OK), SyscallSucceeds());
+}
+
+// Serves FUSE_ACCESS and FUSE_STATFS, and fails FUSE_GETATTR with EIO.
+bool RespondFailingGetattr(int fd, const fuse_in_header& in) {
+  if (in.opcode == FUSE_ACCESS) {
+    FuseRespond(fd, in.unique);
+  } else if (in.opcode == FUSE_STATFS) {
+    fuse_statfs_out out = {};
+    out.st.bsize = 4096;
+    out.st.frsize = 4096;
+    out.st.namelen = 255;
+    FuseRespond(fd, in.unique, &out, sizeof(out));
+  } else if (in.opcode == FUSE_GETATTR) {
+    FuseRespond(fd, in.unique, nullptr, 0, -EIO);
+  } else {
+    FuseRespond(fd, in.unique, nullptr, 0, -ENOSYS);
+  }
+  return true;
+}
+
+// An overlay mount whose top layer is a FUSE filesystem that fails requests
+// made while setting up the overlay root must not crash the kernel.
+TEST(FuseTest, OverlayLowerRootGetattrFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(IsRunningWithSaveRestore());
+
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+  auto fuse_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40000", fd.get());
+  auto fuse_mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("fuse", fuse_dir.path(), "fuse", MS_NODEV | MS_NOSUID, mount_opts,
+            0 /* umountflags */));
+  ASSERT_NO_FATAL_FAILURE(FuseInit(fd.get()));
+  const FileDescriptor stop_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NewEventFD(0, EFD_CLOEXEC));
+
+  ScopedThread fuse_server([&, server_fd = fd.release()] {
+    RunFuseServer(server_fd, stop_fd.get(), RespondFailingGetattr);
+  });
+  Cleanup stop_server([&] {
+    const uint64_t stop = 1;
+    EXPECT_THAT(RetryEINTR(write)(stop_fd.get(), &stop, sizeof(stop)),
+                SyscallSucceedsWithValue(sizeof(stop)));
+  });
+
+  auto bottom_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto overlay_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string overlay_opts =
+      absl::StrFormat("lowerdir=%s:%s", fuse_dir.path(), bottom_dir.path());
+  // Linux does not send FUSE_GETATTR for the root of a lower layer here, so
+  // the mount succeeds. gVisor stats the top layer's root and fails with the
+  // error returned by the FUSE server.
+  const int ret = mount("overlay", overlay_dir.path().c_str(), "overlay", 0,
+                        overlay_opts.c_str());
+  EXPECT_THAT(ret, AnyOf(SyscallSucceeds(), SyscallFailsWithErrno(EIO)));
+  if (ret == 0) {
+    EXPECT_THAT(umount(overlay_dir.path().c_str()), SyscallSucceeds());
+  }
+}
+
+TEST(FuseTest, FlushUnsupported) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(IsRunningWithSaveRestore());
+
+  FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/fuse", O_RDWR));
+  auto mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto mount_opts =
+      absl::StrFormat("fd=%d,user_id=0,group_id=0,rootmode=40000", fd.get());
+  auto mount = ASSERT_NO_ERRNO_AND_VALUE(
+      Mount("fuse", mount_point.path(), "fuse", MS_NODEV | MS_NOSUID,
+            mount_opts, 0 /* umountflags */));
+  ASSERT_NO_FATAL_FAILURE(FuseInit(fd.get()));
+  const FileDescriptor stop_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(NewEventFD(0, EFD_CLOEXEC));
+
+  std::atomic<int> flush_requests = 0;
+  std::atomic<int> release_requests = 0;
+  ScopedThread fuse_server([&, server_fd = fd.release()] {
+    RunFuseServer(
+        server_fd, stop_fd.get(), [&](int fd, const fuse_in_header& in) {
+          if (in.opcode == FUSE_LOOKUP) {
+            fuse_entry_out out = {.nodeid = 2,
+                                  .generation = 1,
+                                  .entry_valid = 1,
+                                  .attr_valid = 1};
+            out.attr = {.ino = 2, .mode = S_IFREG | 0644, .nlink = 1};
+            FuseRespond(fd, in.unique, &out, sizeof(out));
+          } else if (in.opcode == FUSE_OPEN) {
+            fuse_open_out out = {.fh = 1};
+            FuseRespond(fd, in.unique, &out, sizeof(out));
+          } else if (in.opcode == FUSE_GETATTR) {
+            fuse_attr_out out = {.attr_valid = 1};
+            out.attr = {
+                .ino = in.nodeid,
+                .mode = in.nodeid == 1 ? S_IFDIR | 0755U : S_IFREG | 0644U,
+                .nlink = 1};
+            FuseRespond(fd, in.unique, &out, sizeof(out));
+          } else if (in.opcode == FUSE_FLUSH) {
+            ++flush_requests;
+            FuseRespond(fd, in.unique, nullptr, 0, -ENOSYS);
+          } else if (in.opcode == FUSE_RELEASE) {
+            ++release_requests;
+            FuseRespond(fd, in.unique);
+          } else {
+            FuseRespond(fd, in.unique, nullptr, 0, -ENOSYS);
+          }
+          return true;
+        });
+  });
+  Cleanup stop_server([&] {
+    const uint64_t stop = 1;
+    EXPECT_THAT(RetryEINTR(write)(stop_fd.get(), &stop, sizeof(stop)),
+                SyscallSucceedsWithValue(sizeof(stop)));
+  });
+
+  // ENOSYS from FLUSH is not an error, and FLUSH is not sent again.
+  const std::string file_path = JoinPath(mount_point.path(), "testfile");
+  for (int i = 0; i < 2; i++) {
+    const int file_fd = open(file_path.c_str(), O_RDONLY);
+    ASSERT_THAT(file_fd, SyscallSucceeds());
+    EXPECT_THAT(close(file_fd), SyscallSucceeds());
+  }
+  // RELEASE is sent asynchronously after close; wait for both.
+  const absl::Time deadline = absl::Now() + absl::Seconds(30);
+  while (release_requests.load() < 2 && absl::Now() < deadline) {
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  EXPECT_EQ(release_requests.load(), 2);
+  EXPECT_EQ(flush_requests.load(), 1);
 }
 
 // The parts of <linux/aio_abi.h> used below. The header isn't included since

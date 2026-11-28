@@ -30,20 +30,6 @@ import (
 )
 
 // +checklocksexclude:t.mu
-func getTaskFD(t *kernel.Task, fd int32) (*vfs.FileDescription, kernel.FDFlags) {
-	var (
-		file  *vfs.FileDescription
-		flags kernel.FDFlags
-	)
-	t.WithMuLocked(func(t *kernel.Task) {
-		if fdt := t.FDTable(); fdt != nil {
-			file, flags = fdt.Get(fd)
-		}
-	})
-	return file, flags
-}
-
-// +checklocksexclude:t.mu
 func taskFDExists(ctx context.Context, fs *filesystem, t *kernel.Task, fd int32) bool {
 	var exists bool
 	t.WithMuLocked(func(task *kernel.Task) {
@@ -231,7 +217,7 @@ func (s *fdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) 
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return "", linuxerr.EACCES
 	}
-	file, _ := getTaskFD(s.task, s.fd)
+	file, _ := s.task.GetFileAndFlags(s.fd)
 	if file == nil {
 		return "", linuxerr.ENOENT
 	}
@@ -248,11 +234,12 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return vfs.VirtualDentry{}, "", linuxerr.EACCES
 	}
-	file, _ := getTaskFD(s.task, s.fd)
+	file, _ := s.task.GetFileAndFlags(s.fd)
 	if file == nil {
 		return vfs.VirtualDentry{}, "", linuxerr.ENOENT
 	}
-	defer s.fs.SafeDecRefFD(ctx, file)
+	// kernfs calls Getlink with Filesystem.mu locked.
+	defer s.fs.DeferDecRefFD(file)
 	vd := file.VirtualDentry()
 	vd.IncRef()
 	return vd, "", nil
@@ -311,7 +298,7 @@ func (i *fdInfoDirInode) Lookup(ctx context.Context, name string) (kernfs.Inode,
 		task: i.task,
 		fd:   fd,
 	}
-	return i.fs.newTaskOwnedInode(ctx, i.task, i.fs.NextIno(), 0444, data), nil
+	return i.fs.newFDInfoInode(ctx, i.task, data), nil
 }
 
 // IterDirents implements Inode.IterDirents.
@@ -332,9 +319,49 @@ func (i *fdInfoDirInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *ker
 	return fd.VFSFileDescription(), nil
 }
 
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// ptrace read access is required, then the mode check applies.
+// See fs/proc/fd.c:proc_fdinfo_permission.
+//
+// +checklocksexclude:i.fdDir.task.mu
+func (i *fdInfoDirInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if !kernel.ContextCanTrace(ctx, i.task, false /* attach */) {
+		return linuxerr.EACCES
+	}
+	return i.InodeAttrs.CheckPermissions(ctx, creds, ats)
+}
+
 // DecRef implements kernfs.Inode.DecRef.
 func (i *fdInfoDirInode) DecRef(ctx context.Context) {
 	i.fdInfoDirInodeRefs.DecRef(func() { i.Destroy(ctx) })
+}
+
+// fdInfoInode is the inode for a file in /proc/[pid]/fdinfo.
+//
+// +stateify savable
+type fdInfoInode struct {
+	taskOwnedInode
+}
+
+var _ kernfs.Inode = (*fdInfoInode)(nil)
+
+func (fs *filesystem) newFDInfoInode(ctx context.Context, task *kernel.Task, data *fdInfoData) kernfs.Inode {
+	owned := fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, data).(*taskOwnedInode)
+	return &fdInfoInode{taskOwnedInode: *owned}
+}
+
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
+//
+// ptrace read access is required, then the mode check applies.
+// See fs/proc/fd.c:proc_fdinfo_permission.
+//
+// +checklocksexclude:i.owner.mu
+func (i *fdInfoInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
+	if !kernel.ContextCanTrace(ctx, i.owner, false /* attach */) {
+		return linuxerr.EACCES
+	}
+	return i.taskOwnedInode.CheckPermissions(ctx, creds, ats)
 }
 
 // fdInfoData implements vfs.DynamicBytesSource for /proc/[pid]/fdinfo/[fd].
@@ -354,7 +381,7 @@ var _ dynamicInode = (*fdInfoData)(nil)
 //
 // +checklocksexclude:d.task.mu
 func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	file, descriptorFlags := getTaskFD(d.task, d.fd)
+	file, descriptorFlags := d.task.GetFileAndFlags(d.fd)
 	if file == nil {
 		return linuxerr.ENOENT
 	}

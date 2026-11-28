@@ -13,7 +13,9 @@ filegroup(
     name = "sources",
     srcs = glob(["**"]) + [
         "//images/basic:sources",
+        "//images/benchmarks:sources",
         "//images/benchmarks/bun-spawn:sources",
+        "//images/compatibility:sources",
         "//images/gpu/ollama/client:sources",
     ],
 )

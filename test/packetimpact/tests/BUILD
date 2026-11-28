@@ -84,6 +84,7 @@ packetimpact_testbench(
     name = "tcp_zero_window_probe",
     srcs = ["tcp_zero_window_probe_test.go"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@org_golang_x_sys//unix:go_default_library",
@@ -324,6 +325,7 @@ packetimpact_testbench(
     name = "tcp_linger",
     srcs = ["tcp_linger_test.go"],
     deps = [
+        "//pkg/abi/linux",
         "//pkg/tcpip/header",
         "//test/packetimpact/testbench",
         "@org_golang_x_sys//unix:go_default_library",
